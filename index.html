@@ -1258,6 +1258,8 @@ const AUTH = (() => {
 
 // ─── Màn hình đăng nhập ───────────────────────────────────────
 function showLoginScreen() {
+  // Dọn sạch chatbox cũ để init() có thể chạy lại khi đăng nhập lại
+  if (typeof AICHAT !== 'undefined' && AICHAT.destroy) AICHAT.destroy();
   const root = document.getElementById('app');
   root.innerHTML = '';
   let errMsg = '';
@@ -1825,7 +1827,7 @@ async function bootApp() {
         });
       }, 500);
     }
-  }, 600);
+  }, 1000);
 
   startAutoLogoutTimer();
 }
@@ -12025,8 +12027,17 @@ th.r{text-align:right}th.c{text-align:center}
     });
   }
 
+  function destroy() {
+    const root = document.getElementById('aichat-root');
+    if (root && root.parentNode) root.parentNode.removeChild(root);
+    _container = null;
+    _open = false;
+    _messages = [];
+  }
+
   return {
     init,
+    destroy,
     syncCfgFromCloud: _pullCfgFromCloud,
     open: () => { _open = true; document.getElementById('aichat-panel')?.classList.add('open'); }
   };
@@ -12074,7 +12085,7 @@ async function initMainApp() {
         });
       }, 500);
     }
-  }, 600);
+  }, 1000);
   startAutoLogoutTimer();
 }
 const _startUser = AUTH.currentUser();
