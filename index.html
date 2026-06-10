@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Đá Tự Nhiên Linh Vũ">
-<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.7.1</title>
+<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.7.2</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
 <!-- Firebase SDK -->
@@ -1130,10 +1130,56 @@ function showLoginScreen() {
     const btn     = root.querySelector('#loginBtn');
     const resetBtn = root.querySelector('#resetBtn');
 
-    function doLogin() {
+    async function doLogin() {
       const u = (userEl?.value || '').trim();
       const p = passEl?.value || '';
       if (!u || !p) { errMsg = 'Vui lòng nhập đầy đủ thông tin!'; successMsg = ''; render(); return; }
+
+      // ── Kiểm tra brute-force trước ─────────────────────────
+      const lockCheck = AUTH.getLockStatus();
+      if (lockCheck.locked) { errMsg = `Tài khoản bị khoá ${lockCheck.remaining} giây nữa.`; successMsg = ''; render(); return; }
+
+      // ── Pull thông tin đăng nhập mới nhất từ cloud TRƯỚC khi validate ──
+      // Để đảm bảo mật khẩu / tên đăng nhập đã thay đổi trên thiết bị khác được áp dụng
+      try {
+        const cloudCfg = CLOUD.getCfg();
+        if (cloudCfg.enabled && typeof firebase !== 'undefined' && firebase.apps.length) {
+          if (btn) { btn.disabled = true; btn.textContent = '🔄 Đang đồng bộ...'; }
+          const db = firebase.firestore();
+          const shopId = cloudCfg.shopId || 'shop1';
+          const col = name => db.collection('shops').doc(shopId).collection(name);
+          const [adminSnap, staffSnap] = await Promise.all([
+            col('dtn_admin_cred').doc('admin_cred').get().catch(() => null),
+            col('dtn_staff_accounts').get().catch(() => null),
+          ]);
+          // Apply admin_cred từ cloud (luôn dùng cloud nếu có — vì đây là lúc chưa đăng nhập)
+          if (adminSnap && adminSnap.exists) {
+            const { id, _updated, ...credData } = adminSnap.data();
+            try { localStorage.setItem('dtn_admin_cred', JSON.stringify({ ...credData, _updated: _updated || '' })); } catch(e) {}
+          }
+          // Apply staff accounts từ cloud
+          if (staffSnap && !staffSnap.empty) {
+            const cloudStaff = staffSnap.docs.map(d => { const v = d.data(); return v; });
+            try {
+              const existing = (() => { try { const v = localStorage.getItem('dtn_staff_accounts'); return v ? JSON.parse(v) : []; } catch(e) { return []; } })();
+              const map = {};
+              existing.forEach(s => { if (s && s.id) map[s.id] = s; });
+              cloudStaff.forEach(s => {
+                if (!s || !s.id) return;
+                const localTs = (map[s.id] && (map[s.id]._updated || map[s.id].createdAt)) || '';
+                const cloudTs = s._updated || s.createdAt || '';
+                if (!map[s.id] || cloudTs >= localTs) map[s.id] = s;
+              });
+              localStorage.setItem('dtn_staff_accounts', JSON.stringify(Object.values(map)));
+            } catch(e) {}
+          }
+          if (btn) { btn.disabled = false; btn.textContent = 'Đăng nhập'; }
+        }
+      } catch(e) {
+        if (btn) { btn.disabled = false; btn.textContent = 'Đăng nhập'; }
+        // Không chặn login nếu pull lỗi — dùng local credential
+      }
+
       const result = AUTH.login(u, p);
       if (result && result.error) { errMsg = result.error; successMsg = ''; render(); return; }
       if (result && !result.error) { bootApp(); return; }
@@ -1411,6 +1457,106 @@ function pgAccounts() {
 }
 
 // ─── Boot app (sau khi đăng nhập) ────────────────────────────
+
+// ── Mobile-safe PDF opener ─────────────────────────────────────────
+// Trên mobile, window.open thường bị block. Dùng blob URL để mở PDF
+// và hiển thị nút "Chia sẻ" / "Tải về" thân thiện với điện thoại.
+function openPdfMobile(htmlContent, filename) {
+  try {
+    const blob = new Blob([htmlContent], { type: 'text/html;charset=utf-8' });
+    const url  = URL.createObjectURL(blob);
+    const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+    if (isMobile) {
+      // Hiển thị modal in-app thay vì popup mới
+      const overlay = document.createElement('div');
+      overlay.id = 'pdf-mobile-overlay';
+      overlay.style.cssText = 'position:fixed;inset:0;z-index:9999;background:#0f1117;display:flex;flex-direction:column;overflow:hidden;';
+
+      const topbar = document.createElement('div');
+      topbar.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:#161b27;border-bottom:1px solid #2a3245;flex-shrink:0;padding-top:calc(12px + env(safe-area-inset-top,0px))';
+
+      const title = document.createElement('span');
+      title.style.cssText = 'font-size:14px;font-weight:700;color:#e8e6df';
+      title.textContent = filename || 'Xem tài liệu';
+
+      const btnRow = document.createElement('div');
+      btnRow.style.cssText = 'display:flex;gap:8px;align-items:center';
+
+      // Nút chia sẻ (Web Share API — hoạt động trên iOS/Android)
+      if (navigator.share || navigator.canShare) {
+        const btnShare = document.createElement('button');
+        btnShare.style.cssText = 'padding:7px 14px;border-radius:7px;border:none;background:#c9a84c;color:#0f1117;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit';
+        btnShare.textContent = '📤 Chia sẻ';
+        btnShare.onclick = async () => {
+          try {
+            // Tạo blob PDF nếu browser hỗ trợ, fallback sang share URL
+            const shareBlob = new Blob([htmlContent], { type: 'text/html' });
+            const shareFile = new File([shareBlob], (filename||'document')+'.html', { type: 'text/html' });
+            if (navigator.canShare && navigator.canShare({ files: [shareFile] })) {
+              await navigator.share({ files: [shareFile], title: filename || 'Tài liệu' });
+            } else {
+              await navigator.share({ title: filename || 'Tài liệu', url: url });
+            }
+          } catch(e) { if (e.name !== 'AbortError') alert('Không thể chia sẻ: ' + e.message); }
+        };
+        btnRow.appendChild(btnShare);
+      }
+
+      // Nút in (hoạt động tốt trên mobile Chrome/Safari)
+      const btnPrint = document.createElement('button');
+      btnPrint.style.cssText = 'padding:7px 14px;border-radius:7px;border:1px solid #3a4560;background:#1e2535;color:#e8e6df;font-size:13px;cursor:pointer;font-family:inherit';
+      btnPrint.textContent = '🖨️ In';
+      btnPrint.onclick = () => {
+        const iframe = overlay.querySelector('iframe');
+        if (iframe) {
+          try { iframe.contentWindow.print(); } catch(e) { window.open(url, '_blank'); }
+        }
+      };
+
+      // Nút đóng — QUAN TRỌNG: phải giải phóng URL và cho phép tương tác lại app
+      const btnClose = document.createElement('button');
+      btnClose.style.cssText = 'padding:7px 12px;border-radius:7px;border:1px solid #3a4560;background:transparent;color:#9a9590;font-size:18px;cursor:pointer;line-height:1';
+      btnClose.textContent = '✕';
+      btnClose.onclick = () => {
+        document.body.removeChild(overlay);
+        URL.revokeObjectURL(url);
+        document.body.style.overflow = ''; // khôi phục scroll
+      };
+
+      btnRow.appendChild(btnPrint);
+      btnRow.appendChild(btnClose);
+      topbar.appendChild(title);
+      topbar.appendChild(btnRow);
+
+      const iframe = document.createElement('iframe');
+      iframe.src = url;
+      iframe.style.cssText = 'flex:1;width:100%;border:none;background:#fff;';
+      iframe.onload = () => { URL.revokeObjectURL(url); };
+
+      overlay.appendChild(topbar);
+      overlay.appendChild(iframe);
+      document.body.appendChild(overlay);
+      document.body.style.overflow = 'hidden'; // chặn scroll nền
+
+    } else {
+      // Desktop: mở tab mới bình thường
+      const w = window.open(url, '_blank');
+      if (!w) {
+        // Fallback: popup bị chặn, thử write trực tiếp
+        const w2 = window.open('', '_blank', 'width=900,height=800');
+        if (w2) { w2.document.write(htmlContent); w2.document.close(); }
+        else { alert('Trình duyệt chặn popup. Vui lòng cho phép popup cho trang này.'); }
+      }
+    }
+  } catch(e) {
+    // Ultimate fallback
+    console.error('[PDF] openPdfMobile error:', e);
+    const w = window.open('', '_blank', 'width=900,height=800');
+    if (w) { w.document.write(htmlContent); w.document.close(); }
+  }
+}
+
 async function bootApp() {
   _raf = false;
   const root = document.getElementById('app');
@@ -1428,7 +1574,14 @@ async function bootApp() {
         <div style="font-size:12px;margin-top:6px;color:#5c5850">Vui lòng chờ</div>
       </div>
     </div>`;
-    await CLOUD.bootSync(S);
+    // Boot sync data + AI key song song
+    await Promise.all([
+      CLOUD.bootSync(S),
+      // Pull AI config (Gemini/Claude key) từ cloud để đồng bộ về thiết bị này
+      (typeof AICHAT !== 'undefined' && AICHAT.syncCfgFromCloud)
+        ? AICHAT.syncCfgFromCloud().catch(() => {})
+        : Promise.resolve(),
+    ]);
     if (root) root.innerHTML = ''; // xoá loading
   }
 
@@ -6819,19 +6972,11 @@ ${autoprint ? '<scr'+'ipt>document.title=" ";var _t=document.title;window.addEve
         h('div', { style: { marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' } },
           // Nút In hoá đơn — mở cửa sổ mới rồi tự động in
           h('button', { className: 'btn btn-primary', onClick: () => {
-            const w = window.open('', '_blank', 'width=850,height=750');
-            if (!w) { toast('Trình duyệt chặn popup — vui lòng cho phép popup cho trang này', 'error'); return; }
-            w.document.write(buildInvoiceHTML(s, true));
-            w.document.close();
+            openPdfMobile(buildInvoiceHTML(s, true), 'Hóa đơn - ' + (s.customer||''));
           } }, '🖨️ In hoá đơn'),
           // Nút Xuất PDF — mở cửa sổ mới, người dùng chọn Save as PDF thủ công
           h('button', { className: 'btn', onClick: () => {
-            const w = window.open('', '_blank', 'width=850,height=750');
-            if (!w) { toast('Trình duyệt chặn popup — vui lòng cho phép popup cho trang này', 'error'); return; }
-            w.document.write(buildInvoiceHTML(s, false));
-            w.document.close();
-            // Hướng dẫn xuất PDF
-            toast('Bấm Ctrl+P (hoặc Cmd+P) → Chọn "Save as PDF" để lưu file PDF', 'info');
+            openPdfMobile(buildInvoiceHTML(s, false), 'Hóa đơn PDF - ' + (s.customer||''));
           } }, '📄 Xuất PDF')
         )
       );
@@ -7229,20 +7374,13 @@ ${autoprint ? '<scr'+'ipt>document.title=" ";var _t=document.title;window.addEve
               h('button', { className: 'btn', style: { background: 'var(--blue)', color: '#fff', border: 'none' }, onClick: () => {
                 S.modal = null; render();
                 setTimeout(() => {
-                  const w = window.open('', '_blank', 'width=850,height=750');
-                  if (!w) { toast('Trình duyệt chặn popup!', 'error'); return; }
-                  w.document.write(buildCustomerQuoteHTML(false));
-                  w.document.close();
-                  toast('Bấm Ctrl+P (Cmd+P) → Chọn "Save as PDF" để lưu PDF', 'info');
+                  openPdfMobile(buildCustomerQuoteHTML(false), 'Báo giá PDF');
                 }, 100);
               } }, '📄 Xuất PDF báo giá'),
               h('button', { className: 'btn btn-primary', onClick: () => {
                 S.modal = null; render();
                 setTimeout(() => {
-                  const w = window.open('', '_blank', 'width=850,height=750');
-                  if (!w) { toast('Trình duyệt chặn popup!', 'error'); return; }
-                  w.document.write(buildCustomerQuoteHTML(true));
-                  w.document.close();
+                  openPdfMobile(buildCustomerQuoteHTML(true), 'Báo giá in');
                 }, 100);
               } }, '🖨️ In báo giá')
             ]
@@ -7634,7 +7772,7 @@ ${autoprint ? '<scr'+'ipt>document.title=" ";var _t=document.title;window.addEve
           h('div', { className: 'tag-gold' }, today()),
           h('button', { className: 'btn btn-sm', onClick: async () => {
             const { calcs: cc, totalCost: tC, totalRevenue: tR, totalBuyBase: tBB, totalBuyVat: tBV, totalShipBase: tSB, totalShipVat: tSV, totalSellBase: tSeB, totalSellVat: tSeV, totalVatPayable: tVP, totalProfitB: tPB, totalProfitA: tPA } = calcTotal();
-            const w = window.open('', '_blank', 'width=900,height=800');
+            const _pdfHtml = (() => {
             const custLine = customerName ? `<div style="margin-bottom:12px;font-size:13px;color:#555;"><b>Khách hàng:</b> ${customerName}${customerPhone ? ' &nbsp;|&nbsp; <b>SĐT:</b> ' + customerPhone : ''}${customerNote ? ' &nbsp;|&nbsp; ' + customerNote : ''}</div>` : '';
             const itemRows = items.map((it, i) => {
               const c = cc[i];
@@ -7650,7 +7788,7 @@ ${autoprint ? '<scr'+'ipt>document.title=" ";var _t=document.title;window.addEve
               </tr>`;
             }).join('');
             const vatSign = tVP >= 0 ? '+' : '-';
-            w.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8">
+            return `<!DOCTYPE html><html><head><meta charset="UTF-8">
 <title>Báo Giá Nội Bộ</title>
 <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
@@ -7739,8 +7877,8 @@ ${autoprint ? '<scr'+'ipt>document.title=" ";var _t=document.title;window.addEve
   </div>
 </div>
 <script>window.onload=function(){window.print();}<\/script>
-</body></html>`);
-            w.document.close();
+</body></html>`; })();
+            openPdfMobile(_pdfHtml, 'Báo giá nội bộ');
           } }, '📄 Xuất PDF báo giá')
         )
       ));
@@ -8039,15 +8177,10 @@ ${autoprint?'<scr'+'ipt>window.onload=function(){window.print()};<\/scr'+'ipt>':
       ),
       h('div', { style: { display:'flex', gap:8, flexWrap:'wrap' } },
         h('button', { className:'btn', style:{background:'var(--blue)',color:'#fff',border:'none'}, onClick:() => {
-          const w = window.open('','_blank','width=900,height=800');
-          if (!w) { toast('Trình duyệt chặn popup!','error'); return; }
-          w.document.write(buildBienBanHTML(false)); w.document.close();
-          toast('Bấm Ctrl+P → Save as PDF để lưu','info');
+          openPdfMobile(buildBienBanHTML(false), 'Biên bản giao nhận');
         } }, '📄 Xuất PDF'),
         h('button', { className:'btn btn-primary', onClick:() => {
-          const w = window.open('','_blank','width=900,height=800');
-          if (!w) { toast('Trình duyệt chặn popup!','error'); return; }
-          w.document.write(buildBienBanHTML(true)); w.document.close();
+          openPdfMobile(buildBienBanHTML(true), 'Biên bản giao nhận');
         } }, '🖨️ In biên bản'),
         h('button', { className:'btn', onClick:() => {
           bb = {
@@ -8559,15 +8692,10 @@ ${tongTT>0?`<p class="bangchu">(Bằng chữ: <i>${soThanhChu(tongTT)}</i>)</p>`
       ),
       h('div', { style: { display:'flex', gap:8, flexWrap:'wrap' } },
         h('button', { className:'btn', style:{background:'var(--blue)',color:'#fff',border:'none'}, onClick:()=>{
-          const w=window.open('','_blank','width=900,height=850');
-          if(!w){toast('Trình duyệt chặn popup!','error');return;}
-          w.document.write(buildHopDongHTML(false)); w.document.close();
-          toast('Bấm Ctrl+P → Save as PDF để lưu','info');
+          openPdfMobile(buildHopDongHTML(false), 'Hợp đồng mua bán');
         } }, '📄 Xuất PDF'),
         h('button', { className:'btn btn-primary', onClick:()=>{
-          const w=window.open('','_blank','width=900,height=850');
-          if(!w){toast('Trình duyệt chặn popup!','error');return;}
-          w.document.write(buildHopDongHTML(true)); w.document.close();
+          openPdfMobile(buildHopDongHTML(true), 'Hợp đồng mua bán');
         } }, '🖨️ In hợp đồng'),
         h('button', { className:'btn', onClick:()=>{
           hd={
@@ -11213,10 +11341,7 @@ th.r{text-align:right}th.c{text-align:center}
     btnPDF.innerHTML = '📄 Xuất PDF báo giá';
     btnPDF.onclick = () => {
       const html = buildQuotationPDF(q);
-      const w = window.open('', '_blank', 'width=900,height=700');
-      if (!w) { alert('Vui lòng cho phép popup để mở PDF!'); return; }
-      w.document.write(html);
-      w.document.close();
+      openPdfMobile(html, 'Báo giá - ' + (q.customerName || ''));
     };
 
     const btnSave = document.createElement('button');
@@ -11345,6 +11470,20 @@ th.r{text-align:right}th.c{text-align:center}
         _cfg = pulled;
         // Đảm bảo localStorage đã được cập nhật với config từ cloud
         try { localStorage.setItem(CFG_KEY, JSON.stringify(pulled)); } catch(e) {}
+        // Refresh header sub-text sau khi pull key từ cloud
+        try {
+          const sub = document.getElementById('aichat-head-sub');
+          if (sub && pulled.provider && PROVIDERS[pulled.provider]) {
+            const prov = PROVIDERS[pulled.provider];
+            const model = prov.models.find(m => m.id === pulled.model);
+            sub.textContent = prov.icon + ' ' + (model ? model.label.split('(')[0].trim() : prov.label);
+          }
+          // Nếu settings panel đang mở, refresh lại input key
+          const keyInput = document.getElementById('aichat-apikey-input');
+          if (keyInput && pulled.keys && pulled.provider) {
+            keyInput.value = (pulled.keys[pulled.provider] || '');
+          }
+        } catch(_e) {}
       }
     } catch(e) {}
 
@@ -11508,7 +11647,12 @@ async function initMainApp() {
         <div style="font-size:12px;margin-top:6px;color:#5c5850">Vui lòng chờ</div>
       </div>
     </div>`;
-    await CLOUD.bootSync(S);
+    await Promise.all([
+      CLOUD.bootSync(S),
+      (typeof AICHAT !== 'undefined' && AICHAT.syncCfgFromCloud)
+        ? AICHAT.syncCfgFromCloud().catch(() => {})
+        : Promise.resolve(),
+    ]);
     if (root) root.innerHTML = '';
   }
   render();
