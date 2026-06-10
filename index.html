@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Đá Tự Nhiên Linh Vũ">
-<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.7.2</title>
+<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.8.0</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
 <!-- Firebase SDK -->
@@ -324,10 +324,8 @@ const CLOUD = (() => {
         // nếu local mới hơn: giữ local (sẽ push lên cloud sau)
       }
     });
-    return Object.values(map);
+    return Object.values(map).filter(r => !r._deleted);
   }
-
-  // Products: merge per-field, cloud thắng nếu mới hơn
   // Sau đó deduplicate theo tên — tránh tình trạng 2 thiết bị tạo cùng SP offline
   function mergeProducts(local, cloudDocs) {
     const map = {};
@@ -367,10 +365,8 @@ const CLOUD = (() => {
         }
       }
     });
-    return Object.values(byName);
+    return Object.values(byName).filter(p => !p._deleted);
   }
-
-  // ── Áp dụng cloud data vào S + localStorage + re-render ────
   function applyCloudData(colName, cloudDocs, skipRender) {
     if (!window._S) return;
     const S = window._S;
@@ -483,18 +479,15 @@ const CLOUD = (() => {
     const collections = ['dtn_sales','dtn_imports','dtn_returns','dtn_paymentlogs','dtn_products','dtn_settings','dtn_staff_accounts','dtn_admin_cred'];
     collections.forEach(colName => {
       try {
-        // Chỉ lắng nghe thay đổi trong 24h gần nhất để tiết kiệm read
         const ref = col(colName);
         const unsub = ref.onSnapshot({ includeMetadataChanges: false }, (snap) => {
-          if (snap.metadata.hasPendingWrites) return; // bỏ qua thay đổi của chính mình
-          if (!_bootDone) return; // bỏ qua events trong lúc boot
-          const docs = snap.docs.map(d => { const v = d.data(); return v; });
-          // Chỉ xử lý nếu có thay đổi thực sự từ server
-          const hasServerChanges = snap.docChanges().some(ch => ch.type === 'added' || ch.type === 'modified');
-          if (hasServerChanges) {
-            applyCloudData(colName, docs, false);
-            _lastSync = ts(); notifyStatus();
-          }
+          if (!_bootDone) return;
+          // Chỉ xử lý thay đổi từ server (không phải local pending writes)
+          const serverChanges = snap.docChanges().filter(ch => !ch.doc.metadata.hasPendingWrites);
+          if (serverChanges.length === 0) return;
+          const docs = snap.docs.map(d => d.data());
+          applyCloudData(colName, docs, false);
+          _lastSync = ts(); notifyStatus();
         }, (err) => {
           console.warn('[CLOUD] listener error:', colName, err.message);
         });
@@ -1590,7 +1583,25 @@ async function bootApp() {
     if (typeof AICHAT !== 'undefined') AICHAT.init();
     // Bắt đầu realtime listener sau khi render xong
     if (cloudCfg.enabled) {
-      setTimeout(() => CLOUD.startListeners(), 500);
+      setTimeout(() => {
+        CLOUD.startListeners();
+        // Heartbeat 30s — phòng khi onSnapshot mất kết nối (mobile sleep, mạng chập)
+        let _hbIv = setInterval(() => {
+          if (!document.hidden && AUTH.currentUser()) {
+            try { CLOUD.bootSync(S).then(() => render()).catch(()=>{}); } catch(e) {}
+          }
+        }, 30000);
+        // Khi app quay lại foreground: restart listener + pull ngay
+        document.addEventListener('visibilitychange', () => {
+          if (!document.hidden && AUTH.currentUser() && cloudCfg.enabled) {
+            CLOUD.stopListeners();
+            CLOUD.startListeners();
+            setTimeout(() => {
+              try { CLOUD.bootSync(S).then(() => render()).catch(()=>{}); } catch(e) {}
+            }, 300);
+          }
+        });
+      }, 500);
     }
   }, 600);
 
@@ -1923,7 +1934,10 @@ function save(key) {
     }
     S._saveError = false;
   }
-  // Auto-backup sau mỗi lần lưu (slot 1 — nhanh)
+  // Push lên Firebase NGAY LẬP TỨC sau khi localStorage đã ghi xong
+  if (typeof CLOUD !== 'undefined') CLOUD.push(key, S);
+
+  // Auto-backup + archive chạy sau (không ảnh hưởng sync tốc độ)
   clearTimeout(save._timer);
   save._timer = setTimeout(() => {
     // Kiểm tra ngưỡng và auto-archive nếu nguy hiểm
@@ -1932,7 +1946,6 @@ function save(key) {
       const result = DB.archiveOldData();
       if (result.archivedSales > 0 || result.archivedImports > 0) {
         toast(`🗂️ Đã archive ${result.archivedSales} đơn hàng và ${result.archivedImports} phiếu nhập cũ hơn 12 tháng để giải phóng bộ nhớ.`, 'info');
-        // Cập nhật S từ DB sau archive
         S.sales   = DB.get('dtn_sales',   S.sales);
         S.imports = DB.get('dtn_imports',  S.imports);
         S.paymentlogs = DB.get('dtn_paymentlogs', S.paymentlogs);
@@ -1942,9 +1955,22 @@ function save(key) {
     DB.autoBackup();
     // 3-2-1: slot 2 — 30 phút xoay vòng
     CLOUD.runDailyBackup(() => DB.exportCompact());
-    // Push lên Firebase ngầm (local-first: localStorage đã ghi xong rồi)
-    CLOUD.push(key, S);
-  }, 2000);
+  }, 3000);
+}
+
+// ── Soft-delete: đánh dấu _deleted:true để sync xóa qua Firebase realtime
+// Thay vì .filter() trực tiếp, dùng hàm này để thiết bị khác nhận được lệnh xóa
+function softDelete(arrayKey, id, extraFn) {
+  const now = new Date().toISOString();
+  if (!S[arrayKey]) return;
+  S[arrayKey] = S[arrayKey].map(r => r.id === id ? { ...r, _deleted: true, _updated: now } : r);
+  if (typeof extraFn === 'function') extraFn();
+  save(arrayKey);
+  setTimeout(() => {
+    S[arrayKey] = (S[arrayKey] || []).filter(r => !r._deleted);
+    const dbMap = {products:'dtn_products',imports:'dtn_imports',sales:'dtn_sales',returns:'dtn_returns',paymentlogs:'dtn_paymentlogs'};
+    if (dbMap[arrayKey]) DB.set(dbMap[arrayKey], S[arrayKey]);
+  }, 600);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -3667,7 +3693,7 @@ function pgInventory() {
               h('td', {}, h('div', { style: { display: 'flex', gap: 4 } },
                 h('button', { className: 'btn btn-ghost btn-xs', onClick: () => openProduct(p, rebuild) }, '✏️'),
                 h('button', { className: 'btn btn-ghost btn-xs', onClick: () => {
-                  S.confirm = { msg: 'Xoá sản phẩm "' + p.name + '"?', onYes: () => { S.products = S.products.filter(x => x.id !== p.id); save('products'); toast('Đã xoá sản phẩm', 'info'); rebuild(); } };
+                  S.confirm = { msg: 'Xoá sản phẩm "' + p.name + '"?', onYes: () => { softDelete('products', p.id, () => {}); toast('Đã xoá sản phẩm', 'info'); rebuild(); } };
                   render();
                 } }, '🗑')
               ))
@@ -4255,8 +4281,8 @@ function pgImports() {
                             return { ...p, stock: newStock, variants: newVariants };
                           });
                         }
-                        S.imports = S.imports.filter(x => x.id !== i.id);
-                        save('imports'); save('products'); toast('Đã xoá phiếu nhập · Kho đã trừ lại ' + fmtQty(i.qty) + ' ' + i.unit, 'info'); rebuild();
+                        save('products');
+                        softDelete('imports', i.id, () => {}); toast('Đã xoá phiếu nhập · Kho đã trừ lại ' + fmtQty(i.qty) + ' ' + i.unit, 'info'); rebuild();
                       } };
                       render();
                     }
@@ -5461,27 +5487,30 @@ function pgSales() {
                           // 2. Xử lý phiếu trả hàng liên kết: trừ lại kho (hoàn kho đã cộng khi trả) rồi xoá phiếu
                           if (linkedReturns.length > 0) {
                             linkedReturns.forEach(r => {
-                              // Trừ lại SL đã cộng kho khi tạo phiếu trả
                               S.products = S.products.map(p => {
                                 if (p.id !== r.productId) return p;
                                 const newStock = Math.max(0, p.stock - r.returnQty);
                                 return {...p, stock: newStock};
                               });
                             });
-                            // Xoá phiếu trả liên kết
-                            S.returns = (S.returns || []).filter(r => r.saleId !== s.id);
+                            // Soft-delete phiếu trả liên kết
+                            const _now = new Date().toISOString();
+                            S.returns = (S.returns || []).map(r => r.saleId !== s.id ? r : { ...r, _deleted: true, _updated: _now });
                             save('returns');
+                            setTimeout(() => { S.returns = (S.returns||[]).filter(r=>!r._deleted); DB.set('dtn_returns', S.returns); }, 600);
                           }
 
-                          // 3. Xoá paymentlogs của đơn này
+                          // 3. Soft-delete paymentlogs của đơn này
                           if (linkedLogs.length > 0) {
-                            S.paymentlogs = (S.paymentlogs || []).filter(l => !(l.refId === s.id && l.type === 'customer'));
+                            const _now2 = new Date().toISOString();
+                            S.paymentlogs = (S.paymentlogs || []).map(l => (l.refId === s.id && l.type === 'customer') ? { ...l, _deleted: true, _updated: _now2 } : l);
                             save('paymentlogs');
+                            setTimeout(() => { S.paymentlogs = (S.paymentlogs||[]).filter(l=>!l._deleted); DB.set('dtn_paymentlogs', S.paymentlogs); }, 600);
                           }
 
-                          // 4. Xoá đơn bán
-                          S.sales = S.sales.filter(x => x.id !== s.id);
-                          save('sales'); save('products');
+                          // 4. Soft-delete đơn bán
+                          save('products');
+                          softDelete('sales', s.id, () => {});
 
                           const msg = linkedReturns.length > 0
                             ? `Đã xoá đơn + ${linkedReturns.length} phiếu trả hàng liên kết`
@@ -6154,8 +6183,8 @@ function pgDebt() {
                                   const newPaid = Math.max(0, x.paid - lg.amount);
                                   return { ...x, paid: newPaid, status: newPaid >= x.total ? 'done' : 'debt' };
                                 });
-                                S.paymentlogs = (S.paymentlogs || []).filter(x => x.id !== lg.id);
-                                save('sales'); save('paymentlogs');
+                                save('sales');
+                                softDelete('paymentlogs', lg.id, () => {});
                                 logs.splice(idx, 1);
                                 renderLogs();
                                 toast(`🗑 Đã xoá khoản thu ${fmt(lg.amount)}đ`, 'info');
@@ -6330,8 +6359,8 @@ function pgDebt() {
                                   const newPaid = Math.max(0, x.paid - lg.amount);
                                   return { ...x, paid: newPaid, status: newPaid >= x.total ? 'paid' : 'debt' };
                                 });
-                                S.paymentlogs = (S.paymentlogs || []).filter(x => x.id !== lg.id);
-                                save('imports'); save('paymentlogs');
+                                save('imports');
+                                softDelete('paymentlogs', lg.id, () => {});
                                 logs.splice(idx, 1);
                                 renderLogs();
                                 toast(`🗑 Đã xoá khoản trả ${fmt(lg.amount)}đ`, 'info');
@@ -9464,8 +9493,8 @@ function pgReturns() {
                               return { ...s, qty: newQty, subTotal: newSubTotal, vatAmt: newVatAmt, total: newTotal, status: newStatus };
                             });
                           }
-                          S.returns = S.returns.filter(x => x.id !== r.id);
-                          save('returns'); save('products'); save('sales');
+                          save('products'); save('sales');
+                          softDelete('returns', r.id, () => {});
                           toast('Đã xoá phiếu trả hàng, kho và đơn gốc được khôi phục', 'info');
                           rebuild();
                         }
@@ -10927,14 +10956,17 @@ Sau thẻ QUOTATION, tiếp tục trả lời bình thường để giải thíc
   function buildQuotationPDF(q) {
     const settings = S.settings || {};
     const shop = settings.shopName || 'Đá Tự Nhiên Linh Vũ';
-    const today = new Date().toISOString().slice(0, 10);
-    const dateStr = q.date || today;
+    // Fix: dùng timezone local thay vì toISOString() (UTC) — tránh lệch ngày khi ở VN (UTC+7)
+    const _now = new Date();
+    const _pad = n => String(n).padStart(2,'0');
+    const todayLocal = `${_now.getFullYear()}-${_pad(_now.getMonth()+1)}-${_pad(_now.getDate())}`;
+    const dateStr = q.date || todayLocal;
     const [yy, mm, dd] = dateStr.split('-');
     const dateVN = `${dd}/${mm}/${yy}`;
-    const validTo = new Date(dateStr);
-    validTo.setDate(validTo.getDate() + (q.validDays || 7));
-    const [vy, vm, vd] = validTo.toISOString().slice(0,10).split('-');
-    const validToVN = `${vd}/${vm}/${vy}`;
+    // Tính ngày hết hạn dùng Date với timezone-safe parsing
+    const [_vy, _vm, _vd] = dateStr.split('-').map(Number);
+    const validTo = new Date(_vy, _vm - 1, _vd + (q.validDays || 7));
+    const validToVN = `${_pad(validTo.getDate())}/${_pad(validTo.getMonth()+1)}/${validTo.getFullYear()}`;
     const quoteNo = 'BG' + Date.now().toString().slice(-6);
 
     const fmt2 = n => new Intl.NumberFormat('vi-VN').format(Math.round(n) || 0);
@@ -11074,13 +11106,14 @@ th.r{text-align:right}th.c{text-align:center}
 #aichat-fab{
   position:fixed;bottom:90px;right:18px;width:52px;height:52px;
   background:linear-gradient(135deg,#c9a84c,#e8c97a);border-radius:50%;
-  display:flex;align-items:center;justify-content:center;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;cursor:grab;
   box-shadow:0 4px 16px rgba(201,168,76,.45);z-index:9998;
-  font-size:22px;border:none;transition:transform .18s,box-shadow .18s;
-  -webkit-user-select:none;user-select:none
+  font-size:22px;border:none;transition:box-shadow .18s;
+  -webkit-user-select:none;user-select:none;touch-action:none
 }
-#aichat-fab:hover{transform:scale(1.08);box-shadow:0 6px 24px rgba(201,168,76,.6)}
-#aichat-fab:active{transform:scale(.95)}
+#aichat-fab:hover{box-shadow:0 6px 24px rgba(201,168,76,.6)}
+#aichat-fab:active{cursor:grabbing;opacity:.9}
+#aichat-fab.dragging{transition:none!important;cursor:grabbing;opacity:.85}
 #aichat-badge{
   position:absolute;top:-3px;right:-3px;width:18px;height:18px;
   background:#e05c5c;border-radius:50%;font-size:10px;font-weight:700;
@@ -11092,13 +11125,16 @@ th.r{text-align:right}th.c{text-align:center}
   height:580px;max-height:calc(100vh - 110px);
   background:#161b27;border:1px solid #2a3245;border-radius:16px;
   box-shadow:0 8px 40px rgba(0,0,0,.7);z-index:9999;
-  display:none;flex-direction:column;overflow:hidden
+  display:none;flex-direction:column;overflow:hidden;touch-action:none
 }
 #aichat-panel.open{display:flex}
+#aichat-panel.dragging{transition:none!important;opacity:.95}
 #aichat-head{
   padding:14px 16px;background:#1e2535;border-bottom:1px solid #2a3245;
-  display:flex;align-items:center;justify-content:space-between;flex-shrink:0
+  display:flex;align-items:center;justify-content:space-between;flex-shrink:0;
+  cursor:grab;-webkit-user-select:none;user-select:none;touch-action:none
 }
+#aichat-head:active{cursor:grabbing}
 #aichat-head-left{display:flex;align-items:center;gap:10px}
 #aichat-head-icon{
   width:34px;height:34px;background:linear-gradient(135deg,#c9a84c,#e8c97a);
@@ -11559,20 +11595,112 @@ th.r{text-align:right}th.c{text-align:center}
       tab.addEventListener('click', () => refreshSettingsUI(tab.dataset.prov));
     });
 
-    // Open/close chatbox
-    fab.addEventListener('click', () => {
-      _open = !_open;
-      panel.classList.toggle('open', _open);
-      if (_open) {
-        if (badge) badge.style.display = 'none';
-        if (!_messages.length) {
-          const pCount = (S.products||[]).length;
-          const cfg = loadCfg();
-          const pInfo = PROVIDERS[cfg.provider] || PROVIDERS.claude;
-          addMessage('assistant', `Xin chào! 👋 Tôi là trợ lý AI của cửa hàng.\nĐang dùng: ${pInfo.icon} ${pInfo.label}\n\nHiện có ${pCount} sản phẩm trong kho. Bạn có thể:\n• Hỏi về sản phẩm, giá cả, tồn kho\n• Yêu cầu "báo giá [tên đá] [số m²]"\n• Tôi sẽ tự tạo báo giá PDF có ảnh cho bạn!`);
-        }
-        setTimeout(() => input?.focus(), 100);
+    // ── Kéo thả FAB + Panel ──────────────────────────────────────
+    const POS_KEY = 'aichat_pos';
+    const fabSize = 52;
+    function savePos(l, t) { try { localStorage.setItem(POS_KEY, JSON.stringify({l,t})); } catch(e) {} }
+    function loadPos() { try { const v=localStorage.getItem(POS_KEY); return v?JSON.parse(v):null; } catch(e){return null;} }
+    function clampPos(left, top, w, h) {
+      const vw=window.innerWidth, vh=window.innerHeight;
+      return { left: Math.max(8, Math.min(left, vw-w-8)), top: Math.max(8, Math.min(top, vh-h-8)) };
+    }
+    function applyFabPos(left, top) {
+      fab.style.right='auto'; fab.style.bottom='auto';
+      fab.style.left=left+'px'; fab.style.top=top+'px';
+    }
+    function positionPanel(fabLeft, fabTop) {
+      const pw=panel.offsetWidth||380, ph=panel.offsetHeight||480;
+      let pt=fabTop-ph-8;
+      if(pt<8) pt=fabTop+60;
+      let pl=fabLeft+26-pw/2;
+      const c=clampPos(pl,pt,pw,ph);
+      panel.style.right='auto'; panel.style.bottom='auto';
+      panel.style.left=c.left+'px'; panel.style.top=c.top+'px';
+    }
+
+    // Phục hồi vị trí FAB đã lưu
+    const savedPos = loadPos();
+    if (savedPos) {
+      const c = clampPos(savedPos.l, savedPos.t, fabSize, fabSize);
+      applyFabPos(c.left, c.top);
+    } else {
+      applyFabPos(window.innerWidth-fabSize-18, window.innerHeight-fabSize-90);
+    }
+
+    // Drag engine (touch + mouse)
+    function makeDraggable(handle, getEl, onEnd) {
+      let _drag=false, _sx=0, _sy=0, _ol=0, _ot=0, _moved=false;
+      function xy(e){ return e.touches?{x:e.touches[0].clientX,y:e.touches[0].clientY}:{x:e.clientX,y:e.clientY}; }
+      function start(e){
+        if(e.target.closest('button,input,textarea,select')) return;
+        _drag=true; _moved=false;
+        const {x,y}=xy(e);
+        _sx=x; _sy=y;
+        const r=getEl().getBoundingClientRect();
+        _ol=r.left; _ot=r.top;
+        getEl().classList.add('dragging');
+        e.preventDefault();
       }
+      function move(e){
+        if(!_drag) return;
+        const {x,y}=xy(e);
+        const dx=x-_sx, dy=y-_sy;
+        if(Math.abs(dx)>4||Math.abs(dy)>4) _moved=true;
+        if(!_moved) return;
+        const el=getEl();
+        const c=clampPos(_ol+dx, _ot+dy, el.offsetWidth, el.offsetHeight);
+        el.style.right='auto'; el.style.bottom='auto';
+        el.style.left=c.left+'px'; el.style.top=c.top+'px';
+        e.preventDefault();
+      }
+      function end(){
+        if(!_drag) return;
+        _drag=false;
+        const el=getEl();
+        el.classList.remove('dragging');
+        const r=el.getBoundingClientRect();
+        if(onEnd) onEnd(r.left, r.top, _moved);
+      }
+      handle.addEventListener('touchstart', start, {passive:false});
+      document.addEventListener('touchmove', move, {passive:false});
+      document.addEventListener('touchend', end);
+      handle.addEventListener('mousedown', start);
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', end);
+    }
+
+    // Open/close chatbox (chỉ khi không drag)
+    makeDraggable(fab, ()=>fab, (l,t,moved)=>{
+      savePos(l,t);
+      if(!moved) {
+        _open=!_open;
+        panel.classList.toggle('open', _open);
+        if(_open){
+          if(badge) badge.style.display='none';
+          positionPanel(l,t);
+          if(!_messages.length){
+            const pCount=(S.products||[]).length;
+            const cfg=loadCfg();
+            const pInfo=PROVIDERS[cfg.provider]||PROVIDERS.claude;
+            addMessage('assistant',`Xin chào! 👋 Tôi là trợ lý AI của cửa hàng.\nĐang dùng: ${pInfo.icon} ${pInfo.label}\n\nHiện có ${pCount} sản phẩm trong kho. Bạn có thể:\n• Hỏi về sản phẩm, giá cả, tồn kho\n• Yêu cầu "báo giá [tên đá] [số m²]"\n• Tôi sẽ tự tạo báo giá PDF có ảnh cho bạn!`);
+          }
+          setTimeout(()=>input?.focus(),100);
+        }
+      } else if(_open) {
+        positionPanel(l,t); // cập nhật vị trí panel theo FAB mới
+      }
+    });
+
+    // Kéo panel qua header
+    const panelHead = document.getElementById('aichat-head');
+    makeDraggable(panelHead, ()=>panel, null);
+
+    // Resize: căn lại
+    window.addEventListener('resize', ()=>{
+      const r=fab.getBoundingClientRect();
+      const c=clampPos(r.left, r.top, fabSize, fabSize);
+      applyFabPos(c.left, c.top);
+      if(_open) positionPanel(c.left, c.top);
     });
 
     btnClose.addEventListener('click', () => {
@@ -11659,7 +11787,20 @@ async function initMainApp() {
   setTimeout(() => {
     if (typeof AICHAT !== 'undefined') AICHAT.init();
     if (cloudCfg.enabled) {
-      setTimeout(() => CLOUD.startListeners(), 500);
+      setTimeout(() => {
+        CLOUD.startListeners();
+        setInterval(() => {
+          if (!document.hidden && AUTH.currentUser()) {
+            try { CLOUD.bootSync(S).then(() => render()).catch(()=>{}); } catch(e) {}
+          }
+        }, 30000);
+        document.addEventListener('visibilitychange', () => {
+          if (!document.hidden && AUTH.currentUser() && cloudCfg.enabled) {
+            CLOUD.stopListeners(); CLOUD.startListeners();
+            setTimeout(() => { try { CLOUD.bootSync(S).then(() => render()).catch(()=>{}); } catch(e) {} }, 300);
+          }
+        });
+      }, 500);
     }
   }, 600);
   startAutoLogoutTimer();
