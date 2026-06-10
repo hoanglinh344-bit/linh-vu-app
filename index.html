@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Đá Tự Nhiên Linh Vũ">
-<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.8.0</title>
+<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.8.2</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
 <!-- Firebase SDK -->
@@ -200,7 +200,7 @@ textarea.form-input{resize:vertical;min-height:72px}
 let _raf = false; // render debounce flag — khai báo sớm để bootApp & logout dùng được
 
 // ═══════════════════════════════════════════════════════════════
-//  CLOUD — Firebase Firestore sync + Conflict Resolution (v7.8.0)
+//  CLOUD — Firebase Firestore sync + Conflict Resolution (v7.8.2)
 //
 //  Chiến lược xử lý xung đột multi-device:
 //  ─ Sales / Imports / Returns / Paymentlogs: APPEND-ONLY
@@ -317,10 +317,11 @@ const CLOUD = (() => {
       if (!existing) {
         map[r.id] = r; // doc mới từ thiết bị khác → thêm vào
       } else {
-        // So sánh timestamp — lấy bản mới hơn
+        // So sánh timestamp — lấy bản mới hơn; _deleted luôn thắng
         const localTs  = existing._updated || existing.date || '';
         const cloudTs  = r._updated || r.date || '';
-        if (cloudTs > localTs) map[r.id] = r;
+        if (r._deleted) { map[r.id] = r; } // xóa thắng mọi bản
+        else if (cloudTs > localTs) map[r.id] = r;
         // nếu local mới hơn: giữ local (sẽ push lên cloud sau)
       }
     });
@@ -337,7 +338,9 @@ const CLOUD = (() => {
       } else {
         const localTs = map[p.id]._updated || '';
         const cloudTs = p._updated || '';
-        if (cloudTs > localTs) map[p.id] = p; // cloud mới hơn → lấy cloud
+        // Nếu cloud có _deleted:true → luôn ưu tiên (xóa thắng)
+        if (p._deleted) { map[p.id] = p; }
+        else if (cloudTs > localTs) map[p.id] = p;
         // local mới hơn → giữ nguyên, sẽ push lên cloud
       }
     });
@@ -354,13 +357,20 @@ const CLOUD = (() => {
         // Giữ bản mới hơn theo _updated; nếu bằng nhau giữ bản có id nhỏ hơn (ổn định)
         const existTs = byName[key]._updated || byName[key].createdAt || '';
         const newTs   = p._updated || p.createdAt || '';
-        if (newTs > existTs) {
-          // Bản mới hơn thắng, nhưng nếu bản cũ có stock > 0 và bản mới = 0 → lấy stock của bản cũ
-          const winnerStock = (p.stock || 0) > 0 ? p.stock : (byName[key].stock || 0);
+        // _deleted luôn thắng — không được giữ stock của bản đã xóa
+        if (p._deleted && !byName[key]._deleted) {
+          byName[key] = p; // bản xóa thắng bản còn tồn tại
+        } else if (!p._deleted && byName[key]._deleted) {
+          // bản _deleted hiện tại thắng, giữ nguyên
+        } else if (newTs > existTs) {
+          // Bản mới hơn thắng — chỉ kế thừa stock khi cả 2 chưa bị xóa và bản mới = 0
+          const winnerStock = (!p._deleted && (p.stock || 0) === 0)
+            ? (byName[key].stock || 0) : (p.stock || 0);
           byName[key] = { ...p, stock: winnerStock };
         } else {
-          // Bản cũ thắng, nếu bản mới có stock cao hơn thì lấy
-          const winnerStock = (byName[key].stock || 0) > 0 ? byName[key].stock : (p.stock || 0);
+          // Bản cũ thắng
+          const winnerStock = (!byName[key]._deleted && (byName[key].stock || 0) === 0)
+            ? (p.stock || 0) : (byName[key].stock || 0);
           byName[key] = { ...byName[key], stock: winnerStock };
         }
       }
@@ -709,6 +719,11 @@ const CLOUD = (() => {
       window._S = S;
       if (!_cfg?.enabled) return;
       enqueue(key, S);
+    },
+    // Push array có chứa _deleted records để đồng bộ xóa sang thiết bị khác
+    _pushDeletedRecord(colName, arrayWithDeleted) {
+      if (!_db || !_cfg?.enabled) return;
+      pushCollection(colName, arrayWithDeleted).catch(e => console.warn('[CLOUD] pushDeleted error:', e));
     },
     syncAll: (S) => syncAll(S),
     pullAll,
@@ -1094,7 +1109,7 @@ function showLoginScreen() {
         <div style="text-align:center;margin-bottom:32px">
           <div style="width:64px;height:64px;background:linear-gradient(135deg,var(--accent),var(--accent2));border-radius:16px;display:flex;align-items:center;justify-content:center;font-size:32px;margin:0 auto 16px;box-shadow:0 4px 16px rgba(201,168,76,0.3)">💎</div>
           <div style="font-family:Georgia,serif;font-size:22px;font-weight:700;color:var(--text)">Đá Tự Nhiên Linh Vũ</div>
-          <div style="font-size:13px;color:var(--text2);margin-top:4px">Hệ thống quản lý v7.7.1</div>
+          <div style="font-size:13px;color:var(--text2);margin-top:4px">Hệ thống quản lý v7.8.2</div>
         </div>
         <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:28px">
           ${lockWarn}
@@ -1958,19 +1973,24 @@ function save(key) {
   }, 3000);
 }
 
-// ── Soft-delete: đánh dấu _deleted:true để sync xóa qua Firebase realtime
-// Thay vì .filter() trực tiếp, dùng hàm này để thiết bị khác nhận được lệnh xóa
+// ── Soft-delete: push _deleted record lên cloud, lọc local NGAY
 function softDelete(arrayKey, id, extraFn) {
   const now = new Date().toISOString();
   if (!S[arrayKey]) return;
-  S[arrayKey] = S[arrayKey].map(r => r.id === id ? { ...r, _deleted: true, _updated: now } : r);
+  // Tạo bản _deleted để push lên cloud trước khi filter
+  const withDeleted = S[arrayKey].map(r => r.id === id ? { ...r, _deleted: true, _updated: now } : r);
+  // Lọc sạch local NGAY LẬP TỨC để UI phản ánh đúng
+  S[arrayKey] = withDeleted.filter(r => !r._deleted);
+  const dbMap = {products:'dtn_products',imports:'dtn_imports',sales:'dtn_sales',returns:'dtn_returns',paymentlogs:'dtn_paymentlogs'};
+  if (dbMap[arrayKey]) DB.set(dbMap[arrayKey], S[arrayKey]);
   if (typeof extraFn === 'function') extraFn();
-  save(arrayKey);
-  setTimeout(() => {
-    S[arrayKey] = (S[arrayKey] || []).filter(r => !r._deleted);
-    const dbMap = {products:'dtn_products',imports:'dtn_imports',sales:'dtn_sales',returns:'dtn_returns',paymentlogs:'dtn_paymentlogs'};
-    if (dbMap[arrayKey]) DB.set(dbMap[arrayKey], S[arrayKey]);
-  }, 600);
+  // Push lên cloud: dùng withDeleted (có _deleted:true) để thiết bị khác nhận lệnh xóa
+  if (typeof CLOUD !== 'undefined' && CLOUD._pushDeletedRecord) {
+    CLOUD._pushDeletedRecord(dbMap[arrayKey], withDeleted);
+  } else if (typeof CLOUD !== 'undefined') {
+    // Fallback: push toàn bộ array hiện tại (không có _deleted, cloud sẽ không xóa trên thiết bị khác ngay)
+    CLOUD.push(arrayKey, S);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -11645,7 +11665,7 @@ th.r{text-align:right}th.c{text-align:center}
         if(!_drag) return;
         const {x,y}=xy(e);
         const dx=x-_sx, dy=y-_sy;
-        if(Math.abs(dx)>4||Math.abs(dy)>4) _moved=true;
+        if(Math.abs(dx)>8||Math.abs(dy)>8) _moved=true;
         if(!_moved) return;
         const el=getEl();
         const c=clampPos(_ol+dx, _ot+dy, el.offsetWidth, el.offsetHeight);
