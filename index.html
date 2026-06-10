@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Đá Tự Nhiên Linh Vũ">
-<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.7.0</title>
+<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.7.1</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
 <!-- Firebase SDK -->
@@ -383,11 +383,33 @@ const CLOUD = (() => {
       dtn_products:        'products',
       dtn_settings:        'settings',
       dtn_staff_accounts:  'staff_accounts',
+      dtn_admin_cred:      'admin_cred',
     };
     const stateKey = colMap[colName];
     if (!stateKey) return;
 
-    if (stateKey === 'staff_accounts') {
+    if (stateKey === 'admin_cred') {
+      // Thông tin đăng nhập admin — merge vào localStorage (AUTH quản lý)
+      // Chỉ apply nếu cloud mới hơn local (so sánh _updated)
+      if (cloudDocs.length > 0) {
+        try {
+          const cloudCred = cloudDocs.find(d => d.id === 'admin_cred');
+          if (cloudCred) {
+            const localRaw = localStorage.getItem('dtn_admin_cred');
+            const localCred = localRaw ? JSON.parse(localRaw) : null;
+            const cloudTs = cloudCred._updated || '';
+            const localTs = (localCred && localCred._updated) || '';
+            // Áp dụng cloud nếu cloud mới hơn hoặc local chưa có _updated
+            if (!localTs || cloudTs > localTs) {
+              const { id, _updated, ...credData } = cloudCred;
+              // Lưu thêm _updated để so sánh lần sau
+              localStorage.setItem('dtn_admin_cred', JSON.stringify({ ...credData, _updated: cloudTs }));
+              changed = true;
+            }
+          }
+        } catch(e) {}
+      }
+    } else if (stateKey === 'staff_accounts') {
       // Tài khoản nhân viên — merge vào localStorage trực tiếp (AUTH quản lý)
       if (cloudDocs.length > 0) {
         try {
@@ -458,7 +480,7 @@ const CLOUD = (() => {
     // Dừng listener cũ nếu có
     stopListeners();
 
-    const collections = ['dtn_sales','dtn_imports','dtn_returns','dtn_paymentlogs','dtn_products','dtn_settings','dtn_staff_accounts'];
+    const collections = ['dtn_sales','dtn_imports','dtn_returns','dtn_paymentlogs','dtn_products','dtn_settings','dtn_staff_accounts','dtn_admin_cred'];
     collections.forEach(colName => {
       try {
         // Chỉ lắng nghe thay đổi trong 24h gần nhất để tiết kiệm read
@@ -525,6 +547,7 @@ const CLOUD = (() => {
     try {
       // Đọc staff accounts từ localStorage (AUTH quản lý trực tiếp, không trong S)
       const _staffForSync = (() => { try { const v = localStorage.getItem('dtn_staff_accounts'); return v ? JSON.parse(v) : []; } catch(e) { return []; } })();
+      const _adminCredForSync = (() => { try { const v = localStorage.getItem('dtn_admin_cred'); return v ? [{ id: 'admin_cred', ...JSON.parse(v) }] : []; } catch(e) { return []; } })();
       await Promise.all([
         pushCollection('dtn_products',       S.products    || []),
         pushCollection('dtn_imports',        S.imports     || []),
@@ -533,6 +556,7 @@ const CLOUD = (() => {
         pushCollection('dtn_paymentlogs',    S.paymentlogs || []),
         pushCollection('dtn_settings',       [{ id:'settings', ...S.settings }]),
         pushCollection('dtn_staff_accounts', _staffForSync),
+        pushCollection('dtn_admin_cred',     _adminCredForSync),
       ]);
       _syncStatus = 'ok'; _lastSync = ts(); notifyStatus();
       return true;
@@ -570,10 +594,10 @@ const CLOUD = (() => {
         const snap = await col(name).get();
         return snap.docs.map(d => d.data());
       };
-      const [products, imports, sales, returns, paymentlogs, settingsArr, staffArr] = await Promise.all([
+      const [products, imports, sales, returns, paymentlogs, settingsArr, staffArr, adminCredArr] = await Promise.all([
         pullCol('dtn_products'), pullCol('dtn_imports'),  pullCol('dtn_sales'),
         pullCol('dtn_returns'),  pullCol('dtn_paymentlogs'), pullCol('dtn_settings'),
-        pullCol('dtn_staff_accounts'),
+        pullCol('dtn_staff_accounts'), pullCol('dtn_admin_cred'),
       ]);
 
       // Merge từng collection vào state hiện tại (không overwrite)
@@ -584,6 +608,7 @@ const CLOUD = (() => {
       if (paymentlogs.length) applyCloudData('dtn_paymentlogs',     paymentlogs, true);
       if (settingsArr.length) applyCloudData('dtn_settings',        settingsArr, true);
       if (staffArr.length)    applyCloudData('dtn_staff_accounts',  staffArr,    true);
+      if (adminCredArr.length) applyCloudData('dtn_admin_cred',      adminCredArr, true);
 
       _syncStatus = 'ok'; _lastSync = ts();
       _bootDone = true;
@@ -607,16 +632,16 @@ const CLOUD = (() => {
         const snap = await col(name).get();
         return snap.docs.map(d => { const v = d.data(); delete v._updated; return v; });
       };
-      const [products, imports, sales, returns, paymentlogs, settingsArr, staffArr] = await Promise.all([
+      const [products, imports, sales, returns, paymentlogs, settingsArr, staffArr, adminCredArr] = await Promise.all([
         pullCol('dtn_products'), pullCol('dtn_imports'), pullCol('dtn_sales'),
         pullCol('dtn_returns'),  pullCol('dtn_paymentlogs'), pullCol('dtn_settings'),
-        pullCol('dtn_staff_accounts')
+        pullCol('dtn_staff_accounts'), pullCol('dtn_admin_cred')
       ]);
       const settings = settingsArr.length > 0
         ? (() => { const s = {...settingsArr[0]}; delete s.id; delete s._updated; return s; })()
         : null;
       _syncStatus = 'ok'; _lastSync = ts(); notifyStatus();
-      return { products, imports, sales, returns, paymentlogs, settings, staff_accounts: staffArr };
+      return { products, imports, sales, returns, paymentlogs, settings, staff_accounts: staffArr, admin_cred: adminCredArr };
     } catch(e) {
       console.warn('[CLOUD] pullAll error:', e);
       _syncStatus = 'error'; notifyStatus();
@@ -911,7 +936,18 @@ const AUTH = (() => {
       if (!verifyPassword(oldPass, admin)) return false;
       if (!newPass || newPass.length < 6) return false;
       const hashed = hashPwSync(newPass);
-      saveAdminCred(admin.username, hashed, true);
+      const updated = new Date().toISOString();
+      try { localStorage.setItem(ADMIN_KEY, JSON.stringify({ ...admin, password: hashed, hashed: true, _updated: updated })); } catch(e) {}
+      // Sync lên cloud
+      try {
+        if (typeof CLOUD !== 'undefined' && CLOUD.getCfg().enabled && typeof firebase !== 'undefined' && firebase.apps.length) {
+          const db = firebase.firestore();
+          const shopId = CLOUD.getCfg().shopId || 'shop1';
+          db.collection('shops').doc(shopId).collection('dtn_admin_cred').doc('admin_cred')
+            .set({ id:'admin_cred', username: admin.username, password: hashed, hashed: true, _updated: updated }, { merge: true })
+            .catch(e => console.warn('[AUTH] cloud push admin_cred error:', e));
+        }
+      } catch(e) {}
       return true;
     },
     changeAdminUsername(newUsername, password) {
@@ -919,9 +955,20 @@ const AUTH = (() => {
       if (!admin) return false;
       if (!verifyPassword(password, admin)) return false;
       if (!newUsername || !newUsername.trim()) return false;
-      saveAdminCred(newUsername.trim(), admin.password, admin.hashed);
+      const updated = new Date().toISOString();
+      try { localStorage.setItem(ADMIN_KEY, JSON.stringify({ ...admin, username: newUsername.trim(), _updated: updated })); } catch(e) {}
       const sess = getSession();
       if (sess && sess.role === 'admin') { sess.username = newUsername.trim(); setSession(sess); }
+      // Sync lên cloud
+      try {
+        if (typeof CLOUD !== 'undefined' && CLOUD.getCfg().enabled && typeof firebase !== 'undefined' && firebase.apps.length) {
+          const db = firebase.firestore();
+          const shopId = CLOUD.getCfg().shopId || 'shop1';
+          db.collection('shops').doc(shopId).collection('dtn_admin_cred').doc('admin_cred')
+            .set({ id:'admin_cred', username: newUsername.trim(), password: admin.password, hashed: admin.hashed !== false, _updated: updated }, { merge: true })
+            .catch(e => console.warn('[AUTH] cloud push admin_cred error:', e));
+        }
+      } catch(e) {}
       return true;
     },
 
@@ -1054,7 +1101,7 @@ function showLoginScreen() {
         <div style="text-align:center;margin-bottom:32px">
           <div style="width:64px;height:64px;background:linear-gradient(135deg,var(--accent),var(--accent2));border-radius:16px;display:flex;align-items:center;justify-content:center;font-size:32px;margin:0 auto 16px;box-shadow:0 4px 16px rgba(201,168,76,0.3)">💎</div>
           <div style="font-family:Georgia,serif;font-size:22px;font-weight:700;color:var(--text)">Đá Tự Nhiên Linh Vũ</div>
-          <div style="font-size:13px;color:var(--text2);margin-top:4px">Hệ thống quản lý v7.5.2</div>
+          <div style="font-size:13px;color:var(--text2);margin-top:4px">Hệ thống quản lý v7.7.1</div>
         </div>
         <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:28px">
           ${lockWarn}
@@ -10538,7 +10585,14 @@ const AICHAT = (() => {
     try {
       const cloudCfg = CLOUD.getCfg();
       if (!cloudCfg.enabled) return null;
-      if (typeof firebase === 'undefined' || !firebase.apps.length) return null;
+      if (typeof firebase === 'undefined') return null;
+      // Chờ Firebase apps init nếu chưa sẵn sàng (retry tối đa 3s)
+      let retries = 0;
+      while (!firebase.apps.length && retries < 6) {
+        await new Promise(r => setTimeout(r, 500));
+        retries++;
+      }
+      if (!firebase.apps.length) return null;
       const db = firebase.firestore();
       const shopId = cloudCfg.shopId || 'shop1';
       const snap = await db.collection('shops').doc(shopId).collection('aichat_cfg').doc('config').get();
@@ -11287,7 +11341,11 @@ th.r{text-align:right}th.c{text-align:center}
     // Pull AI config từ cloud (nếu cloud đang bật) — sync key về thiết bị này
     try {
       const pulled = await _pullCfgFromCloud();
-      if (pulled) _cfg = pulled;
+      if (pulled) {
+        _cfg = pulled;
+        // Đảm bảo localStorage đã được cập nhật với config từ cloud
+        try { localStorage.setItem(CFG_KEY, JSON.stringify(pulled)); } catch(e) {}
+      }
     } catch(e) {}
 
     const fab          = document.getElementById('aichat-fab');
