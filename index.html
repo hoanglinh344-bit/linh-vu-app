@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Đá Tự Nhiên Linh Vũ">
-<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.6.0</title>
+<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.7.0</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
 <!-- Firebase SDK -->
@@ -10494,21 +10494,65 @@ const AICHAT = (() => {
     }
   };
 
+  const DEF_CFG = { provider: 'gemini', model: 'gemini-2.5-flash', keys: {}, enabled: false };
+
+  function parseCfg(v) {
+    try {
+      const c = JSON.parse(v);
+      if (c.apiKey && !c.keys) {
+        return { ...DEF_CFG, provider: 'claude', model: 'claude-sonnet-4-20250514', keys: { claude: c.apiKey }, enabled: c.enabled || false };
+      }
+      return { ...DEF_CFG, ...c };
+    } catch(e) { return { ...DEF_CFG }; }
+  }
+
   function loadCfg() {
     try {
       const v = localStorage.getItem(CFG_KEY);
-      const def = { provider: 'claude', model: 'claude-sonnet-4-20250514', keys: {}, enabled: false };
-      if (!v) return def;
-      const c = JSON.parse(v);
-      // Migrate cấu hình cũ (chỉ có apiKey)
-      if (c.apiKey && !c.keys) {
-        return { provider: 'claude', model: 'claude-sonnet-4-20250514', keys: { claude: c.apiKey }, enabled: c.enabled || false };
-      }
-      return { ...def, ...c };
-    } catch(e) { return { provider: 'claude', model: 'claude-sonnet-4-20250514', keys: {}, enabled: false }; }
+      return v ? parseCfg(v) : { ...DEF_CFG };
+    } catch(e) { return { ...DEF_CFG }; }
   }
+
   function saveCfg(cfg) {
     try { localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch(e) {}
+    // ── Sync lên Firestore nếu cloud đang bật ──
+    _pushCfgToCloud(cfg);
+  }
+
+  // ── Push AI config lên Firestore (per-shop) ─────────────────
+  function _pushCfgToCloud(cfg) {
+    try {
+      const cloudCfg = CLOUD.getCfg();
+      if (!cloudCfg.enabled) return;
+      if (typeof firebase === 'undefined' || !firebase.apps.length) return;
+      const db = firebase.firestore();
+      const shopId = cloudCfg.shopId || 'shop1';
+      db.collection('shops').doc(shopId).collection('aichat_cfg').doc('config')
+        .set({ ...cfg, _updated: new Date().toISOString() })
+        .catch(e => console.warn('[AICHAT] cloud push error:', e));
+    } catch(e) {}
+  }
+
+  // ── Pull AI config từ Firestore về localStorage ──────────────
+  async function _pullCfgFromCloud() {
+    try {
+      const cloudCfg = CLOUD.getCfg();
+      if (!cloudCfg.enabled) return null;
+      if (typeof firebase === 'undefined' || !firebase.apps.length) return null;
+      const db = firebase.firestore();
+      const shopId = cloudCfg.shopId || 'shop1';
+      const snap = await db.collection('shops').doc(shopId).collection('aichat_cfg').doc('config').get();
+      if (!snap.exists) return null;
+      const data = snap.data();
+      const { _updated, ...cfg } = data;
+      // Merge: cloud thắng nếu có key; local giữ nếu cloud không có
+      const local = loadCfg();
+      const merged = { ...DEF_CFG, ...local, ...cfg };
+      // Merge keys riêng để không mất key local chưa push
+      merged.keys = { ...(local.keys || {}), ...(cfg.keys || {}) };
+      try { localStorage.setItem(CFG_KEY, JSON.stringify(merged)); } catch(e) {}
+      return merged;
+    } catch(e) { console.warn('[AICHAT] cloud pull error:', e); return null; }
   }
 
   // ── State chatbox ───────────────────────────────────────────
@@ -11041,6 +11085,7 @@ th.r{text-align:right}th.c{text-align:center}
 
     <div class="aichat-tip">
       <b>💡 Gợi ý:</b> Mỗi AI provider cần API key riêng. Bạn có thể lưu key cho cả 3 và chuyển đổi bất kỳ lúc nào.<br><br>
+      <b>☁️ Cloud Sync:</b> Khi Cloud được bật, API key tự động đồng bộ lên Firestore — đăng nhập trên bất kỳ thiết bị nào cũng dùng được ngay.<br><br>
       <b>Câu lệnh mẫu:</b><br>
       • "Báo giá đá granite đen 50m²"<br>
       • "Tồn kho đá trắng còn bao nhiêu?"<br>
@@ -11233,11 +11278,17 @@ th.r{text-align:right}th.c{text-align:center}
   }
 
   // ── Init chatbox ─────────────────────────────────────────────
-  function init() {
+  async function init() {
     if (document.getElementById('aichat-root')) return;
     const dom = createChatboxDOM();
     document.body.appendChild(dom);
     _container = dom;
+
+    // Pull AI config từ cloud (nếu cloud đang bật) — sync key về thiết bị này
+    try {
+      const pulled = await _pullCfgFromCloud();
+      if (pulled) _cfg = pulled;
+    } catch(e) {}
 
     const fab          = document.getElementById('aichat-fab');
     const panel        = document.getElementById('aichat-panel');
@@ -11284,7 +11335,8 @@ th.r{text-align:right}th.c{text-align:center}
       keyLabel.textContent = `API Key — ${info.label}`;
       keyInput.placeholder = info.keyPlaceholder;
       keyInput.value = (cfg.keys || {})[prov] || '';
-      keyHint.innerHTML = info.keyHint + '<br>Key chỉ lưu trong thiết bị này, không gửi đi đâu khác.';
+      const _cloudOn = CLOUD.getCfg().enabled;
+      keyHint.innerHTML = info.keyHint + (_cloudOn ? '<br>🔄 <b>Key được sync lên cloud</b> — dùng được trên tất cả thiết bị khi đăng nhập.' : '<br>Key lưu cục bộ. Bật Cloud Sync để dùng trên mọi thiết bị.');
 
       // Status clear
       const status = document.getElementById('aichat-key-status');
@@ -11377,7 +11429,11 @@ th.r{text-align:right}th.c{text-align:center}
     });
   }
 
-  return { init, open: () => { _open = true; document.getElementById('aichat-panel')?.classList.add('open'); } };
+  return {
+    init,
+    syncCfgFromCloud: _pullCfgFromCloud,
+    open: () => { _open = true; document.getElementById('aichat-panel')?.classList.add('open'); }
+  };
 })();
 
 // ── Khởi động chatbox sau khi app render xong ────────────────
