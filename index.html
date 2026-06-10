@@ -230,9 +230,28 @@ const CLOUD = (() => {
   let _lastSync = null;
   let _statusListeners = [];
   let _listeners = [];   // unsubscribe functions cho onSnapshot
-  let _syncQueue = [];
   let _flushing = false;
   let _bootDone = false; // đã hoàn thành boot sync chưa
+
+  // ── Queue persistence: lưu vào sessionStorage để sống qua refresh ──
+  const QUEUE_SS_KEY = 'dtn_sync_queue';
+  function _loadQueue() {
+    try {
+      const v = sessionStorage.getItem(QUEUE_SS_KEY);
+      return v ? JSON.parse(v) : [];
+    } catch(e) { return []; }
+  }
+  function _saveQueue(q) {
+    try {
+      // Chỉ lưu colName + ts (không lưu data lớn — data sẽ đọc lại từ S khi flush)
+      const slim = q.map(item => ({ colName: item.colName, ts: item.ts }));
+      sessionStorage.setItem(QUEUE_SS_KEY, JSON.stringify(slim));
+    } catch(e) {}
+  }
+  function _clearQueue() {
+    try { sessionStorage.removeItem(QUEUE_SS_KEY); } catch(e) {}
+  }
+  let _syncQueue = _loadQueue(); // khôi phục queue từ lần trước nếu tab vừa refresh
 
   // ── Load / save config ──────────────────────────────────────
   const DEFAULT_CFG = {
@@ -304,6 +323,19 @@ const CLOUD = (() => {
   //  MERGE LOGIC — xử lý xung đột
   // ═══════════════════════════════════════════════════════════
 
+  // ── Clamp timestamp tương lai — phòng clock thiết bị chạy sai ──
+  // Nếu timestamp > now + 5 phút → coi như "now" để không chiếm ưu thế merge
+  const _CLOCK_SKEW_MS = 5 * 60 * 1000;
+  function safeTs(raw) {
+    if (!raw) return '';
+    if (typeof raw !== 'string') return '';
+    const t = new Date(raw).getTime();
+    if (isNaN(t)) return '';
+    const now = Date.now();
+    if (t > now + _CLOCK_SKEW_MS) return new Date(now).toISOString(); // clamp
+    return raw;
+  }
+
   // Collections append-only: giữ union của local + cloud theo id
   // Nếu cùng id mà _updated khác → lấy cái mới hơn
   function mergeAppendOnly(local, cloudDocs) {
@@ -317,11 +349,15 @@ const CLOUD = (() => {
       if (!existing) {
         map[r.id] = r; // doc mới từ thiết bị khác → thêm vào
       } else {
-        // So sánh timestamp — lấy bản mới hơn; _deleted luôn thắng
-        const localTs  = existing._updated || existing.date || '';
-        const cloudTs  = r._updated || r.date || '';
-        if (r._deleted) { map[r.id] = r; } // xóa thắng mọi bản
-        else if (cloudTs > localTs) map[r.id] = r;
+        const localTs = safeTs(existing._updated || existing.createdAt || existing.date || '');
+        const cloudTs = safeTs(r._updated || r.createdAt || r.date || '');
+        if (r._deleted) {
+          // _deleted chỉ thắng nếu cloud thực sự MỚI HƠN local
+          if (cloudTs >= localTs) map[r.id] = r;
+          // else: local update mới hơn lệnh xóa → giữ local, push lại cloud
+        } else if (cloudTs > localTs) {
+          map[r.id] = r;
+        }
         // nếu local mới hơn: giữ local (sẽ push lên cloud sau)
       }
     });
@@ -336,11 +372,13 @@ const CLOUD = (() => {
       if (!map[p.id]) {
         map[p.id] = p; // sản phẩm mới từ thiết bị khác
       } else {
-        const localTs = map[p.id]._updated || '';
-        const cloudTs = p._updated || '';
-        // Nếu cloud có _deleted:true → luôn ưu tiên (xóa thắng)
-        if (p._deleted) { map[p.id] = p; }
-        else if (cloudTs > localTs) map[p.id] = p;
+        const localTs = safeTs(map[p.id]._updated || '');
+        const cloudTs = safeTs(p._updated || '');
+        // _deleted chỉ thắng khi cloud thực sự mới hơn local
+        if (p._deleted) {
+          if (cloudTs >= localTs) map[p.id] = p;
+          // else: local update mới hơn lệnh xóa → giữ local
+        } else if (cloudTs > localTs) { map[p.id] = p; }
         // local mới hơn → giữ nguyên, sẽ push lên cloud
       }
     });
@@ -354,12 +392,12 @@ const CLOUD = (() => {
       if (!byName[key]) {
         byName[key] = p;
       } else {
-        // Giữ bản mới hơn theo _updated; nếu bằng nhau giữ bản có id nhỏ hơn (ổn định)
-        const existTs = byName[key]._updated || byName[key].createdAt || '';
-        const newTs   = p._updated || p.createdAt || '';
-        // _deleted luôn thắng — không được giữ stock của bản đã xóa
+        // Giữ bản mới hơn theo _updated; safeTs() loại bỏ clock skew thiết bị
+        const existTs = safeTs(byName[key]._updated || byName[key].createdAt || '');
+        const newTs   = safeTs(p._updated || p.createdAt || '');
+        // _deleted chỉ thắng khi timestamp xóa MỚI HƠN bản đang có
         if (p._deleted && !byName[key]._deleted) {
-          byName[key] = p; // bản xóa thắng bản còn tồn tại
+          if (newTs >= existTs) byName[key] = p; // xóa thắng chỉ khi mới hơn
         } else if (!p._deleted && byName[key]._deleted) {
           // bản _deleted hiện tại thắng, giữ nguyên
         } else if (newTs > existTs) {
@@ -387,6 +425,7 @@ const CLOUD = (() => {
       dtn_returns:         'returns',
       dtn_paymentlogs:     'paymentlogs',
       dtn_products:        'products',
+      dtn_shipping:        'shipping',
       dtn_settings:        'settings',
       dtn_staff_accounts:  'staff_accounts',
       dtn_admin_cred:      'admin_cred',
@@ -455,7 +494,8 @@ const CLOUD = (() => {
       // Cập nhật localStorage
       const dbMap = {
         sales:'dtn_sales', imports:'dtn_imports', returns:'dtn_returns',
-        paymentlogs:'dtn_paymentlogs', products:'dtn_products', settings:'dtn_settings'
+        paymentlogs:'dtn_paymentlogs', products:'dtn_products',
+        shipping:'dtn_shipping', settings:'dtn_settings'
       };
       if (dbMap[stateKey]) {
         try {
@@ -470,7 +510,8 @@ const CLOUD = (() => {
           // Toast thông báo có dữ liệu mới
           if (typeof toast === 'function') {
             const labels = { sales:'đơn hàng', imports:'phiếu nhập', returns:'hoàn trả',
-                             paymentlogs:'thanh toán', products:'sản phẩm', settings:'cài đặt' };
+                             paymentlogs:'thanh toán', products:'sản phẩm',
+                             shipping:'vận chuyển', settings:'cài đặt' };
             toast(`🔄 Đồng bộ: ${labels[stateKey]||stateKey} vừa được cập nhật từ thiết bị khác`, 'info');
           }
         } catch(e) {}
@@ -486,7 +527,7 @@ const CLOUD = (() => {
     // Dừng listener cũ nếu có
     stopListeners();
 
-    const collections = ['dtn_sales','dtn_imports','dtn_returns','dtn_paymentlogs','dtn_products','dtn_settings','dtn_staff_accounts','dtn_admin_cred'];
+    const collections = ['dtn_sales','dtn_imports','dtn_returns','dtn_paymentlogs','dtn_products','dtn_shipping','dtn_settings','dtn_staff_accounts','dtn_admin_cred'];
     collections.forEach(colName => {
       try {
         const ref = col(colName);
@@ -495,7 +536,8 @@ const CLOUD = (() => {
           // Chỉ xử lý thay đổi từ server (không phải local pending writes)
           const serverChanges = snap.docChanges().filter(ch => !ch.doc.metadata.hasPendingWrites);
           if (serverChanges.length === 0) return;
-          const docs = snap.docs.map(d => d.data());
+          // normalizeDoc: Firestore Timestamp → ISO string
+          const docs = snap.docs.map(d => normalizeDoc(d.data()));
           applyCloudData(colName, docs, false);
           _lastSync = ts(); notifyStatus();
         }, (err) => {
@@ -511,6 +553,23 @@ const CLOUD = (() => {
     _listeners = [];
   }
 
+  // ── Helper: chuyển Firestore Timestamp → ISO string ──────────
+  function normalizeTs(val) {
+    if (!val) return '';
+    if (typeof val === 'string') return val;
+    // Firestore Timestamp object
+    if (val && typeof val.toDate === 'function') return val.toDate().toISOString();
+    return '';
+  }
+
+  // ── Helper: chuẩn hoá _updated trong doc trả về từ Firestore ─
+  function normalizeDoc(data) {
+    if (!data) return data;
+    const d = { ...data };
+    if (d._updated) d._updated = normalizeTs(d._updated);
+    return d;
+  }
+
   // ═══════════════════════════════════════════════════════════
   //  PUSH (ghi lên Firestore)
   // ═══════════════════════════════════════════════════════════
@@ -518,12 +577,15 @@ const CLOUD = (() => {
     if (!_db) return false;
     try {
       const rows = Array.isArray(data) ? data : [data];
-      const ref   = col(colName);
-      const now   = ts();
+      const ref  = col(colName);
 
-      if (rows.length === 0) return true; // không xoá — append-only
+      if (rows.length === 0) return true;
 
-      // Firestore batch tối đa 500 ops, chia nhỏ nếu cần
+      // serverTimestamp() — Firestore ghi timestamp theo đồng hồ server,
+      // không phụ thuộc đồng hồ thiết bị → conflict resolution chính xác
+      const SERVER_TS = firebase.firestore.FieldValue.serverTimestamp();
+
+      // Firestore batch tối đa 500 ops, chia nhỏ 400 để dự phòng
       const chunks = [];
       for (let i = 0; i < rows.length; i += 400) chunks.push(rows.slice(i, i+400));
 
@@ -531,8 +593,9 @@ const CLOUD = (() => {
         const batch = _db.batch();
         chunk.forEach(r => {
           if (!r || !r.id) return;
+          // _updated: server timestamp (đồng hồ server, không lệch do device)
           // merge:true → chỉ cập nhật field thay đổi, không xoá field khác
-          batch.set(ref.doc(String(r.id)), { ...r, _updated: now }, { merge: true });
+          batch.set(ref.doc(String(r.id)), { ...r, _updated: SERVER_TS }, { merge: true });
         });
         await batch.commit();
       }
@@ -557,6 +620,7 @@ const CLOUD = (() => {
         pushCollection('dtn_sales',          S.sales       || []),
         pushCollection('dtn_returns',        S.returns     || []),
         pushCollection('dtn_paymentlogs',    S.paymentlogs || []),
+        pushCollection('dtn_shipping',       S.shipping    || []),
         pushCollection('dtn_settings',       [{ id:'settings', ...S.settings }]),
         pushCollection('dtn_staff_accounts', _staffForSync),
         pushCollection('dtn_admin_cred',     _adminCredForSync),
@@ -570,20 +634,95 @@ const CLOUD = (() => {
     }
   }
 
-  // ── Queue / flush ───────────────────────────────────────────
-  function enqueue(key, S) {
-    _syncQueue = _syncQueue.filter(q => q.key !== key);
-    _syncQueue.push({ key, ts: Date.now() });
-    if (_online) flushQueue(S);
+  // ── Queue / flush — chỉ push collection thay đổi, không syncAll ──
+  let _retryDelay = 5000;   // backoff bắt đầu 5s, tăng dần đến 60s
+  let _retryTimer = null;
+
+  function enqueue(colName, data) {
+    // Ghi đè entry cũ cùng colName để không push trùng
+    _syncQueue = _syncQueue.filter(q => q.colName !== colName);
+    _syncQueue.push({ colName, data, ts: Date.now() });
+    _saveQueue(_syncQueue); // persist để sống qua refresh
+    if (_online) flushQueue();
   }
-  async function flushQueue(S_ref) {
+
+  // Map colName → stateKey để hydrate data từ S khi queue restore sau refresh
+  const _COL_TO_STATE = {
+    'dtn_products':     'products',
+    'dtn_imports':      'imports',
+    'dtn_sales':        'sales',
+    'dtn_shipping':     'shipping',
+    'dtn_returns':      'returns',
+    'dtn_paymentlogs':  'paymentlogs',
+    'dtn_settings':     'settings',
+    'dtn_staff_accounts': null, // đọc từ localStorage riêng
+  };
+
+  function hydrateQueueItem(item) {
+    // Nếu item đã có data (enqueue trong session hiện tại) → dùng ngay
+    if (item.data) return item;
+    // Item từ sessionStorage (sau refresh) → hydrate từ state hiện tại
+    const S = window._S;
+    const stateKey = _COL_TO_STATE[item.colName];
+    if (stateKey === null) {
+      // staff_accounts: đọc từ localStorage
+      try {
+        const v = localStorage.getItem('dtn_staff_accounts');
+        return { ...item, data: v ? JSON.parse(v) : [] };
+      } catch(e) { return { ...item, data: [] }; }
+    }
+    if (stateKey === 'settings' && S) {
+      return { ...item, data: [{ id: 'settings', ...S.settings }] };
+    }
+    if (S && S[stateKey]) return { ...item, data: S[stateKey] };
+    return null; // không hydrate được → bỏ qua
+  }
+
+  async function flushQueue() {
     if (_flushing || !_online || !_db || _syncQueue.length === 0) return;
     _flushing = true;
+    _syncStatus = 'syncing'; notifyStatus();
+
+    // Hydrate items thiếu data (từ sessionStorage sau refresh)
+    const items = _syncQueue
+      .map(item => hydrateQueueItem(item))
+      .filter(Boolean); // bỏ những item không hydrate được
+
+    if (items.length === 0) {
+      _syncQueue = []; _clearQueue();
+      _flushing = false; _syncStatus = 'idle'; notifyStatus();
+      return;
+    }
+
     try {
-      const S = S_ref || window._S;
-      if (S) await syncAll(S);
-      _syncQueue = [];
-    } finally { _flushing = false; }
+      await Promise.all(items.map(item => pushCollection(item.colName, item.data)));
+
+      // ✅ Push thành công: chỉ xóa những item đã push thành công
+      const pushedCols = new Set(items.map(i => i.colName));
+      _syncQueue = _syncQueue.filter(q => {
+        if (!pushedCols.has(q.colName)) return true;   // collection khác: giữ
+        const pushed = items.find(i => i.colName === q.colName);
+        return pushed && q.ts > pushed.ts;             // item mới hơn trong session: giữ
+      });
+      _saveQueue(_syncQueue);
+      if (_syncQueue.length === 0) _clearQueue();
+
+      _retryDelay = 5000; // reset backoff
+      _syncStatus = 'ok'; _lastSync = ts(); notifyStatus();
+    } catch(e) {
+      console.warn('[CLOUD] flushQueue error:', e);
+      // ❌ Lỗi: giữ queue, retry với exponential backoff
+      _syncStatus = 'error'; notifyStatus();
+      clearTimeout(_retryTimer);
+      _retryTimer = setTimeout(() => {
+        _flushing = false;
+        _retryDelay = Math.min(_retryDelay * 2, 60000);
+        flushQueue();
+      }, _retryDelay);
+      return;
+    } finally {
+      _flushing = false;
+    }
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -595,12 +734,13 @@ const CLOUD = (() => {
     try {
       const pullCol = async (name) => {
         const snap = await col(name).get();
-        return snap.docs.map(d => d.data());
+        // normalizeDoc: chuyển Firestore Timestamp → ISO string cho _updated
+        return snap.docs.map(d => normalizeDoc(d.data()));
       };
-      const [products, imports, sales, returns, paymentlogs, settingsArr, staffArr, adminCredArr] = await Promise.all([
+      const [products, imports, sales, returns, paymentlogs, shipping, settingsArr, staffArr, adminCredArr] = await Promise.all([
         pullCol('dtn_products'), pullCol('dtn_imports'),  pullCol('dtn_sales'),
-        pullCol('dtn_returns'),  pullCol('dtn_paymentlogs'), pullCol('dtn_settings'),
-        pullCol('dtn_staff_accounts'), pullCol('dtn_admin_cred'),
+        pullCol('dtn_returns'),  pullCol('dtn_paymentlogs'), pullCol('dtn_shipping'),
+        pullCol('dtn_settings'), pullCol('dtn_staff_accounts'), pullCol('dtn_admin_cred'),
       ]);
 
       // Merge từng collection vào state hiện tại (không overwrite)
@@ -609,9 +749,10 @@ const CLOUD = (() => {
       if (sales.length)       applyCloudData('dtn_sales',           sales,       true);
       if (returns.length)     applyCloudData('dtn_returns',         returns,     true);
       if (paymentlogs.length) applyCloudData('dtn_paymentlogs',     paymentlogs, true);
+      if (shipping.length)    applyCloudData('dtn_shipping',        shipping,    true);
       if (settingsArr.length) applyCloudData('dtn_settings',        settingsArr, true);
       if (staffArr.length)    applyCloudData('dtn_staff_accounts',  staffArr,    true);
-      if (adminCredArr.length) applyCloudData('dtn_admin_cred',      adminCredArr, true);
+      if (adminCredArr.length) applyCloudData('dtn_admin_cred',     adminCredArr, true);
 
       _syncStatus = 'ok'; _lastSync = ts();
       _bootDone = true;
@@ -633,18 +774,18 @@ const CLOUD = (() => {
     try {
       const pullCol = async (name) => {
         const snap = await col(name).get();
-        return snap.docs.map(d => { const v = d.data(); delete v._updated; return v; });
+        return snap.docs.map(d => { const v = normalizeDoc(d.data()); delete v._updated; return v; });
       };
-      const [products, imports, sales, returns, paymentlogs, settingsArr, staffArr, adminCredArr] = await Promise.all([
+      const [products, imports, sales, returns, paymentlogs, shipping, settingsArr, staffArr, adminCredArr] = await Promise.all([
         pullCol('dtn_products'), pullCol('dtn_imports'), pullCol('dtn_sales'),
-        pullCol('dtn_returns'),  pullCol('dtn_paymentlogs'), pullCol('dtn_settings'),
-        pullCol('dtn_staff_accounts'), pullCol('dtn_admin_cred')
+        pullCol('dtn_returns'),  pullCol('dtn_paymentlogs'), pullCol('dtn_shipping'),
+        pullCol('dtn_settings'), pullCol('dtn_staff_accounts'), pullCol('dtn_admin_cred')
       ]);
       const settings = settingsArr.length > 0
         ? (() => { const s = {...settingsArr[0]}; delete s.id; delete s._updated; return s; })()
         : null;
       _syncStatus = 'ok'; _lastSync = ts(); notifyStatus();
-      return { products, imports, sales, returns, paymentlogs, settings, staff_accounts: staffArr, admin_cred: adminCredArr };
+      return { products, imports, sales, returns, paymentlogs, shipping, settings, staff_accounts: staffArr, admin_cred: adminCredArr };
     } catch(e) {
       console.warn('[CLOUD] pullAll error:', e);
       _syncStatus = 'error'; notifyStatus();
@@ -673,16 +814,22 @@ const CLOUD = (() => {
     }
   }
 
-  // ── 3-2-1 Backup (giữ nguyên) ──────────────────────────────
+  // ── 3-2-1 Backup ────────────────────────────────────────────
+  // Slot localStorage: backup nhanh (cùng thiết bị)
+  // Slot Firestore:    backup an toàn (cloud, tồn tại dù xóa cache)
   const DAILY_KEY  = 'dtn_backup_daily';
   const DAILY_TIME = 'dtn_backup_daily_time';
   const REMIND_KEY = 'dtn_backup_remind';
+  const CLOUD_BACKUP_TIME = 'dtn_cloud_backup_time';
+  const CLOUD_BACKUP_INTERVAL = 6 * 60 * 60 * 1000; // 6 giờ
 
   function runDailyBackup(exportFn) {
     try {
       const now = Date.now();
       const last = parseInt(localStorage.getItem(DAILY_TIME)||'0');
-      if (now - last < 30*60*1000) return;
+      if (now - last < 30*60*1000) return; // chạy tối đa 30 phút/lần
+
+      // 1. Xoay vòng localStorage (slot 1→2→3)
       const data = exportFn();
       const slot2 = localStorage.getItem(DAILY_KEY+'_2');
       const slot1 = localStorage.getItem(DAILY_KEY+'_1');
@@ -690,7 +837,39 @@ const CLOUD = (() => {
       if (slot1) { try { localStorage.setItem(DAILY_KEY+'_2', slot1); } catch(e) {} }
       localStorage.setItem(DAILY_KEY+'_1', data);
       localStorage.setItem(DAILY_TIME, String(now));
+
+      // 2. Backup lên Firestore (6 giờ/lần) — thoát khỏi giới hạn localStorage
+      const lastCloud = parseInt(localStorage.getItem(CLOUD_BACKUP_TIME)||'0');
+      if (_db && _cfg?.enabled && _online && now - lastCloud > CLOUD_BACKUP_INTERVAL) {
+        try {
+          const backupDoc = {
+            id: 'snapshot',
+            data,                              // chuỗi JSON nén
+            _backedUpAt: firebase.firestore.FieldValue.serverTimestamp(),
+            _size: data.length,
+            _device: navigator.userAgent.slice(0, 80)
+          };
+          col('dtn_backup').doc('snapshot')
+            .set(backupDoc, { merge: false })  // overwrite — chỉ giữ bản mới nhất
+            .then(() => {
+              localStorage.setItem(CLOUD_BACKUP_TIME, String(now));
+              console.info('[CLOUD] Backup snapshot pushed to Firestore');
+            })
+            .catch(e => console.warn('[CLOUD] cloud backup error:', e.message));
+        } catch(e) {}
+      }
     } catch(e) { console.warn('[CLOUD] dailyBackup error:', e); }
+  }
+
+  // Pull snapshot backup từ Firestore về
+  async function pullCloudBackup() {
+    if (!_db) return null;
+    try {
+      const doc = await col('dtn_backup').doc('snapshot').get();
+      if (!doc.exists) return null;
+      const d = doc.data();
+      return { data: d.data, backedUpAt: normalizeTs(d._backedUpAt), size: d._size };
+    } catch(e) { console.warn('[CLOUD] pullCloudBackup error:', e); return null; }
   }
   function shouldRemindDownload() {
     try { return Date.now() - parseInt(localStorage.getItem(REMIND_KEY)||'0') > 7*24*60*60*1000; } catch(e) { return false; }
@@ -715,10 +894,10 @@ const CLOUD = (() => {
     saveCfg(cfg) { saveCfg(cfg); stopListeners(); initClient(); },
     getStatus,
     onStatus(fn) { _statusListeners.push(fn); },
-    push(key, S) {
-      window._S = S;
+    // colName: 'dtn_products' | 'dtn_sales' | ...  data: array hoặc single doc
+    push(colName, data) {
       if (!_cfg?.enabled) return;
-      enqueue(key, S);
+      enqueue(colName, Array.isArray(data) ? data : [data]);
     },
     // Push array có chứa _deleted records để đồng bộ xóa sang thiết bị khác
     _pushDeletedRecord(colName, arrayWithDeleted) {
@@ -726,12 +905,15 @@ const CLOUD = (() => {
       pushCollection(colName, arrayWithDeleted).catch(e => console.warn('[CLOUD] pushDeleted error:', e));
     },
     syncAll: (S) => syncAll(S),
+    // Flush queue tồn đọng (dùng cho heartbeat / visibilitychange)
+    flushPending: () => flushQueue(),
     pullAll,
     bootSync,       // ← dùng trong bootApp()
     startListeners, // ← gọi sau bootSync hoàn thành
     stopListeners,
     testConnection,
     runDailyBackup,
+    pullCloudBackup,
     shouldRemindDownload,
     markDownloaded,
     getRotatingBackup,
@@ -754,25 +936,31 @@ const AUTH = (() => {
 
   let _sessionCache = null;
 
-  // ── SHA-256 hash (async) ──────────────────────────────────────
-  async function hashPw(password) {
+  // ── Salt theo từng user — tránh rainbow table chung ─────────
+  // username được lowercase+trim để đồng nhất giữa các thiết bị
+  function makeSalt(username) {
+    return 'dtn_2025_' + (username || 'admin').trim().toLowerCase();
+  }
+
+  // ── SHA-256 hash async (dùng khi có thể await) ───────────────
+  async function hashPw(password, username) {
+    const salt = makeSalt(username);
     try {
       const enc = new TextEncoder();
-      const buf = await crypto.subtle.digest('SHA-256', enc.encode(password + 'dtn_salt_2025'));
+      const buf = await crypto.subtle.digest('SHA-256', enc.encode(password + salt));
       return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
     } catch(e) {
-      // Fallback: simple obfuscation nếu Web Crypto không khả dụng (HTTP context)
-      let h = 0;
-      const s = password + 'dtn_salt_2025';
-      for (let i = 0; i < s.length; i++) { h = ((h << 5) - h) + s.charCodeAt(i); h |= 0; }
-      return 'fb_' + Math.abs(h).toString(16);
+      // Fallback khi Web Crypto không khả dụng (HTTP context không có HTTPS)
+      return hashPwSync(password, username);
     }
   }
 
-  // Sync wrapper — dùng khi không thể await (login check)
-  function hashPwSync(password) {
+  // ── Sync hash (djb2 + per-user salt) — dùng khi không thể await
+  // Ghi chú: djb2 không phải thuật toán mật mã — brute-force lock (5 lần/5 phút)
+  // là lớp bảo vệ chính. Nâng lên bcrypt cần backend riêng.
+  function hashPwSync(password, username) {
     let h = 5381;
-    const s = password + 'dtn_salt_2025';
+    const s = password + makeSalt(username);
     for (let i = 0; i < s.length; i++) { h = ((h << 5) + h) + s.charCodeAt(i); h |= 0; }
     return 'sync_' + Math.abs(h).toString(36);
   }
@@ -836,24 +1024,35 @@ const AUTH = (() => {
     try { localStorage.removeItem(SESSION_KEY); } catch(e) {}
   }
 
-  // ── Verify password (hỗ trợ cả hash và plaintext legacy) ─────
+  // ── Verify password — username dùng để tạo per-user salt ──────
   function verifyPassword(inputPw, stored) {
     if (!stored) return false;
-    // Nếu cred đã được hash → so sánh hash
     if (stored.hashed) {
-      const h = hashPwSync(inputPw);
-      return stored.password === h;
+      // Thử salt mới (per-user) trước, fallback sang salt cũ để migrate
+      const hNew = hashPwSync(inputPw, stored.username);
+      if (stored.password === hNew) return true;
+      // Fallback: hash với salt cũ cố định (tương thích dữ liệu cũ)
+      const hOld = hashPwSync_legacy(inputPw);
+      return stored.password === hOld;
     }
-    // Legacy plaintext — so sánh trực tiếp (sẽ migrate sau)
+    // Legacy plaintext
     return stored.password === inputPw;
   }
 
-  // ── Migrate plaintext → hash nếu cần ─────────────────────────
+  // Hash với salt cố định cũ — chỉ dùng để migrate, không tạo hash mới
+  function hashPwSync_legacy(password) {
+    let h = 5381;
+    const s = password + 'dtn_salt_2025';
+    for (let i = 0; i < s.length; i++) { h = ((h << 5) + h) + s.charCodeAt(i); h |= 0; }
+    return 'sync_' + Math.abs(h).toString(36);
+  }
+
+  // ── Migrate plaintext / salt-cũ → per-user salt khi login ────
   function migrateIfNeeded(inputPw, storedObj, saveFunc) {
-    if (!storedObj.hashed && storedObj.password === inputPw) {
-      // Chuyển sang hash ngay sau khi đăng nhập thành công
-      const hashed = hashPwSync(inputPw);
-      saveFunc(hashed, true);
+    const correctHash = hashPwSync(inputPw, storedObj.username);
+    if (!storedObj.hashed || storedObj.password !== correctHash) {
+      // Rehash với salt mới ngay sau khi đăng nhập thành công
+      saveFunc(correctHash, true);
     }
   }
 
@@ -862,18 +1061,18 @@ const AUTH = (() => {
     try {
       const raw = localStorage.getItem(ADMIN_KEY);
       if (!raw) {
-        const hashed = hashPwSync('admin123');
+        const hashed = hashPwSync('admin123', 'admin');
         saveAdminCred('admin', hashed, true);
         return;
       }
       const parsed = JSON.parse(raw);
       if (!parsed || typeof parsed.username !== 'string' || !parsed.username.trim() || !parsed.password) {
-        const hashed = hashPwSync('admin123');
+        const hashed = hashPwSync('admin123', 'admin');
         saveAdminCred('admin', hashed, true);
       }
     } catch(e) {
       try {
-        const hashed = hashPwSync('admin123');
+        const hashed = hashPwSync('admin123', 'admin');
         localStorage.setItem(ADMIN_KEY, JSON.stringify({ username: 'admin', password: hashed, hashed: true }));
       } catch(e2) {}
     }
@@ -911,13 +1110,12 @@ const AUTH = (() => {
       const staffList = getStaffAccounts();
       const staff = staffList.find(s => s.username === username && s.active && verifyPassword(password, s));
       if (staff) {
-        // Migrate staff plaintext nếu cần
-        if (!staff.hashed && staff.password === password) {
-          const hashed = hashPwSync(password);
+        // Migrate sang per-user salt khi login
+        migrateIfNeeded(password, staff, (h, isH) => {
           const list = getStaffAccounts();
           const idx = list.findIndex(x => x.id === staff.id);
-          if (idx >= 0) { list[idx].password = hashed; list[idx].hashed = true; saveStaffAccounts(list); }
-        }
+          if (idx >= 0) { list[idx].password = h; list[idx].hashed = isH; saveStaffAccounts(list); }
+        });
         clearFailedAttempts();
         const user = { username: staff.username, role: 'staff', displayName: staff.displayName || staff.username };
         setSession(user);
@@ -929,10 +1127,18 @@ const AUTH = (() => {
       const attemptsLeft = BF_MAX_ATTEMPTS - bfNow.attempts;
       return null; // login fail — caller hiển thị lỗi chung, attemptsLeft dùng nếu muốn
     },
+    verifyPasswordPublic: verifyPassword,
     getLockStatus,
     getRemainingAttempts() { const s = getLockStatus(); return s.locked ? 0 : BF_MAX_ATTEMPTS - s.attempts; },
 
-    logout() { clearSession(); clearTimeout(_autoLogoutTimer); clearTimeout(_autoLogoutWarningTimer); },
+    logout() {
+      clearSession();
+      clearTimeout(_autoLogoutTimer);
+      clearTimeout(_autoLogoutWarningTimer);
+      // Dừng realtime listeners và xóa sync queue pending khi đăng xuất
+      if (window.CLOUD) { try { window.CLOUD.stopListeners(); } catch(e) {} }
+      try { sessionStorage.removeItem('dtn_sync_queue'); } catch(e) {}
+    },
     currentUser() { return getSession(); },
     isAdmin() { const u = getSession(); return u && u.role === 'admin'; },
     getAdminCred,
@@ -943,7 +1149,7 @@ const AUTH = (() => {
       if (!admin) return false;
       if (!verifyPassword(oldPass, admin)) return false;
       if (!newPass || newPass.length < 6) return false;
-      const hashed = hashPwSync(newPass);
+      const hashed = hashPwSync(newPass, admin.username);
       const updated = new Date().toISOString();
       try { localStorage.setItem(ADMIN_KEY, JSON.stringify({ ...admin, password: hashed, hashed: true, _updated: updated })); } catch(e) {}
       // Sync lên cloud
@@ -963,17 +1169,26 @@ const AUTH = (() => {
       if (!admin) return false;
       if (!verifyPassword(password, admin)) return false;
       if (!newUsername || !newUsername.trim()) return false;
+
+      const trimmed = newUsername.trim();
       const updated = new Date().toISOString();
-      try { localStorage.setItem(ADMIN_KEY, JSON.stringify({ ...admin, username: newUsername.trim(), _updated: updated })); } catch(e) {}
+
+      // QUAN TRỌNG: username thay đổi → salt thay đổi → phải rehash password
+      // với salt mới (makeSalt(trimmed)) để lần đăng nhập tiếp theo không bị vỡ
+      const newHash = hashPwSync(password, trimmed);
+      const newCred = { ...admin, username: trimmed, password: newHash, hashed: true, _updated: updated };
+
+      try { localStorage.setItem(ADMIN_KEY, JSON.stringify(newCred)); } catch(e) {}
       const sess = getSession();
-      if (sess && sess.role === 'admin') { sess.username = newUsername.trim(); setSession(sess); }
-      // Sync lên cloud
+      if (sess && sess.role === 'admin') { sess.username = trimmed; setSession(sess); }
+
+      // Sync lên cloud với hash mới
       try {
         if (typeof CLOUD !== 'undefined' && CLOUD.getCfg().enabled && typeof firebase !== 'undefined' && firebase.apps.length) {
           const db = firebase.firestore();
           const shopId = CLOUD.getCfg().shopId || 'shop1';
           db.collection('shops').doc(shopId).collection('dtn_admin_cred').doc('admin_cred')
-            .set({ id:'admin_cred', username: newUsername.trim(), password: admin.password, hashed: admin.hashed !== false, _updated: updated }, { merge: true })
+            .set({ id:'admin_cred', username: trimmed, password: newHash, hashed: true, _updated: updated }, { merge: true })
             .catch(e => console.warn('[AUTH] cloud push admin_cred error:', e));
         }
       } catch(e) {}
@@ -988,7 +1203,7 @@ const AUTH = (() => {
       if (!newPass || newPass.length < 6) return false;
       const admin = getAdminCred();
       if (!admin) return false;
-      const hashed = hashPwSync(newPass);
+      const hashed = hashPwSync(newPass, admin.username);
       saveAdminCred(admin.username, hashed, true);
       try { localStorage.removeItem(SESSION_KEY); } catch(e) {}
       _sessionCache = null;
@@ -1002,11 +1217,10 @@ const AUTH = (() => {
       if (list.find(s => s.username === username)) return false;
       const admin = getAdminCred();
       if (admin && admin.username === username) return false;
-      const hashed = hashPwSync(password);
+      const hashed = hashPwSync(password, username);
       list.push({ id: 'st' + Date.now(), username, password: hashed, hashed: true, displayName: displayName || username, active: true, createdAt: new Date().toISOString() });
       saveStaffAccounts(list);
-      // Đồng bộ lên cloud ngay sau khi thêm nhân viên
-      try { if (typeof CLOUD !== 'undefined' && window._S) CLOUD.push('staff_accounts', window._S); } catch(e) {}
+      try { if (typeof CLOUD !== 'undefined') CLOUD.push('dtn_staff_accounts', list); } catch(e) {}
       return true;
     },
     updateStaff(id, fields) {
@@ -1014,25 +1228,27 @@ const AUTH = (() => {
       const idx = list.findIndex(s => s.id === id);
       if (idx < 0) return false;
       // Nếu update password → hash trước
-      if (fields.password) { fields.password = hashPwSync(fields.password); fields.hashed = true; }
+      if (fields.password) { fields.password = hashPwSync(fields.password, list[idx].username); fields.hashed = true; }
       list[idx] = { ...list[idx], ...fields, _updated: new Date().toISOString() };
       saveStaffAccounts(list);
-      // Đồng bộ lên cloud ngay sau khi cập nhật nhân viên
-      try { if (typeof CLOUD !== 'undefined' && window._S) CLOUD.push('staff_accounts', window._S); } catch(e) {}
+      try { if (typeof CLOUD !== 'undefined') CLOUD.push('dtn_staff_accounts', list); } catch(e) {}
       return true;
     },
     deleteStaff(id) {
-      const list = getStaffAccounts().filter(s => s.id !== id);
-      saveStaffAccounts(list);
-      // Đồng bộ lên cloud ngay sau khi xoá nhân viên
-      try { if (typeof CLOUD !== 'undefined' && window._S) CLOUD.push('staff_accounts', window._S); } catch(e) {}
+      const now = new Date().toISOString();
+      const all = getStaffAccounts();
+      // Soft-delete: đánh dấu _deleted thay vì filter ngay, để cloud nhận lệnh xóa
+      const withDeleted = all.map(s => s.id === id ? { ...s, _deleted: true, _updated: now } : s);
+      const active = withDeleted.filter(s => !s._deleted);
+      saveStaffAccounts(active);
+      try { if (typeof CLOUD !== 'undefined') CLOUD.push('dtn_staff_accounts', withDeleted); } catch(e) {}
     },
     changeStaffPassword(id, oldPass, newPass) {
       const list = getStaffAccounts();
       const s = list.find(x => x.id === id);
       if (!s) return false;
       if (!verifyPassword(oldPass, s)) return false;
-      s.password = hashPwSync(newPass);
+      s.password = hashPwSync(newPass, s.username);
       s.hashed = true;
       saveStaffAccounts(list);
       return true;
@@ -1253,18 +1469,10 @@ function showLoginScreen() {
   render();
 }
 
-// Helper: kiểm tra mật khẩu admin hỗ trợ cả hash lẫn legacy plaintext
+// Helper: uỷ quyền hoàn toàn cho AUTH.verifyPassword để không duplicate logic hash
 function verifyAdminPwForDisplay(inputPw, cred) {
   if (!cred || !inputPw) return false;
-  if (cred.hashed) {
-    // Dùng cùng hashPwSync như AUTH nội bộ
-    let h = 5381;
-    const s = inputPw + 'dtn_salt_2025';
-    for (let i = 0; i < s.length; i++) { h = ((h << 5) + h) + s.charCodeAt(i); h |= 0; }
-    const hashed = 'sync_' + Math.abs(h).toString(36);
-    return cred.password === hashed;
-  }
-  return cred.password === inputPw; // legacy plaintext
+  return AUTH.verifyPasswordPublic(inputPw, cred);
 }
 
 // ─── Trang quản lý tài khoản (chỉ admin) ──────────────────────
@@ -1600,20 +1808,19 @@ async function bootApp() {
     if (cloudCfg.enabled) {
       setTimeout(() => {
         CLOUD.startListeners();
-        // Heartbeat 30s — phòng khi onSnapshot mất kết nối (mobile sleep, mạng chập)
+        // Heartbeat nhẹ: chỉ flush queue tồn đọng — onSnapshot đã xử lý realtime
+        // Không bootSync lại (tránh đọc Firestore ~8 collection mỗi 30s = 240 reads/phút)
         let _hbIv = setInterval(() => {
-          if (!document.hidden && AUTH.currentUser()) {
-            try { CLOUD.bootSync(S).then(() => render()).catch(()=>{}); } catch(e) {}
+          if (!document.hidden && AUTH.currentUser() && navigator.onLine) {
+            try { CLOUD.flushPending(); } catch(e) {}
           }
-        }, 30000);
-        // Khi app quay lại foreground: restart listener + pull ngay
+        }, 60000);
+        // Khi app quay lại foreground: restart listener + chỉ flush queue offline
         document.addEventListener('visibilitychange', () => {
           if (!document.hidden && AUTH.currentUser() && cloudCfg.enabled) {
             CLOUD.stopListeners();
             CLOUD.startListeners();
-            setTimeout(() => {
-              try { CLOUD.bootSync(S).then(() => render()).catch(()=>{}); } catch(e) {}
-            }, 300);
+            setTimeout(() => { try { CLOUD.flushPending(); } catch(e) {} }, 300);
           }
         });
       }, 500);
@@ -1916,6 +2123,18 @@ const SEED = {
   settings: {shopName:'Đá Tự Nhiên Pro',address:'',phone:'',email:'',taxId:'',defaultVat:10,corporateTaxRate:20}
 };
 
+// ─── Helper: reload toàn bộ state từ DB sau khi import/restore ──
+// Dùng ở tất cả các restore flow để đảm bảo đồng bộ, không bỏ sót field
+function reloadStateFromDB() {
+  S.products    = DB.get('dtn_products',    SEED.products);
+  S.imports     = DB.get('dtn_imports',     SEED.imports);
+  S.sales       = DB.get('dtn_sales',       SEED.sales);
+  S.shipping    = DB.get('dtn_shipping',    SEED.shipping);
+  S.settings    = DB.get('dtn_settings',    SEED.settings);
+  S.returns     = DB.get('dtn_returns',     []);
+  S.paymentlogs = DB.get('dtn_paymentlogs', []);
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  STATE
 // ═══════════════════════════════════════════════════════════════
@@ -1938,8 +2157,9 @@ const S = {
 
 function save(key) {
   const map = {products:'dtn_products',imports:'dtn_imports',sales:'dtn_sales',shipping:'dtn_shipping',settings:'dtn_settings',returns:'dtn_returns',paymentlogs:'dtn_paymentlogs'};
-  if (map[key]) {
-    const ok = DB.set(map[key], S[key]);
+  const colName = map[key];
+  if (colName) {
+    const ok = DB.set(colName, S[key]);
     if (!ok) {
       // Lưu thất bại — cảnh báo nghiêm trọng
       S._saveError = true;
@@ -1949,8 +2169,13 @@ function save(key) {
     }
     S._saveError = false;
   }
-  // Push lên Firebase NGAY LẬP TỨC sau khi localStorage đã ghi xong
-  if (typeof CLOUD !== 'undefined') CLOUD.push(key, S);
+  // Push LÊN ĐÚNG COLLECTION đã thay đổi — không ghi đè toàn bộ
+  if (typeof CLOUD !== 'undefined' && colName) {
+    const data = key === 'settings'
+      ? [{ id: 'settings', ...S[key] }]  // settings là single doc
+      : (S[key] || []);
+    CLOUD.push(colName, data);
+  }
 
   // Auto-backup + archive chạy sau (không ảnh hưởng sync tốc độ)
   clearTimeout(save._timer);
@@ -1981,15 +2206,15 @@ function softDelete(arrayKey, id, extraFn) {
   const withDeleted = S[arrayKey].map(r => r.id === id ? { ...r, _deleted: true, _updated: now } : r);
   // Lọc sạch local NGAY LẬP TỨC để UI phản ánh đúng
   S[arrayKey] = withDeleted.filter(r => !r._deleted);
-  const dbMap = {products:'dtn_products',imports:'dtn_imports',sales:'dtn_sales',returns:'dtn_returns',paymentlogs:'dtn_paymentlogs'};
+  const dbMap = {products:'dtn_products',imports:'dtn_imports',sales:'dtn_sales',shipping:'dtn_shipping',returns:'dtn_returns',paymentlogs:'dtn_paymentlogs'};
   if (dbMap[arrayKey]) DB.set(dbMap[arrayKey], S[arrayKey]);
   if (typeof extraFn === 'function') extraFn();
   // Push lên cloud: dùng withDeleted (có _deleted:true) để thiết bị khác nhận lệnh xóa
   if (typeof CLOUD !== 'undefined' && CLOUD._pushDeletedRecord) {
     CLOUD._pushDeletedRecord(dbMap[arrayKey], withDeleted);
   } else if (typeof CLOUD !== 'undefined') {
-    // Fallback: push toàn bộ array hiện tại (không có _deleted, cloud sẽ không xóa trên thiết bị khác ngay)
-    CLOUD.push(arrayKey, S);
+    // Fallback: push withDeleted để cloud nhận lệnh xóa
+    CLOUD.push(dbMap[arrayKey], withDeleted);
   }
 }
 
@@ -3556,12 +3781,7 @@ function pgInventory() {
                 mergeLog.push(`"${winner.name}" (${group.length} bản → gộp, tồn kho: ${totalStock} ${winner.unit})`);
               });
               save('products'); save('imports'); save('sales');
-              // Sync lên cloud
-              if (typeof CLOUD !== 'undefined') {
-                CLOUD.enqueue('products', S);
-                CLOUD.enqueue('imports', S);
-                CLOUD.enqueue('sales', S);
-              }
+              // save() đã tự push từng collection lên cloud — không cần enqueue thủ công
               toast('✅ Đã gộp ' + dupGroups.length + ' nhóm trùng: ' + mergeLog.join('; '), 'success');
               rebuild(); render();
             }
@@ -4193,8 +4413,9 @@ function openProduct(prod, rebuild) {
           width: f.width || 0,
           multiVariant: f.multiVariant,
           variants: f.multiVariant ? f.variants : [] };
-        if (prod) { S.products = S.products.map(x => x.id === prod.id ? { ...x, ...p } : x); toast('Đã cập nhật sản phẩm', 'success'); }
-        else { S.products = [...S.products, { ...p, id: 'p' + uid() }]; toast('Đã thêm sản phẩm mới', 'success'); }
+        const nowIso = new Date().toISOString();
+        if (prod) { S.products = S.products.map(x => x.id === prod.id ? { ...x, ...p, _updated: nowIso } : x); toast('Đã cập nhật sản phẩm', 'success'); }
+        else { S.products = [...S.products, { ...p, id: 'p' + uid(), createdAt: nowIso, _updated: nowIso }]; toast('Đã thêm sản phẩm mới', 'success'); }
         save('products'); S.modal = null; rebuild(); render();
       } }, '💾 Lưu')
     ]
@@ -4899,8 +5120,9 @@ function openImport(existing, rebuild) {
                 return vt;
               }
             });
-            return { ...p, stock: newStock, buyPrice: calc.price, variants: newVariants };
+            return { ...p, stock: newStock, buyPrice: calc.price, variants: newVariants, _updated: new Date().toISOString() };
           });
+          const _editNow = new Date().toISOString();
           S.imports = S.imports.map(x => x.id === existing.id ? {
             ...x, date: dateSaved, supplier, productId: it.productId,
             productName: prod?.name || '', qty: calc.qty, unit: prod?.unit || '',
@@ -4912,7 +5134,8 @@ function openImport(existing, rebuild) {
             shipVatRate,
             shipQty: isPartOfBatch ? (existing.shipQty || shipQtyVal) : shipQtyVal,
             shipUnitPrice: isPartOfBatch ? (existing.shipUnitPrice || shipUnitP) : shipUnitP,
-            status: paid >= total ? 'paid' : 'debt', note: noteStr
+            status: paid >= total ? 'paid' : 'debt', note: noteStr,
+            _updated: _editNow
           } : x);
           save('imports'); save('products');
           toast('✅ Đã cập nhật phiếu nhập', 'success');
@@ -4959,7 +5182,9 @@ function openImport(existing, rebuild) {
               variantId: vtId || null,
               shipFee: itemShipFee, shipUnit, shipVatRate, shipQty: shipQtyVal, shipUnitPrice: shipUnitP,
               status: itemPaid >= itemTotal ? 'paid' : 'debt',
-              note: noteStr
+              note: noteStr,
+              createdAt: new Date().toISOString(),
+              _updated: new Date().toISOString()
             };
             newRecs.push(rec);
           });
@@ -4990,7 +5215,7 @@ function openImport(existing, rebuild) {
               const newM2 = (vt.stockM2||0) + vtAdd;
               return { ...vt, stockM2: newM2, stockPieces: ppm2 > 0 ? Math.round(newM2 * ppm2) : (vt.stockPieces||0) };
             });
-            return { ...p, stock: newStock, buyPrice: delta.lastPrice, variants: newVariants };
+            return { ...p, stock: newStock, buyPrice: delta.lastPrice, variants: newVariants, _updated: new Date().toISOString() };
           });
 
           S.imports = [...newRecs, ...S.imports];
@@ -5998,7 +6223,9 @@ function openSale(rebuild, preselectedProduct) {
             variantId:it.variantId||null, variantSize:vtSize,
             status:itemPaid>=itemTotal&&itemTotal>0?'done':'debt', note:inpNote.value.trim(),
             staffId: selStaffId || AUTH.currentUser()?.username || null,
-            staffName: selStaffName || AUTH.currentUser()?.displayName || null
+            staffName: selStaffName || AUTH.currentUser()?.displayName || null,
+            createdAt: new Date().toISOString(),
+            _updated: new Date().toISOString()
           };
           newRecs2.push(rec);
         });
@@ -6023,7 +6250,7 @@ function openSale(rebuild, preselectedProduct) {
             const newM2=(vt.stockM2||0)-vtMinus; // cho phép âm kho
             return {...vt, stockM2:newM2, stockPieces:ppm2>0?Math.round(newM2*ppm2):(vt.stockPieces||0)-Math.round(vtMinus*(ppm2||0))};
           });
-          return {...p, stock:newStock, variants:newVariants};
+          return {...p, stock:newStock, variants:newVariants, _updated: new Date().toISOString()};
         });
 
         S.sales=[...newRecs2, ...S.sales];
@@ -6262,11 +6489,12 @@ function pgDebt() {
                               time: inpTime.value,
                               amount: amt,
                               note: inpNote.value.trim(),
-                              createdAt: new Date().toISOString()
+                              createdAt: new Date().toISOString(),
+                              _updated: new Date().toISOString()
                             };
                             const newPaid = (S.sales.find(x=>x.id===s.id)?.paid || s.paid) + amt;
                             const done = newPaid >= s.total;
-                            S.sales = S.sales.map(x => x.id === s.id ? { ...x, paid: newPaid, status: done ? 'done' : 'debt' } : x);
+                            S.sales = S.sales.map(x => x.id === s.id ? { ...x, paid: newPaid, status: done ? 'done' : 'debt', _updated: new Date().toISOString() } : x);
                             S.paymentlogs = [log, ...(S.paymentlogs || [])];
                             logs.unshift(log);
                             save('sales'); save('paymentlogs');
@@ -6438,11 +6666,12 @@ function pgDebt() {
                               time: inpTime.value,
                               amount: amt,
                               note: inpNote.value.trim(),
-                              createdAt: new Date().toISOString()
+                              createdAt: new Date().toISOString(),
+                              _updated: new Date().toISOString()
                             };
                             const newPaid = (S.imports.find(x=>x.id===i.id)?.paid || i.paid) + amt;
                             const done = newPaid >= i.total;
-                            S.imports = S.imports.map(x => x.id === i.id ? { ...x, paid: newPaid, status: done ? 'paid' : 'debt' } : x);
+                            S.imports = S.imports.map(x => x.id === i.id ? { ...x, paid: newPaid, status: done ? 'paid' : 'debt', _updated: new Date().toISOString() } : x);
                             S.paymentlogs = [log, ...(S.paymentlogs || [])];
                             logs.unshift(log);
                             save('imports'); save('paymentlogs');
@@ -6766,7 +6995,8 @@ function pgDebt() {
                                 time: timeIn,
                                 amount: pay,
                                 note: noteIn || 'Thu nợ tổng',
-                                createdAt: new Date().toISOString()
+                                createdAt: new Date().toISOString(),
+                                _updated: new Date().toISOString()
                               });
                               return { ...sale, paid: newPaid, status: done ? 'done' : 'debt' };
                             });
@@ -9007,11 +9237,7 @@ function pgSettings() {
               reader.onload = ev => {
                 const ok = DB.importAll(ev.target.result);
                 if (ok) {
-                  S.products = DB.get('dtn_products', SEED.products);
-                  S.imports  = DB.get('dtn_imports',  SEED.imports);
-                  S.sales    = DB.get('dtn_sales',    SEED.sales);
-                  S.shipping = DB.get('dtn_shipping', SEED.shipping);
-                  S.settings = DB.get('dtn_settings', SEED.settings);
+                  reloadStateFromDB();
                   toast('Đã nhập dữ liệu thành công!', 'success'); render();
                 } else { toast('File không hợp lệ!', 'error'); }
               };
@@ -9117,8 +9343,8 @@ function pgSync() {
         })(),
         h('div', { className: 'stat' },
           h('div', { className: 'stat-label' }, '🔄 Backup xoay vòng'),
-          h('div', { className: 'stat-val', style: { fontSize: 15, color: rotTime ? 'var(--green)' : 'var(--text3)' } }, rotTime ? '✅ Có' : '— Chưa có'),
-          h('div', { className: 'stat-change' }, 'Lần cuối: ' + fmtTs(rotTime))
+          h('div', { className: 'stat-val', style: { fontSize: 15, color: rotTime ? 'var(--green)' : 'var(--text3)' } }, rotTime ? '✅ Local+Cloud' : '— Chưa có'),
+          h('div', { className: 'stat-change' }, 'Local: ' + fmtTs(rotTime) + ' · Cloud: 6h/lần')
         ),
         h('div', { className: 'stat' },
           h('div', { className: 'stat-label' }, '📊 Dữ liệu'),
@@ -9196,11 +9422,12 @@ function pgSync() {
             S.confirm = { msg: '⬇️ Kéo & merge dữ liệu từ Firebase về?\n\nDữ liệu sẽ được MERGE (không ghi đè) — đơn hàng/phiếu nhập từ cloud sẽ được bổ sung vào local. Sản phẩm sẽ lấy bản mới nhất.', onYes: async () => {
               const result = await CLOUD.pullAll();
               if (!result) { toast('❌ Không kéo được dữ liệu từ cloud!', 'error'); return; }
-              if (result.products.length > 0) { S.products = result.products; save('products'); }
-              if (result.imports.length > 0)  { S.imports  = result.imports;  save('imports'); }
-              if (result.sales.length > 0)    { S.sales    = result.sales;    save('sales'); }
-              if (result.returns.length > 0)  { S.returns  = result.returns;  save('returns'); }
+              if (result.products.length > 0)    { S.products    = result.products;    save('products'); }
+              if (result.imports.length > 0)     { S.imports     = result.imports;     save('imports'); }
+              if (result.sales.length > 0)       { S.sales       = result.sales;       save('sales'); }
+              if (result.returns.length > 0)     { S.returns     = result.returns;     save('returns'); }
               if (result.paymentlogs.length > 0) { S.paymentlogs = result.paymentlogs; save('paymentlogs'); }
+              if ((result.shipping||[]).length > 0) { S.shipping = result.shipping;    save('shipping'); }
               if (result.settings) { S.settings = { ...S.settings, ...result.settings }; save('settings'); }
               toast('✅ Đã kéo dữ liệu từ Firebase!', 'success');
               render();
@@ -9273,12 +9500,7 @@ function pgSync() {
               S.confirm = { msg: `⚠️ Khôi phục từ slot ${slot}? Dữ liệu hiện tại sẽ bị ghi đè.`, onYes: () => {
                 const ok = DB.importAll(bk);
                 if (ok) {
-                  S.products = DB.get('dtn_products', SEED.products);
-                  S.imports  = DB.get('dtn_imports',  SEED.imports);
-                  S.sales    = DB.get('dtn_sales',    SEED.sales);
-                  S.settings = DB.get('dtn_settings', SEED.settings);
-                  S.returns  = DB.get('dtn_returns',  []);
-                  S.paymentlogs = DB.get('dtn_paymentlogs', []);
+                  reloadStateFromDB();
                   toast('✅ Đã khôi phục từ slot ' + slot + '!', 'success'); render();
                 } else { toast('❌ Slot ' + slot + ' bị lỗi!', 'error'); }
               } }; render();
@@ -9292,6 +9514,44 @@ function pgSync() {
             toast('✅ Đã tạo backup xoay vòng!', 'success');
             rebuild();
           } }, '💾 Tạo ngay')
+        )
+      ),
+
+      // ══════════════════════════════════════════════════════════
+      // BẢN CLOUD SNAPSHOT — Firestore backup toàn bộ (6h/lần)
+      // ══════════════════════════════════════════════════════════
+      cloudCfg.enabled && h('div', { className: 'card' },
+        h('div', { className: 'card-title' }, '☁️ Cloud Snapshot — Firestore Backup'),
+        h('div', { style: { fontSize: 13, color: 'var(--text2)', marginBottom: 14, lineHeight: 1.8 } },
+          '• Snapshot nén toàn bộ dữ liệu được đẩy lên Firestore mỗi 6 giờ', h('br'),
+          '• Tồn tại độc lập với localStorage — xóa cache trình duyệt không mất', h('br'),
+          '• Có thể khôi phục từ bất kỳ thiết bị nào đã cấu hình cùng Firebase'
+        ),
+        h('div', { style: { display: 'flex', gap: 10, flexWrap: 'wrap' } },
+          h('button', { className: 'btn btn-primary btn-sm', onClick: async (e) => {
+            e.target.disabled = true; e.target.textContent = '⏳ Đang kéo...';
+            const bk = await CLOUD.pullCloudBackup();
+            e.target.disabled = false; e.target.textContent = '⬇️ Kéo Cloud Snapshot';
+            if (!bk) { toast('☁️ Chưa có cloud snapshot hoặc lỗi kết nối', 'error'); return; }
+            const fmtSize = bk.size > 1024*1024 ? (bk.size/1024/1024).toFixed(1)+'MB' : (bk.size/1024).toFixed(0)+'KB';
+            S.confirm = {
+              msg: `Khôi phục từ Cloud Snapshot?\n📅 Thời điểm: ${fmtTs(bk.backedUpAt)}\n📦 Kích thước: ${fmtSize}\n\n⚠️ Dữ liệu hiện tại sẽ bị ghi đè hoàn toàn.`,
+              onYes: () => {
+                const ok = DB.importAll(bk.data);
+                if (ok) {
+                  reloadStateFromDB();
+                  toast('✅ Đã khôi phục từ Cloud Snapshot!', 'success'); render();
+                } else { toast('❌ Snapshot bị lỗi hoặc không tương thích!', 'error'); }
+              }
+            }; render();
+          } }, '⬇️ Kéo Cloud Snapshot'),
+          h('button', { className: 'btn btn-sm', onClick: () => {
+            // Force tạo cloud backup ngay (xóa cooldown)
+            try { localStorage.removeItem('dtn_cloud_backup_time'); localStorage.removeItem('dtn_backup_daily_time'); } catch(e) {}
+            CLOUD.runDailyBackup(() => DB.exportCompact());
+            toast('⏳ Đang đẩy Cloud Snapshot lên Firestore...', 'info');
+            rebuild();
+          } }, '☁️ Đẩy ngay lên Cloud')
         )
       ),
 
@@ -9351,13 +9611,7 @@ function pgSync() {
               reader.onload = ev => {
                 const ok = DB.importAll(ev.target.result);
                 if (ok) {
-                  S.products = DB.get('dtn_products', SEED.products);
-                  S.imports  = DB.get('dtn_imports',  SEED.imports);
-                  S.sales    = DB.get('dtn_sales',    SEED.sales);
-                  S.shipping = DB.get('dtn_shipping', SEED.shipping);
-                  S.settings = DB.get('dtn_settings', SEED.settings);
-                  S.returns      = DB.get('dtn_returns',     []);
-                  S.paymentlogs  = DB.get('dtn_paymentlogs', []);
+                  reloadStateFromDB();
                   toast('✅ Nhập dữ liệu thành công!', 'success'); render();
                 } else { toast('❌ File JSON không hợp lệ!', 'error'); }
               };
@@ -9371,12 +9625,7 @@ function pgSync() {
             S.confirm = { msg: '⚠️ Khôi phục từ auto-backup (slot nhanh)? Dữ liệu hiện tại sẽ bị ghi đè.', onYes: () => {
               const ok = DB.importAll(backup);
               if (ok) {
-                S.products = DB.get('dtn_products', SEED.products);
-                S.imports  = DB.get('dtn_imports',  SEED.imports);
-                S.sales    = DB.get('dtn_sales',    SEED.sales);
-                S.settings = DB.get('dtn_settings', SEED.settings);
-                S.returns  = DB.get('dtn_returns',  []);
-                S.paymentlogs = DB.get('dtn_paymentlogs', []);
+                reloadStateFromDB();
                 toast('✅ Đã khôi phục từ auto-backup!', 'success'); render();
               } else { toast('❌ Backup bị lỗi!', 'error'); }
             } }; render();
@@ -9390,12 +9639,7 @@ function pgSync() {
             if (!json) { toast('Vui lòng dán JSON!', 'error'); return; }
             const ok = DB.importAll(json);
             if (ok) {
-              S.products = DB.get('dtn_products', SEED.products);
-              S.imports  = DB.get('dtn_imports',  SEED.imports);
-              S.sales    = DB.get('dtn_sales',    SEED.sales);
-              S.settings = DB.get('dtn_settings', SEED.settings);
-              S.returns  = DB.get('dtn_returns',  []);
-              S.paymentlogs = DB.get('dtn_paymentlogs', []);
+              reloadStateFromDB();
               toast('✅ Nhập từ JSON thành công!', 'success'); ta.value = ''; render();
             } else { toast('❌ JSON không hợp lệ!', 'error'); }
           } }, '✅ Nhập JSON');
@@ -9499,7 +9743,7 @@ function pgReturns() {
                         msg: `Xoá phiếu trả hàng của "${r.customer}" (${fmtQty(r.returnQty)} ${r.unit} ${r.productName})?\n\n⚠️ Hàng sẽ bị lấy lại ra khỏi kho và doanh thu đơn gốc sẽ được khôi phục.`,
                         onYes: () => {
                           // Hoàn tác: trừ lại hàng khỏi kho (vì khi tạo phiếu trả đã cộng vào kho)
-                          S.products = S.products.map(p => p.id === r.productId ? { ...p, stock: Math.max(0, p.stock - r.returnQty) } : p);
+                          S.products = S.products.map(p => p.id === r.productId ? { ...p, stock: Math.max(0, p.stock - r.returnQty), _updated: new Date().toISOString() } : p);
                           // Hoàn tác: cộng lại doanh thu đơn gốc nếu có
                           if (r.saleId) {
                             S.sales = S.sales.map(s => {
@@ -9667,11 +9911,13 @@ function openReturnFromSale(sale, onDone) {
           refundVat,
           refundValue,
           reason: inpReason.value.trim(),
-          saleId: sale.id
+          saleId: sale.id,
+          createdAt: new Date().toISOString(),
+          _updated: new Date().toISOString()
         };
 
         // Hoàn hàng vào kho
-        S.products = S.products.map(p => p.id === sale.productId ? { ...p, stock: p.stock + returnQty } : p);
+        S.products = S.products.map(p => p.id === sale.productId ? { ...p, stock: p.stock + returnQty, _updated: new Date().toISOString() } : p);
 
         // Điều chỉnh đơn gốc
         S.sales = S.sales.map(s => {
@@ -9858,11 +10104,13 @@ function openReturn(rebuild) {
           refundVat,
           refundValue,
           reason: inpReason.value.trim(),
-          saleId: saleId || null
+          saleId: saleId || null,
+          createdAt: new Date().toISOString(),
+          _updated: new Date().toISOString()
         };
 
         // Cộng hàng trả lại vào kho
-        S.products = S.products.map(p => p.id === productId ? { ...p, stock: p.stock + returnQty } : p);
+        S.products = S.products.map(p => p.id === productId ? { ...p, stock: p.stock + returnQty, _updated: new Date().toISOString() } : p);
 
         // Điều chỉnh đơn bán gốc: trừ SL và doanh thu
         if (origSale) {
@@ -10311,7 +10559,8 @@ function pgStaffReport() {
                 time: now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0'),
                 note: 'Thu nợ nhanh từ báo cáo nhân viên',
                 staffId: AUTH.currentUser()?.username || null,
-                createdAt: now.toISOString()
+                createdAt: now.toISOString(),
+                _updated: now.toISOString()
               };
               S.paymentlogs = [...(S.paymentlogs || []), log];
               save('sales'); save('paymentlogs');
@@ -11652,7 +11901,9 @@ th.r{text-align:right}th.c{text-align:center}
       let _drag=false, _sx=0, _sy=0, _ol=0, _ot=0, _moved=false;
       function xy(e){ return e.touches?{x:e.touches[0].clientX,y:e.touches[0].clientY}:{x:e.clientX,y:e.clientY}; }
       function start(e){
-        if(e.target.closest('button,input,textarea,select')) return;
+        // Cho phép drag nếu target CHÍNH là handle (ví dụ FAB là button),
+        // nhưng block nếu click vào button/input bên TRONG handle (vd: nút đóng trong panel header)
+        if(e.target !== handle && e.target.closest('button,input,textarea,select')) return;
         _drag=true; _moved=false;
         const {x,y}=xy(e);
         _sx=x; _sy=y;
@@ -11809,15 +12060,16 @@ async function initMainApp() {
     if (cloudCfg.enabled) {
       setTimeout(() => {
         CLOUD.startListeners();
+        // Heartbeat nhẹ: chỉ flush queue tồn đọng, không pull lại toàn bộ cloud
         setInterval(() => {
-          if (!document.hidden && AUTH.currentUser()) {
-            try { CLOUD.bootSync(S).then(() => render()).catch(()=>{}); } catch(e) {}
+          if (!document.hidden && AUTH.currentUser() && navigator.onLine) {
+            try { CLOUD.flushPending(); } catch(e) {}
           }
-        }, 30000);
+        }, 60000);
         document.addEventListener('visibilitychange', () => {
           if (!document.hidden && AUTH.currentUser() && cloudCfg.enabled) {
             CLOUD.stopListeners(); CLOUD.startListeners();
-            setTimeout(() => { try { CLOUD.bootSync(S).then(() => render()).catch(()=>{}); } catch(e) {} }, 300);
+            setTimeout(() => { try { CLOUD.flushPending(); } catch(e) {} }, 300);
           }
         });
       }, 500);
