@@ -235,11 +235,19 @@ const CLOUD = (() => {
   let _bootDone = false; // đã hoàn thành boot sync chưa
 
   // ── Load / save config ──────────────────────────────────────
+  const DEFAULT_CFG = {
+    apiKey:     'AIzaSyBcBGZL9-S2TJv0vZMBJYQGNc9kDLU5484',
+    authDomain: 'datunhienlinhvu-42a05.firebaseapp.com',
+    projectId:  'datunhienlinhvu-42a05',
+    shopId:     'shop1',
+    enabled:    true
+  };
   function loadCfg() {
     try {
       const v = localStorage.getItem(CFG_KEY);
-      _cfg = v ? JSON.parse(v) : { apiKey:'', authDomain:'', projectId:'', shopId:'shop1', enabled:false };
-    } catch(e) { _cfg = { apiKey:'', authDomain:'', projectId:'', shopId:'shop1', enabled:false }; }
+      _cfg = v ? JSON.parse(v) : { ...DEFAULT_CFG };
+      if (!_cfg.apiKey) _cfg = { ...DEFAULT_CFG };
+    } catch(e) { _cfg = { ...DEFAULT_CFG }; }
   }
   function saveCfg(cfg) {
     _cfg = cfg;
