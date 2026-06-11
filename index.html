@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Đá Tự Nhiên Linh Vũ">
-<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.9.0</title>
+<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.9.2</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
 <!-- Firebase SDK -->
@@ -10936,16 +10936,18 @@ const AICHAT = (() => {
   let _cfg = loadCfg();
   let _container = null;
 
-  // ── Build system prompt với dữ liệu sản phẩm hiện tại ──────
+  // ── Build system prompt với dữ liệu sản phẩm THỜI GIAN THỰC ──
   function buildSystemPrompt() {
-    const products = (window._S || S).products || [];
-    const settings = (window._S || S).settings || {};
+    // Luôn đọc thẳng từ S (state toàn cục, được cập nhật realtime bởi Firestore listener)
+    const products = (S.products || []).filter(p => !p._deleted);
+    const settings = S.settings || {};
     const shopName = settings.shopName || 'Đá Tự Nhiên Linh Vũ';
     const phone = settings.phone || '';
     const address = settings.address || '';
 
     const productList = products.map(p => {
-      let line = `- ID:${p.id} | Tên: ${p.name} | Loại: ${p.type||''} | Xuất xứ: ${p.origin||''} | Đơn vị: ${p.unit||''} | Giá bán: ${p.sellPrice||0}đ | Tồn kho: ${p.stock||0}`;
+      // KHÔNG đưa tồn kho vào prompt — tránh AI báo hàng còn/hết với khách
+      let line = `- ID:${p.id} | Tên: ${p.name} | Loại: ${p.type||''} | Xuất xứ: ${p.origin||''} | Đơn vị: ${p.unit||''} | Giá bán: ${p.sellPrice||0}đ`;
       if (p.description) line += ` | Mô tả: ${p.description}`;
       if (p.variants && p.variants.length > 0) {
         line += ` | Quy cách: ` + p.variants.map(v => `${v.tileW||'?'}x${v.tileH||'?'}cm`).join(', ');
@@ -10953,27 +10955,33 @@ const AICHAT = (() => {
       return line;
     }).join('\n');
 
+    const _now = new Date();
+    const _pad = n => String(n).padStart(2,'0');
+    const todayLocal = `${_now.getFullYear()}-${_pad(_now.getMonth()+1)}-${_pad(_now.getDate())}`;
+
     return `Bạn là trợ lý bán hàng thông minh của cửa hàng "${shopName}".
 Địa chỉ: ${address} | Hotline: ${phone}
+Ngày hiện tại: ${todayLocal}
 
-DANH SÁCH SẢN PHẨM HIỆN CÓ:
+DANH SÁCH SẢN PHẨM (cập nhật thời gian thực từ hệ thống):
 ${productList || '(Chưa có sản phẩm nào)'}
 
 NHIỆM VỤ:
-1. Trả lời câu hỏi về sản phẩm, giá cả, tồn kho một cách tự nhiên, thân thiện.
+1. Trả lời câu hỏi về sản phẩm, giá cả một cách tự nhiên, thân thiện.
 2. Khi khách hỏi giá hoặc yêu cầu báo giá (ví dụ: "báo giá đá granite 50m²", "giá đá hoa cương xanh"), hãy:
    - Tìm sản phẩm phù hợp trong danh sách
    - Tính toán chính xác (số lượng × đơn giá)
    - Trả về JSON báo giá trong thẻ <QUOTATION>...</QUOTATION>
 3. Nếu không tìm thấy sản phẩm phù hợp, hỏi thêm thông tin.
-4. Luôn trả lời bằng tiếng Việt, ngắn gọn, chuyên nghiệp.
+4. QUAN TRỌNG: TUYỆT ĐỐI KHÔNG đề cập đến tồn kho, số lượng tồn, hàng còn hay hết trong bất kỳ câu trả lời nào. Nếu khách hỏi về tình trạng hàng, hãy bảo họ liên hệ trực tiếp qua hotline.
+5. Luôn trả lời bằng tiếng Việt, ngắn gọn, chuyên nghiệp.
 
 FORMAT JSON BÁO GIÁ (khi được yêu cầu):
 <QUOTATION>
 {
   "customerName": "tên khách (nếu biết, để trống nếu không)",
   "customerPhone": "",
-  "date": "YYYY-MM-DD",
+  "date": "${todayLocal}",
   "items": [
     {
       "productId": "id sản phẩm",
@@ -11099,10 +11107,11 @@ Sau thẻ QUOTATION, tiếp tục trả lời bình thường để giải thíc
     if (!match) return null;
     try {
       const q = JSON.parse(match[1].trim());
-      // Gắn ảnh từ S.products
+      // Gắn ảnh từ S.products (lấy thời gian thực, bỏ qua sản phẩm đã xoá)
       if (q.items) {
+        const activeProducts = (S.products || []).filter(p => !p._deleted);
         q.items = q.items.map(item => {
-          const prod = (S.products || []).find(p => p.id === item.productId || p.name === item.productName);
+          const prod = activeProducts.find(p => p.id === item.productId || p.name === item.productName);
           return { ...item, image: prod?.image || '', description: prod?.description || '' };
         });
       }
@@ -11119,16 +11128,14 @@ Sau thẻ QUOTATION, tiếp tục trả lời bình thường để giải thíc
   function buildQuotationPDF(q) {
     const settings = S.settings || {};
     const shop = settings.shopName || 'Đá Tự Nhiên Linh Vũ';
-    // Fix: dùng timezone local thay vì toISOString() (UTC) — tránh lệch ngày khi ở VN (UTC+7)
+    // Luôn dùng ngày local của thiết bị — KHÔNG tin vào q.date từ AI (AI có thể trả sai ngày)
     const _now = new Date();
     const _pad = n => String(n).padStart(2,'0');
-    const todayLocal = `${_now.getFullYear()}-${_pad(_now.getMonth()+1)}-${_pad(_now.getDate())}`;
-    const dateStr = q.date || todayLocal;
-    const [yy, mm, dd] = dateStr.split('-');
-    const dateVN = `${dd}/${mm}/${yy}`;
-    // Tính ngày hết hạn dùng Date với timezone-safe parsing
-    const [_vy, _vm, _vd] = dateStr.split('-').map(Number);
-    const validTo = new Date(_vy, _vm - 1, _vd + (q.validDays || 7));
+    // Ngày theo local timezone (UTC+7 VN) — tránh toISOString() bị lệch ngày
+    const dateStr = `${_now.getFullYear()}-${_pad(_now.getMonth()+1)}-${_pad(_now.getDate())}`;
+    const dateVN = `${_pad(_now.getDate())}/${_pad(_now.getMonth()+1)}/${_now.getFullYear()}`;
+    // Tính ngày hết hạn dùng local Date constructor — timezone-safe
+    const validTo = new Date(_now.getFullYear(), _now.getMonth(), _now.getDate() + (q.validDays || 7));
     const validToVN = `${_pad(validTo.getDate())}/${_pad(validTo.getMonth()+1)}/${validTo.getFullYear()}`;
     const quoteNo = 'BG' + Date.now().toString().slice(-6);
 
@@ -11469,7 +11476,7 @@ th.r{text-align:right}th.c{text-align:center}
       <b>☁️ Cloud Sync:</b> Khi Cloud được bật, API key tự động đồng bộ lên Firestore — đăng nhập trên bất kỳ thiết bị nào cũng dùng được ngay.<br><br>
       <b>Câu lệnh mẫu:</b><br>
       • "Báo giá đá granite đen 50m²"<br>
-      • "Tồn kho đá trắng còn bao nhiêu?"<br>
+      • "Giới thiệu các loại đá hoa cương hiện có"<br>
       • "Làm báo giá cho anh Minh 100m²"
     </div>
   </div>
@@ -11491,10 +11498,10 @@ th.r{text-align:right}th.c{text-align:center}
   <div id="aichat-msgs"></div>
 
   <div id="aichat-quick">
-    <button class="aichat-quick-btn" data-q="Tồn kho hiện tại còn gì?">📦 Kiểm kho</button>
+    <button class="aichat-quick-btn" data-q="Danh sách sản phẩm hiện có?">📋 Danh sách SP</button>
     <button class="aichat-quick-btn" data-q="Báo giá đá granite 50m²">💰 Báo giá</button>
-    <button class="aichat-quick-btn" data-q="Sản phẩm nào đang bán chạy nhất?">📈 Bán chạy</button>
-    <button class="aichat-quick-btn" data-q="So sánh các loại đá hiện có">🔍 So sánh</button>
+    <button class="aichat-quick-btn" data-q="Giới thiệu các loại đá tự nhiên hiện có">🔍 So sánh</button>
+    <button class="aichat-quick-btn" data-q="Đá nào phù hợp ốp sàn trong nhà?">💡 Tư vấn</button>
   </div>
 
   <div id="aichat-inputarea">
@@ -11847,7 +11854,7 @@ th.r{text-align:right}th.c{text-align:center}
             const pCount=(S.products||[]).length;
             const cfg=loadCfg();
             const pInfo=PROVIDERS[cfg.provider]||PROVIDERS.claude;
-            addMessage('assistant',`Xin chào! 👋 Tôi là trợ lý AI của cửa hàng.\nĐang dùng: ${pInfo.icon} ${pInfo.label}\n\nHiện có ${pCount} sản phẩm trong kho. Bạn có thể:\n• Hỏi về sản phẩm, giá cả, tồn kho\n• Yêu cầu "báo giá [tên đá] [số m²]"\n• Tôi sẽ tự tạo báo giá PDF có ảnh cho bạn!`);
+            addMessage('assistant',`Xin chào! 👋 Tôi là trợ lý AI của cửa hàng.\nĐang dùng: ${pInfo.icon} ${pInfo.label}\n\nDữ liệu ${pCount} sản phẩm vừa được cập nhật thời gian thực. Bạn có thể:\n• Hỏi về sản phẩm, giá cả, quy cách\n• Yêu cầu "báo giá [tên đá] [số m²]"\n• Tôi sẽ tự tạo báo giá PDF có ảnh cho bạn!\n\n📋 Lưu ý: Thông tin tồn kho vui lòng liên hệ trực tiếp qua hotline.`);
           }
           setTimeout(()=>input?.focus(),100);
         }
