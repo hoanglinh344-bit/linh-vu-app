@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Đá Tự Nhiên Linh Vũ">
-<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.8.2</title>
+<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.9.0</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
 <!-- Firebase SDK -->
@@ -200,7 +200,7 @@ textarea.form-input{resize:vertical;min-height:72px}
 let _raf = false; // render debounce flag — khai báo sớm để bootApp & logout dùng được
 
 // ═══════════════════════════════════════════════════════════════
-//  CLOUD — Firebase Firestore sync + Conflict Resolution (v7.8.2)
+//  CLOUD — Firebase Firestore sync + Conflict Resolution (v7.9.0)
 //
 //  Chiến lược xử lý xung đột multi-device:
 //  ─ Sales / Imports / Returns / Paymentlogs: APPEND-ONLY
@@ -1327,7 +1327,7 @@ function showLoginScreen() {
         <div style="text-align:center;margin-bottom:32px">
           <div style="width:64px;height:64px;background:linear-gradient(135deg,var(--accent),var(--accent2));border-radius:16px;display:flex;align-items:center;justify-content:center;font-size:32px;margin:0 auto 16px;box-shadow:0 4px 16px rgba(201,168,76,0.3)">💎</div>
           <div style="font-family:Georgia,serif;font-size:22px;font-weight:700;color:var(--text)">Đá Tự Nhiên Linh Vũ</div>
-          <div style="font-size:13px;color:var(--text2);margin-top:4px">Hệ thống quản lý v7.8.2</div>
+          <div style="font-size:13px;color:var(--text2);margin-top:4px">Hệ thống quản lý v7.9.0</div>
         </div>
         <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:28px">
           ${lockWarn}
@@ -2160,43 +2160,36 @@ const S = {
 function save(key) {
   const map = {products:'dtn_products',imports:'dtn_imports',sales:'dtn_sales',shipping:'dtn_shipping',settings:'dtn_settings',returns:'dtn_returns',paymentlogs:'dtn_paymentlogs'};
   const colName = map[key];
-  if (colName) {
-    const ok = DB.set(colName, S[key]);
-    if (!ok) {
-      // Lưu thất bại — cảnh báo nghiêm trọng
-      S._saveError = true;
-      toast('🚨 KHÔNG THỂ LƯU! Bộ nhớ thiết bị đầy. Hãy xuất backup JSON ngay!', 'error');
-      render();
-      return;
-    }
-    S._saveError = false;
-  }
-  // Push LÊN ĐÚNG COLLECTION đã thay đổi — không ghi đè toàn bộ
-  if (typeof CLOUD !== 'undefined' && colName) {
+
+  // ── Firebase-first: push ngay lên Firestore ──────────────────
+  // localStorage chỉ là cache tạm — nguồn dữ liệu chính là Firebase
+  if (typeof CLOUD !== 'undefined' && colName && CLOUD.getCfg().enabled) {
     const data = key === 'settings'
-      ? [{ id: 'settings', ...S[key] }]  // settings là single doc
+      ? [{ id: 'settings', ...S[key] }]
       : (S[key] || []);
     CLOUD.push(colName, data);
   }
 
-  // Auto-backup + archive chạy sau (không ảnh hưởng sync tốc độ)
+  // ── Cache vào localStorage (để hoạt động offline & boot nhanh) ──
+  if (colName) {
+    DB.set(colName, S[key]); // lỗi quota → bỏ qua (Firebase là nguồn chính)
+    S._saveError = false;
+  }
+
+  // ── Archive nếu localStorage gần đầy (chạy nền, không block) ──
   clearTimeout(save._timer);
   save._timer = setTimeout(() => {
-    // Kiểm tra ngưỡng và auto-archive nếu nguy hiểm
     const warn = DB.storageWarning();
     if (warn === 'danger') {
       const result = DB.archiveOldData();
       if (result.archivedSales > 0 || result.archivedImports > 0) {
-        toast(`🗂️ Đã archive ${result.archivedSales} đơn hàng và ${result.archivedImports} phiếu nhập cũ hơn 12 tháng để giải phóng bộ nhớ.`, 'info');
+        toast(`🗂️ Đã archive ${result.archivedSales} đơn hàng và ${result.archivedImports} phiếu nhập cũ để giải phóng cache.`, 'info');
         S.sales   = DB.get('dtn_sales',   S.sales);
         S.imports = DB.get('dtn_imports',  S.imports);
         S.paymentlogs = DB.get('dtn_paymentlogs', S.paymentlogs);
         render();
       }
     }
-    DB.autoBackup();
-    // 3-2-1: slot 2 — 30 phút xoay vòng
-    CLOUD.runDailyBackup(() => DB.exportCompact());
   }, 3000);
 }
 
@@ -2775,7 +2768,7 @@ function buildApp() {
       }, '🚪 Đăng xuất'),
       DB.isLocal() ? '✅ Dữ liệu đã lưu tự động' : '⚠️ Lưu tạm (phiên làm việc)',
       h('br'),
-      'v7.5.4 · Đá Tự Nhiên Linh Vũ © 2026'
+      'v7.9.0 · Đá Tự Nhiên Linh Vũ © 2026'
     )
   );
 
@@ -9300,8 +9293,8 @@ function pgSync() {
     wrap.appendChild(h('div', {},
       h('div', { className: 'page-header' },
         h('div', {},
-          h('div', { className: 'page-title' }, '🔄 Đồng Bộ & Sao Lưu 3-2-1'),
-          h('div', { className: 'page-sub' }, 'Local-first · Firebase Firestore · Backup xoay vòng · Xuất Excel')
+          h('div', { className: 'page-title' }, '🔥 Đồng Bộ & Sao Lưu'),
+          h('div', { className: 'page-sub' }, 'Firebase là nguồn dữ liệu chính · Backup về máy để dự phòng')
         )
       ),
 
@@ -9324,30 +9317,25 @@ function pgSync() {
       ),
 
       // ── TRẠNG THÁI TỔNG QUAN ──
-      h('div', { className: 'stats-grid', style: { gridTemplateColumns: 'repeat(4,1fr)', marginBottom: 20 } },
+      h('div', { className: 'stats-grid', style: { gridTemplateColumns: 'repeat(3,1fr)', marginBottom: 20 } },
         (() => {
-          const swLevel = DB.storageWarning();
-          const lsColor = !isLS ? 'var(--red)' : swLevel === 'danger' ? 'var(--red)' : swLevel === 'warning' ? 'var(--amber)' : 'var(--green)';
-          const swLabel = swLevel === 'danger' ? '🚨 Gần đầy!' : swLevel === 'warning' ? '⚠️ Dùng nhiều' : '✅ Hoạt động';
+          const c = cloudSt.enabled ? (cloudSt.online ? 'var(--green)' : 'var(--amber)') : 'var(--red)';
+          const label = cloudSt.enabled ? (cloudSt.online ? '✅ Online' : '📵 Offline') : '❌ Chưa bật';
           return h('div', { className: 'stat' },
-            h('div', { className: 'stat-label' }, '💾 LocalStorage'),
-            h('div', { className: 'stat-val', style: { fontSize: 15, color: lsColor } }, isLS ? swLabel : '❌ Không khả dụng'),
-            h('div', { className: 'stat-change' }, size + ' KB / ~5120 KB · Lưu: ' + fmtTs(lastSaved))
-          );
-        })(),
-        (() => {
-          const c = cloudSt.enabled ? (cloudSt.online ? 'var(--green)' : 'var(--amber)') : 'var(--text3)';
-          return h('div', { className: 'stat' },
-            h('div', { className: 'stat-label' }, '🔥 Firebase Cloud'),
-            h('div', { className: 'stat-val', style: { fontSize: 15, color: c } }, cloudSt.enabled ? (cloudSt.online ? '✅ Online' : '📵 Offline') : '— Chưa bật'),
+            h('div', { className: 'stat-label' }, '🔥 Firebase — Nguồn chính'),
+            h('div', { className: 'stat-val', style: { fontSize: 15, color: c } }, label),
             h('div', { className: 'stat-change' }, cloudSt.realtime ? '📡 Realtime ON · ' + cloudBadge(cloudSt) : cloudBadge(cloudSt))
           );
         })(),
-        h('div', { className: 'stat' },
-          h('div', { className: 'stat-label' }, '🔄 Backup xoay vòng'),
-          h('div', { className: 'stat-val', style: { fontSize: 15, color: rotTime ? 'var(--green)' : 'var(--text3)' } }, rotTime ? '✅ Local+Cloud' : '— Chưa có'),
-          h('div', { className: 'stat-change' }, 'Local: ' + fmtTs(rotTime) + ' · Cloud: 6h/lần')
-        ),
+        (() => {
+          const swLevel = DB.storageWarning();
+          const lsColor = swLevel === 'danger' ? 'var(--red)' : swLevel === 'warning' ? 'var(--amber)' : 'var(--text2)';
+          return h('div', { className: 'stat' },
+            h('div', { className: 'stat-label' }, '💾 Cache cục bộ'),
+            h('div', { className: 'stat-val', style: { fontSize: 15, color: lsColor } }, size + ' KB'),
+            h('div', { className: 'stat-change' }, 'Cache tạm để hoạt động offline · Lưu: ' + fmtTs(lastSaved))
+          );
+        })(),
         h('div', { className: 'stat' },
           h('div', { className: 'stat-label' }, '📊 Dữ liệu'),
           h('div', { className: 'stat-val', style: { fontSize: 15 } }, S.sales.length + ' đơn'),
@@ -9359,11 +9347,11 @@ function pgSync() {
       // BẬT 1 — FIREBASE FIRESTORE SYNC
       // ══════════════════════════════════════════════════════════
       h('div', { className: 'card' },
-        h('div', { className: 'card-title' }, '🔥 Bản 1 — Firebase Firestore (Real-time Sync)'),
+        h('div', { className: 'card-title' }, '🔥 Firebase Firestore — Nguồn dữ liệu chính'),
         h('div', { style: { fontSize: 13, color: 'var(--text2)', marginBottom: 14, lineHeight: 1.8 } },
-          '• Dữ liệu tự động sync lên cloud sau mỗi lần lưu', h('br'),
-          '• Dùng chung trên mọi thiết bị (điện thoại, máy tính)', h('br'),
-          '• Miễn phí (Spark plan) · NoSQL · Hoạt động offline tự động'
+          '• Mọi hành động lưu đều đẩy thẳng lên Firebase ngay lập tức', h('br'),
+          '• Dùng chung trên mọi thiết bị — điện thoại, máy tính, tablet', h('br'),
+          '• Hoạt động offline: cache tạm vào thiết bị, tự đồng bộ khi có mạng trở lại'
         ),
 
         // Firebase config form
@@ -9472,102 +9460,14 @@ function pgSync() {
       ),
 
       // ══════════════════════════════════════════════════════════
-      // BẢN 2 — BACKUP XOAY VÒNG (localStorage slot 2)
+      // BACKUP VỀ MÁY — Dự phòng khi Firebase có vấn đề
       // ══════════════════════════════════════════════════════════
       h('div', { className: 'card' },
-        h('div', { className: 'card-title' }, '🔄 Bản 2 — Backup xoay vòng 30 phút (3 phiên bản)'),
-        h('div', { style: { fontSize: 13, color: 'var(--text2)', marginBottom: 14, lineHeight: 1.8 } },
-          '• Tự động chạy mỗi 30 phút khi có thay đổi dữ liệu', h('br'),
-          '• Giữ 3 phiên bản xoay vòng — khôi phục được nếu save nhầm', h('br'),
-          '• Lưu trong localStorage riêng, tách biệt khỏi auto-backup nhanh'
+        h('div', { className: 'card-title' }, '💾 Backup về máy — Dự phòng Firebase'),
+        h('div', { style: { background: 'rgba(201,168,76,0.08)', border: '1px solid rgba(201,168,76,0.25)', borderRadius: 'var(--r2)', padding: '10px 14px', marginBottom: 14, fontSize: 12, color: 'var(--text2)', lineHeight: 1.8 } },
+          '⚠️ Dữ liệu chính lưu trên Firebase. Tải backup về máy để dự phòng trong trường hợp mất kết nối lâu dài hoặc cần khôi phục khẩn cấp. ', h('b', { style: { color: 'var(--accent)' } }, 'Nên tải 1 lần/tuần.')
         ),
-        h('div', { style: { background: 'var(--bg3)', borderRadius: 'var(--r2)', padding: '14px 16px', marginBottom: 12 } },
-          h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 } },
-            h('div', {},
-              h('div', { style: { fontWeight: 600, fontSize: 13 } }, '📦 Trạng thái backup xoay vòng'),
-              h('div', { style: { fontSize: 11, color: 'var(--text2)', marginTop: 4 } },
-                'Slot 1: ' + (CLOUD.getRotatingBackup(1) ? '✅ Có' : '— Trống') + ' · ' +
-                'Slot 2: ' + (CLOUD.getRotatingBackup(2) ? '✅ Có' : '— Trống') + ' · ' +
-                'Slot 3: ' + (CLOUD.getRotatingBackup(3) ? '✅ Có' : '— Trống')
-              ),
-              h('div', { style: { fontSize: 11, color: 'var(--text2)', marginTop: 2 } }, 'Lần cuối: ' + fmtTs(rotTime))
-            )
-          )
-        ),
-        h('div', { style: { display: 'flex', gap: 10, flexWrap: 'wrap' } },
-          ...[1, 2, 3].map(slot => {
-            const bk = CLOUD.getRotatingBackup(slot);
-            return h('button', { className: 'btn btn-sm', disabled: !bk, onClick: () => {
-              if (!bk) return;
-              S.confirm = { msg: `⚠️ Khôi phục từ slot ${slot}? Dữ liệu hiện tại sẽ bị ghi đè.`, onYes: () => {
-                const ok = DB.importAll(bk);
-                if (ok) {
-                  reloadStateFromDB();
-                  toast('✅ Đã khôi phục từ slot ' + slot + '!', 'success'); render();
-                } else { toast('❌ Slot ' + slot + ' bị lỗi!', 'error'); }
-              } }; render();
-            } }, (bk ? '🔄' : '—') + ' Slot ' + slot);
-          }),
-          h('button', { className: 'btn btn-sm', style: { background: 'var(--green)', color: '#fff', border: 'none' }, onClick: () => {
-            CLOUD.runDailyBackup(() => DB.exportCompact());
-            // Force chạy ngay bằng cách xóa timestamp
-            try { localStorage.removeItem('dtn_backup_daily_time'); } catch(e) {}
-            CLOUD.runDailyBackup(() => DB.exportCompact());
-            toast('✅ Đã tạo backup xoay vòng!', 'success');
-            rebuild();
-          } }, '💾 Tạo ngay')
-        )
-      ),
-
-      // ══════════════════════════════════════════════════════════
-      // BẢN CLOUD SNAPSHOT — Firestore backup toàn bộ (6h/lần)
-      // ══════════════════════════════════════════════════════════
-      cloudCfg.enabled && h('div', { className: 'card' },
-        h('div', { className: 'card-title' }, '☁️ Cloud Snapshot — Firestore Backup'),
-        h('div', { style: { fontSize: 13, color: 'var(--text2)', marginBottom: 14, lineHeight: 1.8 } },
-          '• Snapshot nén toàn bộ dữ liệu được đẩy lên Firestore mỗi 6 giờ', h('br'),
-          '• Tồn tại độc lập với localStorage — xóa cache trình duyệt không mất', h('br'),
-          '• Có thể khôi phục từ bất kỳ thiết bị nào đã cấu hình cùng Firebase'
-        ),
-        h('div', { style: { display: 'flex', gap: 10, flexWrap: 'wrap' } },
-          h('button', { className: 'btn btn-primary btn-sm', onClick: async (e) => {
-            e.target.disabled = true; e.target.textContent = '⏳ Đang kéo...';
-            const bk = await CLOUD.pullCloudBackup();
-            e.target.disabled = false; e.target.textContent = '⬇️ Kéo Cloud Snapshot';
-            if (!bk) { toast('☁️ Chưa có cloud snapshot hoặc lỗi kết nối', 'error'); return; }
-            const fmtSize = bk.size > 1024*1024 ? (bk.size/1024/1024).toFixed(1)+'MB' : (bk.size/1024).toFixed(0)+'KB';
-            S.confirm = {
-              msg: `Khôi phục từ Cloud Snapshot?\n📅 Thời điểm: ${fmtTs(bk.backedUpAt)}\n📦 Kích thước: ${fmtSize}\n\n⚠️ Dữ liệu hiện tại sẽ bị ghi đè hoàn toàn.`,
-              onYes: () => {
-                const ok = DB.importAll(bk.data);
-                if (ok) {
-                  reloadStateFromDB();
-                  toast('✅ Đã khôi phục từ Cloud Snapshot!', 'success'); render();
-                } else { toast('❌ Snapshot bị lỗi hoặc không tương thích!', 'error'); }
-              }
-            }; render();
-          } }, '⬇️ Kéo Cloud Snapshot'),
-          h('button', { className: 'btn btn-sm', onClick: () => {
-            // Force tạo cloud backup ngay (xóa cooldown)
-            try { localStorage.removeItem('dtn_cloud_backup_time'); localStorage.removeItem('dtn_backup_daily_time'); } catch(e) {}
-            CLOUD.runDailyBackup(() => DB.exportCompact());
-            toast('⏳ Đang đẩy Cloud Snapshot lên Firestore...', 'info');
-            rebuild();
-          } }, '☁️ Đẩy ngay lên Cloud')
-        )
-      ),
-
-      // ══════════════════════════════════════════════════════════
-      // BẢN 3 — EXPORT FILE (Download về máy)
-      // ══════════════════════════════════════════════════════════
-      h('div', { className: 'card' },
-        h('div', { className: 'card-title' }, '💾 Bản 3 — Export file về máy (Offline Backup)'),
-        h('div', { style: { fontSize: 13, color: 'var(--text2)', marginBottom: 14, lineHeight: 1.8 } },
-          '• Tải file về Google Drive, USB, hoặc ổ cứng ngoài', h('br'),
-          '• Khuyến nghị: mỗi tuần 1 lần (JSON) + mỗi tháng 1 lần (Excel)', h('br'),
-          '• App sẽ nhắc tự động sau 7 ngày chưa tải'
-        ),
-        h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(180px,1fr))', gap: 10, marginBottom: 14 } },
+        h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(180px,1fr))', gap: 10 } },
           h('button', { className: 'btn btn-primary', style: { flexDirection: 'column', alignItems: 'flex-start', gap: 4, padding: '12px 14px', height: 'auto' }, onClick: () => {
             const data = DB.exportAll();
             const a = document.createElement('a');
@@ -9575,17 +9475,17 @@ function pgSync() {
             a.download = 'DaTuNhien_backup_' + today() + '.json';
             a.click();
             CLOUD.markDownloaded();
-            toast('✅ Đã tải JSON! Lưu vào Google Drive hoặc iCloud.', 'success');
+            toast('✅ Đã tải JSON! Lưu vào Google Drive hoặc USB.', 'success');
             rebuild();
           } },
             h('span', { style: { fontSize: 18 } }, '📥'),
-            h('span', { style: { fontWeight: 700, fontSize: 13 } }, 'Xuất JSON'),
+            h('span', { style: { fontWeight: 700, fontSize: 13 } }, 'Tải JSON về máy'),
             h('span', { style: { fontSize: 11, opacity: .8 } }, 'Khôi phục được 100%')
           ),
           ...[
-            { key: 'all',       icon: '📦', label: 'Excel TẤT CẢ', sub: 'Kho + Bán + Nhập + Nợ', primary: true },
-            { key: 'sales',     icon: '🧾', label: 'Excel Bán hàng', sub: 'Tất cả đơn bán' },
-            { key: 'imports',   icon: '📥', label: 'Excel Nhập hàng', sub: 'Tất cả phiếu nhập' },
+            { key: 'all',     icon: '📦', label: 'Excel TẤT CẢ', sub: 'Kho + Bán + Nhập + Nợ', primary: true },
+            { key: 'sales',   icon: '🧾', label: 'Excel Bán hàng', sub: 'Tất cả đơn bán' },
+            { key: 'imports', icon: '📥', label: 'Excel Nhập hàng', sub: 'Tất cả phiếu nhập' },
           ].map(item => h('button', {
             className: 'btn' + (item.primary ? ' btn-primary' : ''),
             style: { flexDirection: 'column', alignItems: 'flex-start', gap: 4, padding: '12px 14px', height: 'auto' },
@@ -9602,7 +9502,7 @@ function pgSync() {
       // NHẬP / KHÔI PHỤC
       // ══════════════════════════════════════════════════════════
       h('div', { className: 'card' },
-        h('div', { className: 'card-title' }, '📤 Nhập / Khôi phục dữ liệu'),
+        h('div', { className: 'card-title' }, '📤 Khôi phục từ file backup'),
         h('div', { style: { display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 12 } },
           h('button', { className: 'btn btn-primary', onClick: () => {
             const fileInp = document.createElement('input');
@@ -9614,24 +9514,15 @@ function pgSync() {
                 const ok = DB.importAll(ev.target.result);
                 if (ok) {
                   reloadStateFromDB();
-                  toast('✅ Nhập dữ liệu thành công!', 'success'); render();
+                  // Push lại toàn bộ lên Firebase sau khi khôi phục
+                  ['products','imports','sales','shipping','settings','returns','paymentlogs'].forEach(k => save(k));
+                  toast('✅ Đã khôi phục và đồng bộ lên Firebase!', 'success'); render();
                 } else { toast('❌ File JSON không hợp lệ!', 'error'); }
               };
               reader.readAsText(file);
             };
             fileInp.click();
-          } }, '📁 Nhập từ file JSON'),
-          h('button', { className: 'btn', onClick: () => {
-            const backup = DB.getAutoBackup();
-            if (!backup) { toast('Chưa có bản auto-backup!', 'error'); return; }
-            S.confirm = { msg: '⚠️ Khôi phục từ auto-backup (slot nhanh)? Dữ liệu hiện tại sẽ bị ghi đè.', onYes: () => {
-              const ok = DB.importAll(backup);
-              if (ok) {
-                reloadStateFromDB();
-                toast('✅ Đã khôi phục từ auto-backup!', 'success'); render();
-              } else { toast('❌ Backup bị lỗi!', 'error'); }
-            } }; render();
-          } }, '🔄 Khôi phục auto-backup')
+          } }, '📁 Khôi phục từ file JSON'),
         ),
         h('div', { style: { fontSize: 12, color: 'var(--text2)', marginBottom: 8 } }, 'Hoặc dán JSON trực tiếp:'),
         (() => {
@@ -9642,7 +9533,8 @@ function pgSync() {
             const ok = DB.importAll(json);
             if (ok) {
               reloadStateFromDB();
-              toast('✅ Nhập từ JSON thành công!', 'success'); ta.value = ''; render();
+              ['products','imports','sales','shipping','settings','returns','paymentlogs'].forEach(k => save(k));
+              toast('✅ Nhập thành công và đồng bộ lên Firebase!', 'success'); ta.value = ''; render();
             } else { toast('❌ JSON không hợp lệ!', 'error'); }
           } }, '✅ Nhập JSON');
           return h('div', {}, ta, btnImp);
