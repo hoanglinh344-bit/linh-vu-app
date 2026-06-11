@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Đá Tự Nhiên Linh Vũ">
-<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.9.3</title>
+<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.9.4</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
 <!-- Firebase SDK -->
@@ -352,9 +352,9 @@ const CLOUD = (() => {
         const localTs = safeTs(existing._updated || existing.createdAt || existing.date || '');
         const cloudTs = safeTs(r._updated || r.createdAt || r.date || '');
         if (r._deleted) {
-          // _deleted chỉ thắng nếu cloud thực sự MỚI HƠN local
-          if (cloudTs >= localTs) map[r.id] = r;
-          // else: local update mới hơn lệnh xóa → giữ local, push lại cloud
+          // _deleted chỉ thắng nếu cloud thực sự MỚI HƠN local (dùng > không >=)
+          if (cloudTs > localTs) map[r.id] = r;
+          // else: local update mới hơn hoặc bằng lệnh xóa → giữ local, push lại cloud
         } else if (cloudTs > localTs) {
           map[r.id] = r;
         }
@@ -374,10 +374,10 @@ const CLOUD = (() => {
       } else {
         const localTs = safeTs(map[p.id]._updated || '');
         const cloudTs = safeTs(p._updated || '');
-        // _deleted chỉ thắng khi cloud thực sự mới hơn local
+        // _deleted chỉ thắng khi cloud thực sự mới hơn local (dùng > không >=)
         if (p._deleted) {
-          if (cloudTs >= localTs) map[p.id] = p;
-          // else: local update mới hơn lệnh xóa → giữ local
+          if (cloudTs > localTs) map[p.id] = p;
+          // else: local update mới hơn hoặc bằng lệnh xóa → giữ local
         } else if (cloudTs > localTs) { map[p.id] = p; }
         // local mới hơn → giữ nguyên, sẽ push lên cloud
       }
@@ -395,11 +395,13 @@ const CLOUD = (() => {
         // Giữ bản mới hơn theo _updated; safeTs() loại bỏ clock skew thiết bị
         const existTs = safeTs(byName[key]._updated || byName[key].createdAt || '');
         const newTs   = safeTs(p._updated || p.createdAt || '');
-        // _deleted chỉ thắng khi timestamp xóa MỚI HƠN bản đang có
+        // _deleted chỉ thắng khi timestamp xóa THỰC SỰ MỚI HƠN (dùng > không >=)
         if (p._deleted && !byName[key]._deleted) {
-          if (newTs >= existTs) byName[key] = p; // xóa thắng chỉ khi mới hơn
+          if (newTs > existTs) byName[key] = p; // xóa thắng chỉ khi THỰC SỰ mới hơn
         } else if (!p._deleted && byName[key]._deleted) {
-          // bản _deleted hiện tại thắng, giữ nguyên
+          // Bản sống thắng khi mới hơn hoặc bằng lệnh xóa — đây là fix bug chính
+          // (trước đây code giữ _deleted, gây mất sản phẩm khi tạo lại cùng tên)
+          if (newTs >= existTs) byName[key] = p;
         } else if (newTs > existTs) {
           // Bản mới hơn thắng — chỉ kế thừa stock khi cả 2 chưa bị xóa và bản mới = 0
           const winnerStock = (!p._deleted && (p.stock || 0) === 0)
@@ -593,9 +595,13 @@ const CLOUD = (() => {
         const batch = _db.batch();
         chunk.forEach(r => {
           if (!r || !r.id) return;
-          // _updated: server timestamp (đồng hồ server, không lệch do device)
+          // QUAN TRỌNG: giữ _updated gốc của record. Nếu ghi đè bằng SERVER_TS
+          // thì mọi record (kể cả dữ liệu CŨ chưa đổi) đều nhận timestamp mới,
+          // khiến thiết bị có dữ liệu cũ ghi đè dữ liệu mới của thiết bị khác
+          // → đây chính là nguyên nhân mất tồn kho sản phẩm.
+          // safeTs() phía đọc đã chặn clock lệch về tương lai.
           // merge:true → chỉ cập nhật field thay đổi, không xoá field khác
-          batch.set(ref.doc(String(r.id)), { ...r, _updated: SERVER_TS }, { merge: true });
+          batch.set(ref.doc(String(r.id)), { ...r, _updated: r._updated || SERVER_TS }, { merge: true });
         });
         await batch.commit();
       }
@@ -774,7 +780,9 @@ const CLOUD = (() => {
     try {
       const pullCol = async (name) => {
         const snap = await col(name).get();
-        return snap.docs.map(d => { const v = normalizeDoc(d.data()); delete v._updated; return v; });
+        // Giữ _updated — nếu xóa, lần push sau record nhận timestamp server mới
+        // khiến dữ liệu cũ ghi đè dữ liệu mới trên thiết bị khác
+        return snap.docs.map(d => normalizeDoc(d.data()));
       };
       const [products, imports, sales, returns, paymentlogs, shipping, settingsArr, staffArr, adminCredArr] = await Promise.all([
         pullCol('dtn_products'), pullCol('dtn_imports'), pullCol('dtn_sales'),
@@ -1728,7 +1736,15 @@ function openPdfMobile(htmlContent, filename) {
       btnPrint.onclick = () => {
         const iframe = overlay.querySelector('iframe');
         if (iframe) {
-          try { iframe.contentWindow.print(); } catch(e) { window.open(url, '_blank'); }
+          try {
+            iframe.contentWindow.print();
+          } catch(e) {
+            // Fallback: KHÔNG dùng url (có thể đã bị revoke) — write trực tiếp htmlContent
+            try {
+              const w = window.open('', '_blank', 'width=900,height=800');
+              if (w) { w.document.write(htmlContent); w.document.close(); w.print(); }
+            } catch(e2) { console.warn('[PDF] print fallback error:', e2); }
+          }
         }
       };
 
@@ -1736,9 +1752,11 @@ function openPdfMobile(htmlContent, filename) {
       const btnClose = document.createElement('button');
       btnClose.style.cssText = 'padding:7px 12px;border-radius:7px;border:1px solid #3a4560;background:transparent;color:#9a9590;font-size:18px;cursor:pointer;line-height:1';
       btnClose.textContent = '✕';
+      let _urlRevoked = false;
+      const _revokeUrl = () => { if (!_urlRevoked) { _urlRevoked = true; URL.revokeObjectURL(url); } };
       btnClose.onclick = () => {
         document.body.removeChild(overlay);
-        URL.revokeObjectURL(url);
+        _revokeUrl();
         document.body.style.overflow = ''; // khôi phục scroll
       };
 
@@ -1750,7 +1768,9 @@ function openPdfMobile(htmlContent, filename) {
       const iframe = document.createElement('iframe');
       iframe.src = url;
       iframe.style.cssText = 'flex:1;width:100%;border:none;background:#fff;';
-      iframe.onload = () => { URL.revokeObjectURL(url); };
+      // KHÔNG revoke URL trong onload — giữ URL sống cho tới khi đóng overlay
+      // (iOS Safari cần URL còn hiệu lực để print() và chia sẻ hoạt động đúng)
+      iframe.onload = () => { /* revoke khi đóng overlay */ };
 
       overlay.appendChild(topbar);
       overlay.appendChild(iframe);
@@ -2135,6 +2155,16 @@ function reloadStateFromDB() {
   S.settings    = DB.get('dtn_settings',    SEED.settings);
   S.returns     = DB.get('dtn_returns',     []);
   S.paymentlogs = DB.get('dtn_paymentlogs', []);
+}
+
+// ─── Helper: bump _updated cho toàn bộ record sau khi khôi phục backup ──
+// Nếu không bump, record khôi phục mang _updated cũ → cloud (dữ liệu "mới hơn")
+// sẽ ghi đè ngược lại ngay lần sync sau, khiến việc khôi phục vô tác dụng
+function markRestoredAsFresh() {
+  const now = new Date().toISOString();
+  ['products','imports','sales','shipping','returns','paymentlogs'].forEach(k => {
+    if (Array.isArray(S[k])) S[k] = S[k].map(r => ({ ...r, _updated: now }));
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2668,11 +2698,11 @@ function th(t, right) { return h('th', right ? { style: { textAlign: 'right' } }
 // ═══════════════════════════════════════════════════════════════
 //  RENDER
 // ═══════════════════════════════════════════════════════════════
-function toast(msg, type = 'info') {
+function toast(msg, type = 'info', duration = 3000) {
   if (S._toastTimer) clearTimeout(S._toastTimer);
   S.toast = { msg, type };
   render();
-  S._toastTimer = setTimeout(() => { S.toast = null; render(); }, 3000);
+  S._toastTimer = setTimeout(() => { S.toast = null; render(); }, duration);
 }
 
 function go(page) { S.page = page; S.sidebarOpen = false; render(); }
@@ -3764,15 +3794,21 @@ function pgInventory() {
                 // Cộng dồn stock từ các bản bị loại
                 let totalStock = parseFloat(winner.stock) || 0;
                 losers.forEach(l => { totalStock += parseFloat(l.stock) || 0; });
-                // Cập nhật winner stock
-                S.products = S.products.map(p =>
-                  p.id === winner.id ? { ...p, stock: totalStock } :
-                  losers.find(l => l.id === p.id) ? null : p
-                ).filter(Boolean);
-                // Reroute imports và sales sang winner id
+                // Cập nhật winner stock + đánh dấu _deleted cho losers để cloud nhận lệnh xóa
+                const _mergeNow = new Date().toISOString();
                 const loserIds = new Set(losers.map(l => l.id));
-                S.imports = S.imports.map(i => loserIds.has(i.productId) ? { ...i, productId: winner.id, productName: winner.name } : i);
-                S.sales   = S.sales.map(s => loserIds.has(s.productId) ? { ...s, productId: winner.id, productName: winner.name } : s);
+                const withDeleted = S.products.map(p =>
+                  p.id === winner.id ? { ...p, stock: totalStock, _updated: _mergeNow } :
+                  loserIds.has(p.id) ? { ...p, _deleted: true, _updated: _mergeNow } : p
+                );
+                // Push bản có _deleted lên cloud TRƯỚC khi lọc local — nếu không, losers sẽ quay lại ở lần sync sau
+                if (typeof CLOUD !== 'undefined' && CLOUD._pushDeletedRecord) {
+                  CLOUD._pushDeletedRecord('dtn_products', withDeleted);
+                }
+                S.products = withDeleted.filter(p => !p._deleted);
+                // Reroute imports và sales sang winner id (bump _updated để thắng khi merge)
+                S.imports = S.imports.map(i => loserIds.has(i.productId) ? { ...i, productId: winner.id, productName: winner.name, _updated: _mergeNow } : i);
+                S.sales   = S.sales.map(s => loserIds.has(s.productId) ? { ...s, productId: winner.id, productName: winner.name, _updated: _mergeNow } : s);
                 mergeLog.push(`"${winner.name}" (${group.length} bản → gộp, tồn kho: ${totalStock} ${winner.unit})`);
               });
               save('products'); save('imports'); save('sales');
@@ -4497,7 +4533,7 @@ function pgImports() {
                   }, '✏️'),
                   i.status === 'debt' && h('button', {
                     className: 'btn btn-xs', style: { background:'var(--green)',color:'#fff',border:'none' },
-                    onClick: () => { S.imports = S.imports.map(x => x.id === i.id ? { ...x, paid: x.total, status: 'paid' } : x); save('imports'); toast('Đã thanh toán NCC', 'success'); rebuild(); }
+                    onClick: () => { S.imports = S.imports.map(x => x.id === i.id ? { ...x, paid: x.total, status: 'paid', _updated: new Date().toISOString() } : x); save('imports'); toast('Đã thanh toán NCC', 'success'); rebuild(); }
                   }, '✓ TT'),
                   h('button', {
                     className: 'btn btn-ghost btn-xs',
@@ -4514,7 +4550,7 @@ function pgImports() {
                               const newM2 = Math.max(0, (vt.stockM2 || 0) - i.qty);
                               return { ...vt, stockM2: newM2, stockPieces: ppm2 > 0 ? Math.round(newM2 * ppm2) : Math.max(0, (vt.stockPieces || 0) - Math.round(i.qty * (ppm2 || 0))) };
                             });
-                            return { ...p, stock: newStock, variants: newVariants };
+                            return { ...p, stock: newStock, variants: newVariants, _updated: new Date().toISOString() };
                           });
                         }
                         save('products');
@@ -5080,7 +5116,7 @@ function openImport(existing, rebuild) {
                 const newM2 = Math.max(0, (vt.stockM2||0) - oldQty);
                 return { ...vt, stockM2: newM2, stockPieces: ppm2 > 0 ? Math.round(newM2 * ppm2) : Math.max(0, (vt.stockPieces||0) - Math.round(oldQty * (ppm2||0))) };
               });
-              return { ...p, stock: revertStock, variants: revertVariants };
+              return { ...p, stock: revertStock, variants: revertVariants, _updated: new Date().toISOString() };
             }
             if (p.id !== newProdId) return p;
             // Sản phẩm mới (hoặc không đổi): tính delta
@@ -5720,7 +5756,7 @@ function pgSales() {
                                 const newM2=(vt.stockM2||0)+s.qty;
                                 return {...vt, stockM2:newM2, stockPieces:ppm2>0?Math.round(newM2*ppm2):(vt.stockPieces||0)+Math.round(s.qty*(ppm2||0))};
                               });
-                              return {...p, stock:newStock, variants:newVariants};
+                              return {...p, stock:newStock, variants:newVariants, _updated: new Date().toISOString()};
                             });
                           }
 
@@ -5730,7 +5766,7 @@ function pgSales() {
                               S.products = S.products.map(p => {
                                 if (p.id !== r.productId) return p;
                                 const newStock = Math.max(0, p.stock - r.returnQty);
-                                return {...p, stock: newStock};
+                                return {...p, stock: newStock, _updated: new Date().toISOString()};
                               });
                             });
                             // Soft-delete phiếu trả liên kết
@@ -9233,6 +9269,9 @@ function pgSettings() {
                 const ok = DB.importAll(ev.target.result);
                 if (ok) {
                   reloadStateFromDB();
+                  markRestoredAsFresh(); // bump _updated để bản khôi phục thắng dữ liệu cloud
+                  // Push lên Firebase — nếu không, listener realtime sẽ ghi đè ngược dữ liệu vừa nhập
+                  ['products','imports','sales','shipping','settings','returns','paymentlogs'].forEach(k => save(k));
                   toast('Đã nhập dữ liệu thành công!', 'success'); render();
                 } else { toast('File không hợp lệ!', 'error'); }
               };
@@ -9244,10 +9283,19 @@ function pgSettings() {
         h('div', { style: { borderTop: '1px solid var(--border)', paddingTop: 12, marginTop: 4 } },
           h('button', { className: 'btn btn-danger btn-sm', onClick: () => {
             S.confirm = { msg: '⚠️ XOÁ TOÀN BỘ dữ liệu (sản phẩm, nhập, bán, vận chuyển)? Hành động này KHÔNG THỂ HOÀN TÁC!', onYes: () => {
-              S.products = []; S.imports = [];
-              S.sales = []; S.shipping = []; S.returns = []; S.paymentlogs = [];
-              save('products'); save('imports'); save('sales'); save('shipping'); save('returns'); save('paymentlogs');
-              toast('Đã xoá toàn bộ dữ liệu', 'info'); render();
+              // Phải đánh dấu _deleted và push lên cloud TRƯỚC khi xóa local —
+              // nếu chỉ gán [] thì doc trên Firestore còn nguyên, lần sync sau dữ liệu quay lại
+              const _wipeNow = new Date().toISOString();
+              const wipeKeys = [['products','dtn_products'],['imports','dtn_imports'],['sales','dtn_sales'],['shipping','dtn_shipping'],['returns','dtn_returns'],['paymentlogs','dtn_paymentlogs']];
+              wipeKeys.forEach(([key, colName]) => {
+                const withDeleted = (S[key]||[]).map(r => ({ ...r, _deleted: true, _updated: _wipeNow }));
+                if (withDeleted.length > 0 && typeof CLOUD !== 'undefined' && CLOUD._pushDeletedRecord) {
+                  CLOUD._pushDeletedRecord(colName, withDeleted);
+                }
+                S[key] = [];
+                DB.set(colName, []);
+              });
+              toast('Đã xoá toàn bộ dữ liệu (local + cloud)', 'info'); render();
             } };
             render();
           } }, '🗑 Xoá toàn bộ dữ liệu')
@@ -9410,16 +9458,12 @@ function pgSync() {
           const btnPull = h('button', { className: 'btn btn-sm', onClick: async () => {
             if (!cloudCfg.enabled) { toast('Chưa bật Firebase sync!', 'error'); return; }
             S.confirm = { msg: '⬇️ Kéo & merge dữ liệu từ Firebase về?\n\nDữ liệu sẽ được MERGE (không ghi đè) — đơn hàng/phiếu nhập từ cloud sẽ được bổ sung vào local. Sản phẩm sẽ lấy bản mới nhất.', onYes: async () => {
-              const result = await CLOUD.pullAll();
-              if (!result) { toast('❌ Không kéo được dữ liệu từ cloud!', 'error'); return; }
-              if (result.products.length > 0)    { S.products    = result.products;    save('products'); }
-              if (result.imports.length > 0)     { S.imports     = result.imports;     save('imports'); }
-              if (result.sales.length > 0)       { S.sales       = result.sales;       save('sales'); }
-              if (result.returns.length > 0)     { S.returns     = result.returns;     save('returns'); }
-              if (result.paymentlogs.length > 0) { S.paymentlogs = result.paymentlogs; save('paymentlogs'); }
-              if ((result.shipping||[]).length > 0) { S.shipping = result.shipping;    save('shipping'); }
-              if (result.settings) { S.settings = { ...S.settings, ...result.settings }; save('settings'); }
-              toast('✅ Đã kéo dữ liệu từ Firebase!', 'success');
+              // Dùng bootSync → applyCloudData: merge đúng theo _updated + tôn trọng _deleted,
+              // KHÔNG ghi đè như trước (code cũ S.products = result.products làm mất dữ liệu
+              // local chưa sync và hồi sinh sản phẩm đã xóa)
+              const ok = await CLOUD.bootSync(S);
+              if (!ok) { toast('❌ Không kéo được dữ liệu từ cloud!', 'error'); return; }
+              toast('✅ Đã kéo & merge dữ liệu từ Firebase!', 'success');
               render();
             } };
             render();
@@ -9514,6 +9558,7 @@ function pgSync() {
                 const ok = DB.importAll(ev.target.result);
                 if (ok) {
                   reloadStateFromDB();
+                  markRestoredAsFresh(); // bump _updated để bản khôi phục thắng dữ liệu cloud
                   // Push lại toàn bộ lên Firebase sau khi khôi phục
                   ['products','imports','sales','shipping','settings','returns','paymentlogs'].forEach(k => save(k));
                   toast('✅ Đã khôi phục và đồng bộ lên Firebase!', 'success'); render();
@@ -9533,6 +9578,7 @@ function pgSync() {
             const ok = DB.importAll(json);
             if (ok) {
               reloadStateFromDB();
+              markRestoredAsFresh(); // bump _updated để bản khôi phục thắng dữ liệu cloud
               ['products','imports','sales','shipping','settings','returns','paymentlogs'].forEach(k => save(k));
               toast('✅ Nhập thành công và đồng bộ lên Firebase!', 'success'); ta.value = ''; render();
             } else { toast('❌ JSON không hợp lệ!', 'error'); }
@@ -9547,10 +9593,19 @@ function pgSync() {
         h('div', { style: { display: 'flex', gap: 10, flexWrap: 'wrap' } },
           h('button', { className: 'btn btn-danger btn-sm', onClick: () => {
             S.confirm = { msg: '⚠️ XOÁ TOÀN BỘ dữ liệu? KHÔNG THỂ HOÀN TÁC!', onYes: () => {
-              S.products = []; S.imports = [];
-              S.sales = []; S.shipping = []; S.returns = []; S.paymentlogs = [];
-              save('products'); save('imports'); save('sales'); save('shipping'); save('returns'); save('paymentlogs');
-              toast('Đã xoá toàn bộ dữ liệu', 'info'); render();
+              // Đánh dấu _deleted và push lên cloud trước khi xóa local —
+              // nếu chỉ gán [] thì doc trên Firestore còn nguyên, lần sync sau dữ liệu quay lại
+              const _wipeNow = new Date().toISOString();
+              const wipeKeys = [['products','dtn_products'],['imports','dtn_imports'],['sales','dtn_sales'],['shipping','dtn_shipping'],['returns','dtn_returns'],['paymentlogs','dtn_paymentlogs']];
+              wipeKeys.forEach(([key, colName]) => {
+                const withDeleted = (S[key]||[]).map(r => ({ ...r, _deleted: true, _updated: _wipeNow }));
+                if (withDeleted.length > 0 && typeof CLOUD !== 'undefined' && CLOUD._pushDeletedRecord) {
+                  CLOUD._pushDeletedRecord(colName, withDeleted);
+                }
+                S[key] = [];
+                DB.set(colName, []);
+              });
+              toast('Đã xoá toàn bộ dữ liệu (local + cloud)', 'info'); render();
             } }; render();
           } }, '🗑 Xoá toàn bộ dữ liệu')
         )
@@ -10826,9 +10881,9 @@ const AICHAT = (() => {
       label: 'Claude (Anthropic)',
       icon: '🟠',
       models: [
-        { id: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4 (Mới nhất)' },
-        { id: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5 (Nhanh)' },
-        { id: 'claude-opus-4-5', label: 'Claude Opus 4.5 (Mạnh nhất)' },
+        { id: 'claude-sonnet-4-5', label: 'Claude Sonnet 4.5 (Khuyến nghị)' },
+        { id: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5 (Nhanh/rẻ)' },
+        { id: 'claude-opus-4-5-20251101', label: 'Claude Opus 4.5 (Mạnh nhất)' },
       ],
       keyPlaceholder: 'sk-ant-api03-...',
       keyPrefix: 'sk-ant',
@@ -10867,7 +10922,7 @@ const AICHAT = (() => {
     try {
       const c = JSON.parse(v);
       if (c.apiKey && !c.keys) {
-        return { ...DEF_CFG, provider: 'claude', model: 'claude-sonnet-4-20250514', keys: { claude: c.apiKey }, enabled: c.enabled || false };
+        return { ...DEF_CFG, provider: 'claude', model: 'claude-sonnet-4-5', keys: { claude: c.apiKey }, enabled: c.enabled || false };
       }
       return { ...DEF_CFG, ...c };
     } catch(e) { return { ...DEF_CFG }; }
@@ -11027,7 +11082,7 @@ Sau thẻ QUOTATION, tiếp tục trả lời bình thường để giải thíc
 
     // ── Claude ──
     if (provider === 'claude') {
-      const model = cfg.model || 'claude-sonnet-4-20250514';
+      const model = cfg.model || 'claude-sonnet-4-5';
       const resp = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
@@ -11147,10 +11202,20 @@ Sau thẻ QUOTATION, tiếp tục trả lời bình thường để giải thíc
 
     const fmt2 = n => new Intl.NumberFormat('vi-VN').format(Math.round(n) || 0);
 
+    // Giới hạn ảnh base64: nếu > 500KB thì bỏ qua để tránh iframe không render trên iOS/một số browser
+    const MAX_IMG_B64 = 500 * 1024; // 500KB tính theo ký tự base64
+    function _safeImg(src) {
+      if (!src) return '';
+      // base64 data URI — kiểm tra độ dài
+      if (src.startsWith('data:') && src.length > MAX_IMG_B64) return '';
+      return src;
+    }
+
     const itemRows = (q.items || []).map((item, idx) => {
-      const imgCell = item.image
+      const safeImg = _safeImg(item.image);
+      const imgCell = safeImg
         ? `<td style="padding:8px 10px;border-bottom:1px solid #f0ece4;text-align:center;width:70px">
-             <img src="${item.image}" style="width:60px;height:48px;object-fit:cover;border-radius:4px;border:1px solid #e0d9c8"/>
+             <img src="${safeImg}" style="width:60px;height:48px;object-fit:cover;border-radius:4px;border:1px solid #e0d9c8"/>
            </td>`
         : `<td style="padding:8px 10px;border-bottom:1px solid #f0ece4;text-align:center;color:#bbb;font-size:11px;width:70px">—</td>`;
       return `<tr>
@@ -11528,7 +11593,7 @@ th.r{text-align:right}th.c{text-align:center}
       const html = buildQuotationPDF(q);
       const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
       const url  = URL.createObjectURL(blob);
-      // Tạo tên file: BaoGia_TenKhach_NgayThang.html (dùng được trên mọi thiết bị)
+      // Tên file: BaoGia_TenKhach_NgayThang.html
       const _now = new Date();
       const _pad = n => String(n).padStart(2,'0');
       const dateTag = `${_now.getFullYear()}${_pad(_now.getMonth()+1)}${_pad(_now.getDate())}`;
@@ -11559,7 +11624,8 @@ th.r{text-align:right}th.c{text-align:center}
     document.body.appendChild(a);
     a.click();
     setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 2000);
-    toast('📥 Đã tải file báo giá!', 'success');
+    // Hướng dẫn rõ ràng: file .html mở bằng trình duyệt, sau đó in/lưu PDF
+    toast('📥 Đã tải file báo giá (.html) — Mở bằng trình duyệt, chọn In → Lưu PDF để có file PDF chuẩn!', 'info', 5000);
   }
 
   // ── Render quotation card trong bubble ───────────────────────
