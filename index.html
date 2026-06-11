@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Đá Tự Nhiên Linh Vũ">
-<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.9.2</title>
+<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.9.3</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
 <!-- Firebase SDK -->
@@ -10968,19 +10968,25 @@ ${productList || '(Chưa có sản phẩm nào)'}
 
 NHIỆM VỤ:
 1. Trả lời câu hỏi về sản phẩm, giá cả một cách tự nhiên, thân thiện.
-2. Khi khách hỏi giá hoặc yêu cầu báo giá (ví dụ: "báo giá đá granite 50m²", "giá đá hoa cương xanh"), hãy:
-   - Tìm sản phẩm phù hợp trong danh sách
+2. Khi người dùng yêu cầu tạo báo giá hoặc gửi báo giá (ví dụ: "báo giá đá granite 50m²", "gửi báo giá đá marble cho khách Nguyễn Văn A số 100m²", "tạo báo giá cho anh Tuấn 0901234567 đá travertine 30m²"), hãy:
+   - Tìm sản phẩm phù hợp nhất trong danh sách dựa trên tên, loại, xuất xứ
+   - Nếu người dùng đề cập tên khách hàng → điền vào customerName
+   - Nếu người dùng đề cập số điện thoại khách → điền vào customerPhone
+   - Nếu người dùng đề cập địa chỉ khách → điền vào customerAddress
    - Tính toán chính xác (số lượng × đơn giá)
    - Trả về JSON báo giá trong thẻ <QUOTATION>...</QUOTATION>
-3. Nếu không tìm thấy sản phẩm phù hợp, hỏi thêm thông tin.
-4. QUAN TRỌNG: TUYỆT ĐỐI KHÔNG đề cập đến tồn kho, số lượng tồn, hàng còn hay hết trong bất kỳ câu trả lời nào. Nếu khách hỏi về tình trạng hàng, hãy bảo họ liên hệ trực tiếp qua hotline.
-5. Luôn trả lời bằng tiếng Việt, ngắn gọn, chuyên nghiệp.
+3. Nếu không tìm thấy sản phẩm phù hợp, liệt kê các sản phẩm gần nhất và hỏi thêm.
+4. QUAN TRỌNG: TUYỆT ĐỐI KHÔNG đề cập đến tồn kho, số lượng tồn, hàng còn hay hết. Nếu khách hỏi tình trạng hàng → bảo liên hệ hotline.
+5. KHÔNG bao giờ hiển thị giá nhập, lợi nhuận, chi phí nội bộ trong báo giá.
+6. Ngày báo giá LUÔN LUÔN dùng ngày hiện tại: ${todayLocal} — KHÔNG được tự ý thay đổi.
+7. Luôn trả lời bằng tiếng Việt, ngắn gọn, chuyên nghiệp.
 
 FORMAT JSON BÁO GIÁ (khi được yêu cầu):
 <QUOTATION>
 {
   "customerName": "tên khách (nếu biết, để trống nếu không)",
-  "customerPhone": "",
+  "customerPhone": "số điện thoại khách (nếu biết)",
+  "customerAddress": "địa chỉ khách (nếu biết)",
   "date": "${todayLocal}",
   "items": [
     {
@@ -11499,8 +11505,8 @@ th.r{text-align:right}th.c{text-align:center}
 
   <div id="aichat-quick">
     <button class="aichat-quick-btn" data-q="Danh sách sản phẩm hiện có?">📋 Danh sách SP</button>
-    <button class="aichat-quick-btn" data-q="Báo giá đá granite 50m²">💰 Báo giá</button>
-    <button class="aichat-quick-btn" data-q="Giới thiệu các loại đá tự nhiên hiện có">🔍 So sánh</button>
+    <button class="aichat-quick-btn" data-q="Báo giá đá granite 50m²">💰 Báo giá nhanh</button>
+    <button class="aichat-quick-btn" data-q="Gửi báo giá đá marble 30m² cho khách Nguyễn Văn A số điện thoại 0901234567">📤 Gửi cho khách</button>
     <button class="aichat-quick-btn" data-q="Đá nào phù hợp ốp sàn trong nhà?">💡 Tư vấn</button>
   </div>
 
@@ -11516,11 +11522,61 @@ th.r{text-align:right}th.c{text-align:center}
   // ── Format số VND ────────────────────────────────────────────
   function fmtVND(n) { return new Intl.NumberFormat('vi-VN').format(Math.round(n)||0); }
 
+  // ── Tải file PDF thực về máy (Blob download) ────────────────
+  function downloadQuotationPDF(q) {
+    try {
+      const html = buildQuotationPDF(q);
+      const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+      const url  = URL.createObjectURL(blob);
+      // Tạo tên file: BaoGia_TenKhach_NgayThang.html (dùng được trên mọi thiết bị)
+      const _now = new Date();
+      const _pad = n => String(n).padStart(2,'0');
+      const dateTag = `${_now.getFullYear()}${_pad(_now.getMonth()+1)}${_pad(_now.getDate())}`;
+      const custTag = (q.customerName || 'KhachHang').replace(/\s+/g,'_').replace(/[^a-zA-Z0-9_àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđÀÁẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬÈÉẺẼẸÊẾỀỂỄỆÌÍỈĨỊÒÓỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÙÚỦŨỤƯỨỪỬỮỰỲÝỶỸỴĐ]/g,'');
+      const fname = `BaoGia_${custTag}_${dateTag}.html`;
+
+      // Thử Web Share API (share file thực, hoạt động iOS/Android)
+      const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+      if (isMobile && navigator.share && navigator.canShare) {
+        const file = new File([blob], fname, { type: 'text/html' });
+        if (navigator.canShare({ files: [file] })) {
+          navigator.share({ files: [file], title: 'Báo Giá - ' + (q.customerName || 'Quý Khách') })
+            .catch(e => { if (e.name !== 'AbortError') _fallbackDownload(url, fname); });
+          return;
+        }
+      }
+      _fallbackDownload(url, fname);
+    } catch(e) {
+      toast('❌ Không thể tải file: ' + (e.message||e), 'error');
+    }
+  }
+
+  function _fallbackDownload(url, fname) {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fname;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 2000);
+    toast('📥 Đã tải file báo giá!', 'success');
+  }
+
   // ── Render quotation card trong bubble ───────────────────────
   function renderQuotationCard(q, container) {
     const card = document.createElement('div');
     card.className = 'aichat-quotation-card';
-    card.innerHTML = `<div class="qc-title">💰 Báo giá tự động</div>`;
+
+    // Header card — hiển thị thông tin khách nếu có
+    let headerHtml = `<div class="qc-title">💰 Báo giá tự động</div>`;
+    if (q.customerName || q.customerPhone) {
+      headerHtml += `<div style="font-size:11px;color:#9a9590;margin-bottom:6px;padding:0 2px">`;
+      if (q.customerName)  headerHtml += `👤 ${q.customerName}`;
+      if (q.customerPhone) headerHtml += ` &nbsp;📞 ${q.customerPhone}`;
+      if (q.customerAddress) headerHtml += `<br>📍 ${q.customerAddress}`;
+      headerHtml += `</div>`;
+    }
+    card.innerHTML = headerHtml;
 
     (q.items || []).forEach(item => {
       const row = document.createElement('div');
@@ -11541,31 +11597,43 @@ th.r{text-align:right}th.c{text-align:center}
 
     const actions = document.createElement('div');
     actions.className = 'qc-actions';
+    actions.style.cssText = 'flex-wrap:wrap;gap:5px';
 
-    const btnPDF = document.createElement('button');
-    btnPDF.className = 'qc-btn pdf';
-    btnPDF.innerHTML = '📄 Xuất PDF báo giá';
-    btnPDF.onclick = () => {
+    // Nút 1: Xem / In PDF (mở overlay)
+    const btnView = document.createElement('button');
+    btnView.className = 'qc-btn pdf';
+    btnView.innerHTML = '📄 Xem & In';
+    btnView.title = 'Xem trước và in báo giá';
+    btnView.onclick = () => {
       const html = buildQuotationPDF(q);
-      openPdfMobile(html, 'Báo giá - ' + (q.customerName || ''));
+      openPdfMobile(html, 'Báo giá - ' + (q.customerName || 'Quý Khách'));
     };
 
+    // Nút 2: Tải file PDF về máy / Chia sẻ trên mobile
+    const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    const btnDL = document.createElement('button');
+    btnDL.className = 'qc-btn pdf';
+    btnDL.style.background = '#4caf7d';
+    btnDL.style.color = '#fff';
+    btnDL.innerHTML = isMobile ? '📤 Chia sẻ file' : '📥 Tải file';
+    btnDL.title = isMobile ? 'Chia sẻ file báo giá qua Zalo, Gmail...' : 'Tải file báo giá về máy';
+    btnDL.onclick = () => downloadQuotationPDF(q);
+
+    // Nút 3: Lưu vào trang Báo Giá
     const btnSave = document.createElement('button');
     btnSave.className = 'qc-btn save';
-    btnSave.innerHTML = '💾 Lưu vào Báo Giá';
+    btnSave.innerHTML = '💾 Lưu vào hệ thống';
     btnSave.onclick = () => {
-      // Điều hướng sang trang quotation và điền dữ liệu
       S.page = 'quotation';
       S._aiQuotationDraft = q;
       render();
-      // Đóng chatbox
       document.getElementById('aichat-panel')?.classList.remove('open');
-      document.getElementById('aichat-fab')?.style && (document.getElementById('aichat-fab').style.display = 'flex');
       _open = false;
       toast('💡 Đã chuyển sang trang Báo Giá với dữ liệu từ AI', 'info');
     };
 
-    actions.appendChild(btnPDF);
+    actions.appendChild(btnView);
+    actions.appendChild(btnDL);
     actions.appendChild(btnSave);
     card.appendChild(actions);
     container.appendChild(card);
@@ -11854,7 +11922,7 @@ th.r{text-align:right}th.c{text-align:center}
             const pCount=(S.products||[]).length;
             const cfg=loadCfg();
             const pInfo=PROVIDERS[cfg.provider]||PROVIDERS.claude;
-            addMessage('assistant',`Xin chào! 👋 Tôi là trợ lý AI của cửa hàng.\nĐang dùng: ${pInfo.icon} ${pInfo.label}\n\nDữ liệu ${pCount} sản phẩm vừa được cập nhật thời gian thực. Bạn có thể:\n• Hỏi về sản phẩm, giá cả, quy cách\n• Yêu cầu "báo giá [tên đá] [số m²]"\n• Tôi sẽ tự tạo báo giá PDF có ảnh cho bạn!\n\n📋 Lưu ý: Thông tin tồn kho vui lòng liên hệ trực tiếp qua hotline.`);
+            addMessage('assistant',`Xin chào! 👋 Tôi là trợ lý AI của cửa hàng.\nĐang dùng: ${pInfo.icon} ${pInfo.label}\n\nDữ liệu ${pCount} sản phẩm vừa được cập nhật. Bạn có thể:\n• Hỏi về sản phẩm, giá cả, quy cách\n• "Báo giá đá granite 50m²" → tạo báo giá ngay\n• "Gửi báo giá đá marble 30m² cho anh Tuấn 0901234567" → tạo PDF có tên khách, tải về/chia sẻ\n\n📋 Tồn kho vui lòng liên hệ hotline trực tiếp.`);
           }
           setTimeout(()=>input?.focus(),100);
         }
