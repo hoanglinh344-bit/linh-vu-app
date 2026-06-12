@@ -5757,7 +5757,7 @@ function pgSales() {
                 h('td', {}, h('div', {style:{display:'flex',gap:4}},
                   s.status==='debt' && h('button', {
                     className:'btn btn-xs', style:{background:'var(--green)',color:'#fff',border:'none'},
-                    onClick: () => { S.sales=S.sales.map(x=>x.id===s.id?{...x,paid:x.total,status:'done'}:x); save('sales'); toast('Đã thu hết nợ','success'); rebuild(); }
+                    onClick: () => { S.sales=S.sales.map(x=>x.id===s.id?{...x,paid:x.total,status:'done',_updated:new Date().toISOString()}:x); save('sales'); toast('Đã thu hết nợ','success'); rebuild(); }
                   }, '✓ Thu'),
                   s.qty>0 && h('button', {
                     className:'btn btn-xs', style:{background:'var(--amber)',color:'#fff',border:'none'},
@@ -6494,7 +6494,7 @@ function pgDebt() {
                                 S.sales = S.sales.map(x => {
                                   if (x.id !== s.id) return x;
                                   const newPaid = Math.max(0, x.paid - lg.amount);
-                                  return { ...x, paid: newPaid, status: newPaid >= x.total ? 'done' : 'debt' };
+                                  return { ...x, paid: newPaid, status: newPaid >= x.total ? 'done' : 'debt', _updated: new Date().toISOString() };
                                 });
                                 save('sales');
                                 softDelete('paymentlogs', lg.id, () => {});
@@ -7064,7 +7064,7 @@ function pgDebt() {
                                 createdAt: new Date().toISOString(),
                                 _updated: new Date().toISOString()
                               });
-                              return { ...sale, paid: newPaid, status: done ? 'done' : 'debt' };
+                              return { ...sale, paid: newPaid, status: done ? 'done' : 'debt', _updated: new Date().toISOString() };
                             });
 
                             S.sales = updatedSales;
@@ -9738,7 +9738,7 @@ function pgReturns() {
                               const newQty      = s.qty + r.returnQty;
                               // Cập nhật lại status: nếu đã thu đủ thì done, ngược lại debt
                               const newStatus   = s.paid >= newTotal ? 'done' : 'debt';
-                              return { ...s, qty: newQty, subTotal: newSubTotal, vatAmt: newVatAmt, total: newTotal, status: newStatus };
+                              return { ...s, qty: newQty, subTotal: newSubTotal, vatAmt: newVatAmt, total: newTotal, status: newStatus, _updated: new Date().toISOString() };
                             });
                           }
                           save('products'); save('sales');
@@ -9911,7 +9911,7 @@ function openReturnFromSale(sale, onDone) {
           const newVatAmt   = Math.round(newSubTotal * s.vatRate / 100);
           const newTotal    = newSubTotal + newVatAmt;
           const newStatus   = s.paid >= newTotal && newTotal >= 0 ? 'done' : 'debt';
-          return { ...s, qty: newQty, subTotal: newSubTotal, vatAmt: newVatAmt, total: newTotal, status: newStatus };
+          return { ...s, qty: newQty, subTotal: newSubTotal, vatAmt: newVatAmt, total: newTotal, status: newStatus, _updated: new Date().toISOString() };
         });
 
         S.returns = [rec, ...S.returns];
@@ -10105,7 +10105,7 @@ function openReturn(rebuild) {
             const newVatAmt   = Math.round(newSubTotal * s.vatRate / 100);
             const newTotal    = newSubTotal + newVatAmt;
             const newStatus   = s.paid >= newTotal && newTotal >= 0 ? 'done' : 'debt';
-            return { ...s, qty: newQty, subTotal: newSubTotal, vatAmt: newVatAmt, total: newTotal, status: newStatus };
+            return { ...s, qty: newQty, subTotal: newSubTotal, vatAmt: newVatAmt, total: newTotal, status: newStatus, _updated: new Date().toISOString() };
           });
         }
 
@@ -10534,7 +10534,7 @@ function pgStaffReport() {
             onClick: () => {
               const now = new Date();
               // Cập nhật đơn hàng
-              S.sales = S.sales.map(x => x.id === s.id ? { ...x, paid: x.total, status: 'done' } : x);
+              S.sales = S.sales.map(x => x.id === s.id ? { ...x, paid: x.total, status: 'done', _updated: new Date().toISOString() } : x);
               // Tạo paymentlog — audit trail
               const log = {
                 id: 'pl' + Date.now() + Math.random().toString(36).slice(2,6),
