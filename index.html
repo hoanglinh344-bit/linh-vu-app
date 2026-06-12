@@ -4555,13 +4555,13 @@ function pgImports() {
                         if (i.qty > 0) {
                           S.products = S.products.map(p => {
                             if (p.id !== i.productId) return p;
-                            const newStock = Math.max(0, p.stock - i.qty);
+                            const newStock = p.stock - i.qty;
                             // Hoàn lại tồn kho variants nếu phiếu nhập có variantId
                             const newVariants = (p.variants || []).map(vt => {
                               if (!i.variantId || vt.id !== i.variantId) return vt;
                               const ppm2 = (vt.tileW > 0 && vt.tileH > 0) ? 10000 / (vt.tileW * vt.tileH) : 0;
-                              const newM2 = Math.max(0, (vt.stockM2 || 0) - i.qty);
-                              return { ...vt, stockM2: newM2, stockPieces: ppm2 > 0 ? Math.round(newM2 * ppm2) : Math.max(0, (vt.stockPieces || 0) - Math.round(i.qty * (ppm2 || 0))) };
+                              const newM2 = (vt.stockM2 || 0) - i.qty;
+                              return { ...vt, stockM2: newM2, stockPieces: ppm2 > 0 ? Math.round(newM2 * ppm2) : (vt.stockPieces || 0) - Math.round(i.qty * (ppm2 || 0)) };
                             });
                             return { ...p, stock: newStock, variants: newVariants, _updated: new Date().toISOString() };
                           });
@@ -5122,12 +5122,12 @@ function openImport(existing, rebuild) {
             // Nếu đổi sang sản phẩm khác: revert stock sản phẩm cũ
             if (prodChanged && p.id === oldProdId) {
               const ppm2old = 0; // dùng chung logic variants bên dưới
-              let revertStock = Math.max(0, p.stock - oldQty);
+              let revertStock = p.stock - oldQty;
               let revertVariants = (p.variants || []).map(vt => {
                 if (!oldVtId || vt.id !== oldVtId) return vt;
                 const ppm2 = (vt.tileW > 0 && vt.tileH > 0) ? 10000/(vt.tileW*vt.tileH) : 0;
-                const newM2 = Math.max(0, (vt.stockM2||0) - oldQty);
-                return { ...vt, stockM2: newM2, stockPieces: ppm2 > 0 ? Math.round(newM2 * ppm2) : Math.max(0, (vt.stockPieces||0) - Math.round(oldQty * (ppm2||0))) };
+                const newM2 = (vt.stockM2||0) - oldQty;
+                return { ...vt, stockM2: newM2, stockPieces: ppm2 > 0 ? Math.round(newM2 * ppm2) : (vt.stockPieces||0) - Math.round(oldQty * (ppm2||0)) };
               });
               return { ...p, stock: revertStock, variants: revertVariants, _updated: new Date().toISOString() };
             }
@@ -5142,13 +5142,13 @@ function openImport(existing, rebuild) {
                 // Cùng sản phẩm: tính delta variant
                 if (oldVtId && newVtId && vt.id === oldVtId && oldVtId === newVtId) {
                   const netDelta = newQty - oldQty;
-                  const newM2 = Math.max(0, (vt.stockM2||0) + netDelta);
-                  return { ...vt, stockM2: newM2, stockPieces: ppm2 > 0 ? Math.round(newM2 * ppm2) : Math.max(0, (vt.stockPieces||0) + Math.round(netDelta * (ppm2||0))) };
+                  const newM2 = (vt.stockM2||0) + netDelta;
+                  return { ...vt, stockM2: newM2, stockPieces: ppm2 > 0 ? Math.round(newM2 * ppm2) : (vt.stockPieces||0) + Math.round(netDelta * (ppm2||0)) };
                 }
                 let sv = { ...vt };
                 if (oldVtId && vt.id === oldVtId) {
-                  sv.stockM2 = Math.max(0, (sv.stockM2||0) - oldQty);
-                  sv.stockPieces = ppm2 > 0 ? Math.round(sv.stockM2 * ppm2) : Math.max(0, (sv.stockPieces||0) - Math.round(oldQty * (ppm2||0)));
+                  sv.stockM2 = (sv.stockM2||0) - oldQty;
+                  sv.stockPieces = ppm2 > 0 ? Math.round(sv.stockM2 * ppm2) : (sv.stockPieces||0) - Math.round(oldQty * (ppm2||0));
                 }
                 if (newVtId && vt.id === newVtId) {
                   sv.stockM2 = (sv.stockM2||0) + newQty;
@@ -5780,16 +5780,19 @@ function pgSales() {
                       S.confirm = {
                         msg: confirmMsg,
                         onYes: () => {
-                          // 1. Hoàn kho: chỉ hoàn SL còn lại trong đơn (qty hiện tại sau khi trả hàng đã trừ)
-                          if (s.qty > 0) {
+                          // 1. Hoàn kho: hoàn SL còn lại trong đơn + SL phiếu trả liên kết (để bù trừ bước 2)
+                          // Bước 2 sẽ trừ lại phần đã cộng khi tạo phiếu trả → net = hoàn đúng qty gốc bán
+                          const totalReturnQty = linkedReturns.reduce((a, r) => a + (r.returnQty || 0), 0);
+                          const qtyToRestore = s.qty + totalReturnQty; // qty gốc = qty còn lại + phần đã trả
+                          if (qtyToRestore > 0) {
                             S.products = S.products.map(p => {
                               if (p.id !== s.productId) return p;
-                              const newStock = p.stock + s.qty;
+                              const newStock = p.stock + qtyToRestore;
                               const newVariants = (p.variants||[]).map(vt => {
                                 if (!s.variantId || vt.id !== s.variantId) return vt;
                                 const ppm2=(vt.tileW>0&&vt.tileH>0)?10000/(vt.tileW*vt.tileH):0;
-                                const newM2=(vt.stockM2||0)+s.qty;
-                                return {...vt, stockM2:newM2, stockPieces:ppm2>0?Math.round(newM2*ppm2):(vt.stockPieces||0)+Math.round(s.qty*(ppm2||0))};
+                                const newM2=(vt.stockM2||0)+qtyToRestore;
+                                return {...vt, stockM2:newM2, stockPieces:ppm2>0?Math.round(newM2*ppm2):(vt.stockPieces||0)+Math.round(qtyToRestore*(ppm2||0))};
                               });
                               return {...p, stock:newStock, variants:newVariants, _updated: new Date().toISOString()};
                             });
@@ -5800,7 +5803,7 @@ function pgSales() {
                             linkedReturns.forEach(r => {
                               S.products = S.products.map(p => {
                                 if (p.id !== r.productId) return p;
-                                const newStock = Math.max(0, p.stock - r.returnQty);
+                                const newStock = p.stock - r.returnQty;
                                 return {...p, stock: newStock, _updated: new Date().toISOString()};
                               });
                             });
@@ -9727,7 +9730,7 @@ function pgReturns() {
                         msg: `Xoá phiếu trả hàng của "${r.customer}" (${fmtQty(r.returnQty)} ${r.unit} ${r.productName})?\n\n⚠️ Hàng sẽ bị lấy lại ra khỏi kho và doanh thu đơn gốc sẽ được khôi phục.`,
                         onYes: () => {
                           // Hoàn tác: trừ lại hàng khỏi kho (vì khi tạo phiếu trả đã cộng vào kho)
-                          S.products = S.products.map(p => p.id === r.productId ? { ...p, stock: Math.max(0, p.stock - r.returnQty), _updated: new Date().toISOString() } : p);
+                          S.products = S.products.map(p => p.id === r.productId ? { ...p, stock: p.stock - r.returnQty, _updated: new Date().toISOString() } : p);
                           // Hoàn tác: cộng lại doanh thu đơn gốc nếu có
                           if (r.saleId) {
                             S.sales = S.sales.map(s => {
@@ -9741,8 +9744,7 @@ function pgReturns() {
                               return { ...s, qty: newQty, subTotal: newSubTotal, vatAmt: newVatAmt, total: newTotal, status: newStatus, _updated: new Date().toISOString() };
                             });
                           }
-                          save('products'); save('sales');
-                          softDelete('returns', r.id, () => {});
+                          softDelete('returns', r.id, () => { save('products'); save('sales'); });
                           toast('Đã xoá phiếu trả hàng, kho và đơn gốc được khôi phục', 'info');
                           rebuild();
                         }
