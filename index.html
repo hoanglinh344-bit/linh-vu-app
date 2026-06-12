@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Đá Tự Nhiên Linh Vũ">
-<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.9.4</title>
+<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.9.5</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
 <!-- Firebase SDK -->
@@ -431,6 +431,7 @@ const CLOUD = (() => {
       dtn_settings:        'settings',
       dtn_staff_accounts:  'staff_accounts',
       dtn_admin_cred:      'admin_cred',
+      dtn_cashflows:       'cashflows',
     };
     const stateKey = colMap[colName];
     if (!stateKey) return;
@@ -497,7 +498,7 @@ const CLOUD = (() => {
       const dbMap = {
         sales:'dtn_sales', imports:'dtn_imports', returns:'dtn_returns',
         paymentlogs:'dtn_paymentlogs', products:'dtn_products',
-        shipping:'dtn_shipping', settings:'dtn_settings'
+        shipping:'dtn_shipping', settings:'dtn_settings', cashflows:'dtn_cashflows'
       };
       if (dbMap[stateKey]) {
         try {
@@ -513,7 +514,7 @@ const CLOUD = (() => {
           if (typeof toast === 'function') {
             const labels = { sales:'đơn hàng', imports:'phiếu nhập', returns:'hoàn trả',
                              paymentlogs:'thanh toán', products:'sản phẩm',
-                             shipping:'vận chuyển', settings:'cài đặt' };
+                             shipping:'vận chuyển', settings:'cài đặt', cashflows:'thu/chi' };
             toast(`🔄 Đồng bộ: ${labels[stateKey]||stateKey} vừa được cập nhật từ thiết bị khác`, 'info');
           }
         } catch(e) {}
@@ -529,7 +530,7 @@ const CLOUD = (() => {
     // Dừng listener cũ nếu có
     stopListeners();
 
-    const collections = ['dtn_sales','dtn_imports','dtn_returns','dtn_paymentlogs','dtn_products','dtn_shipping','dtn_settings','dtn_staff_accounts','dtn_admin_cred'];
+    const collections = ['dtn_sales','dtn_imports','dtn_returns','dtn_paymentlogs','dtn_products','dtn_shipping','dtn_settings','dtn_staff_accounts','dtn_admin_cred','dtn_cashflows'];
     collections.forEach(colName => {
       try {
         const ref = col(colName);
@@ -1335,7 +1336,7 @@ function showLoginScreen() {
         <div style="text-align:center;margin-bottom:32px">
           <div style="width:64px;height:64px;background:linear-gradient(135deg,var(--accent),var(--accent2));border-radius:16px;display:flex;align-items:center;justify-content:center;font-size:32px;margin:0 auto 16px;box-shadow:0 4px 16px rgba(201,168,76,0.3)">💎</div>
           <div style="font-family:Georgia,serif;font-size:22px;font-weight:700;color:var(--text)">Đá Tự Nhiên Linh Vũ</div>
-          <div style="font-size:13px;color:var(--text2);margin-top:4px">Hệ thống quản lý v7.9.0</div>
+          <div style="font-size:13px;color:var(--text2);margin-top:4px">Hệ thống quản lý v7.9.5</div>
         </div>
         <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:28px">
           ${lockWarn}
@@ -1872,7 +1873,7 @@ function resetAutoLogoutTimer() {
     if (!AUTH.currentUser()) return;
     // Lưu toàn bộ dữ liệu trước khi thoát
     try {
-      ['products','imports','sales','shipping','settings','returns','paymentlogs'].forEach(k => save(k));
+      ['products','imports','sales','shipping','settings','returns','paymentlogs','cashflows'].forEach(k => save(k));
     } catch(e) {}
     AUTH.logout();
     _raf = false;
@@ -1910,7 +1911,7 @@ const DB = (() => {
   const mem = {};
   let lsOk = false;
   const APP_VERSION = '3.10.0';
-  const KEYS = ['dtn_products','dtn_imports','dtn_sales','dtn_shipping','dtn_settings','dtn_returns','dtn_paymentlogs'];
+  const KEYS = ['dtn_products','dtn_imports','dtn_sales','dtn_shipping','dtn_settings','dtn_returns','dtn_paymentlogs','dtn_cashflows'];
   // Prefix để nhận biết dữ liệu đã nén
   const LZ_PREFIX = '\x00LZ:';
 
@@ -2155,6 +2156,7 @@ function reloadStateFromDB() {
   S.settings    = DB.get('dtn_settings',    SEED.settings);
   S.returns     = DB.get('dtn_returns',     []);
   S.paymentlogs = DB.get('dtn_paymentlogs', []);
+  S.cashflows   = DB.get('dtn_cashflows',   []);
 }
 
 // ─── Helper: bump _updated cho toàn bộ record sau khi khôi phục backup ──
@@ -2162,7 +2164,7 @@ function reloadStateFromDB() {
 // sẽ ghi đè ngược lại ngay lần sync sau, khiến việc khôi phục vô tác dụng
 function markRestoredAsFresh() {
   const now = new Date().toISOString();
-  ['products','imports','sales','shipping','returns','paymentlogs'].forEach(k => {
+  ['products','imports','sales','shipping','returns','paymentlogs','cashflows'].forEach(k => {
     if (Array.isArray(S[k])) S[k] = S[k].map(r => ({ ...r, _updated: now }));
   });
 }
@@ -2180,6 +2182,7 @@ const S = {
   settings:  DB.get('dtn_settings',  SEED.settings),
   returns:     DB.get('dtn_returns',     []),
   paymentlogs: DB.get('dtn_paymentlogs', []),
+  cashflows:   DB.get('dtn_cashflows',   []),
   stockAlerts: (() => { try { const v = localStorage.getItem('dtn_stockAlerts'); return v ? JSON.parse(v) : []; } catch(e) { return []; } })(),
   modal: null,
   confirm: null,
@@ -2188,7 +2191,7 @@ const S = {
 };
 
 function save(key) {
-  const map = {products:'dtn_products',imports:'dtn_imports',sales:'dtn_sales',shipping:'dtn_shipping',settings:'dtn_settings',returns:'dtn_returns',paymentlogs:'dtn_paymentlogs'};
+  const map = {products:'dtn_products',imports:'dtn_imports',sales:'dtn_sales',shipping:'dtn_shipping',settings:'dtn_settings',returns:'dtn_returns',paymentlogs:'dtn_paymentlogs',cashflows:'dtn_cashflows'};
   const colName = map[key];
 
   // ── Firebase-first: push ngay lên Firestore ──────────────────
@@ -2231,7 +2234,7 @@ function softDelete(arrayKey, id, extraFn) {
   const withDeleted = S[arrayKey].map(r => r.id === id ? { ...r, _deleted: true, _updated: now } : r);
   // Lọc sạch local NGAY LẬP TỨC để UI phản ánh đúng
   S[arrayKey] = withDeleted.filter(r => !r._deleted);
-  const dbMap = {products:'dtn_products',imports:'dtn_imports',sales:'dtn_sales',shipping:'dtn_shipping',returns:'dtn_returns',paymentlogs:'dtn_paymentlogs'};
+  const dbMap = {products:'dtn_products',imports:'dtn_imports',sales:'dtn_sales',shipping:'dtn_shipping',returns:'dtn_returns',paymentlogs:'dtn_paymentlogs',cashflows:'dtn_cashflows'};
   if (dbMap[arrayKey]) DB.set(dbMap[arrayKey], S[arrayKey]);
   if (typeof extraFn === 'function') extraFn();
   // Push lên cloud: dùng withDeleted (có _deleted:true) để thiết bị khác nhận lệnh xóa
@@ -2745,6 +2748,7 @@ const ALL_PAGES = [
   {id:'imports',  label:'Nhập hàng',   icon:'📥', adminOnly: true,  staffVisible: false},
   {id:'sales',    label:'Bán hàng',    icon:'🧾', adminOnly: false,  staffVisible: true},
   {id:'returns',  label:'Trả hàng',    icon:'🔄', adminOnly: true,  staffVisible: false},
+  {id:'cashflow', label:'Thu / Chi',   icon:'💵', adminOnly: true,  staffVisible: false},
   {id:'debt',     label:'Công nợ',     icon:'💳', adminOnly: true,  staffVisible: true},
   {id:'invoice',  label:'Hoá đơn',     icon:'📄', adminOnly: true,  staffVisible: true},
   {id:'quotation',label:'Báo Giá',     icon:'💰', adminOnly: false,  staffVisible: true},
@@ -2811,7 +2815,7 @@ function buildApp() {
       }, '🚪 Đăng xuất'),
       DB.isLocal() ? '✅ Dữ liệu đã lưu tự động' : '⚠️ Lưu tạm (phiên làm việc)',
       h('br'),
-      'v7.9.0 · Đá Tự Nhiên Linh Vũ © 2026'
+      'v7.9.5 · Đá Tự Nhiên Linh Vũ © 2026'
     )
   );
 
@@ -2849,6 +2853,7 @@ function buildApp() {
     sales: pgSales, returns: pgReturns, debt: pgDebt, invoice: pgInvoice, quotation: pgQuotation,
     bienban: pgBienBan,
     hopdong: pgHopDong,
+    cashflow: pgCashflow,
     staffreport: pgStaffReport,
     vatrpt: pgVatReport,
     search: pgSearch,
@@ -3252,15 +3257,24 @@ function pgDashboard() {
   const returnRefund = moReturns.reduce((a, r) => a + (r.refundValue || 0), 0);
 
   // ══════════════════════════════════════════════════════════════
-  //  LỢI NHUẬN TRƯỚC THUẾ TNDN (v6.3.0)
+  //  THU / CHI PHÁT SINH (tiền nhà, thuế TNDN, điện nước, ...)
+  //  Thu (+) → cộng vào LN
+  //  Chi (−) → trừ khỏi LN
+  // ══════════════════════════════════════════════════════════════
+  const moCashflows = (S.cashflows || []).filter(cf => matchPeriod(cf.date));
+  const cashflowIncome  = moCashflows.filter(cf => cf.type === 'income').reduce((a, cf) => a + (cf.amount || 0), 0);
+  const cashflowExpense = moCashflows.filter(cf => cf.type === 'expense').reduce((a, cf) => a + (cf.amount || 0), 0);
+  const cashflowNet = cashflowIncome - cashflowExpense; // (+) = lãi thêm, (-) = chi thêm
+
+  // ══════════════════════════════════════════════════════════════
+  //  LỢI NHUẬN TRƯỚC THUẾ TNDN (v7.9.5)
   //  Công thức chuẩn:
-  //  LN = DT thuần (giá bán chưa VAT) − Giá vốn thuần (giá nhập chưa VAT) − VC thuần
+  //  LN = DT thuần − Giá vốn thuần − VC thuần + Thu phát sinh − Chi phát sinh
   //  ⚠️ KHÔNG trừ returnRefund: khi khách trả hàng, đơn gốc đã được điều chỉnh
   //  giảm SL/doanh thu ngay lúc tạo phiếu trả → revenueNet đã tự giảm tương ứng.
-  //  Trừ thêm returnRefund là đếm đúp (double-count) khoản này.
   //  VAT phải nộp = VAT đầu ra − VAT đầu vào hàng − VAT đầu vào VC (nhập + giao)
   // ══════════════════════════════════════════════════════════════
-  const profitBeforeTax = revenueNet - cogsTotal - shipOutNet;
+  const profitBeforeTax = revenueNet - cogsTotal - shipOutNet + cashflowNet;
 
   // ══════════════════════════════════════════════════════════════
   //  VAT PHẢI NỘP NHÀ NƯỚC (kỳ tháng này)
@@ -3440,7 +3454,19 @@ function pgDashboard() {
             '', 0, 'var(--blue)', false, false));
         }
 
-        // ── BƯỚC 5: HOÀN HÀNG (thông tin tham khảo) ─────────────
+        // ── BƯỚC 5: THU / CHI PHÁT SINH ────────────────────────
+        if (cashflowIncome > 0) {
+          wrap2.appendChild(profitRow('💵', `Thu phát sinh (${moCashflows.filter(cf=>cf.type==='income').length} khoản)`,
+            moCashflows.filter(cf=>cf.type==='income').slice(0,3).map(cf=>cf.note||cf.category||'Thu').join(' · '),
+            '+', cashflowIncome, 'var(--green)', false, false));
+        }
+        if (cashflowExpense > 0) {
+          wrap2.appendChild(profitRow('💸', `Chi phát sinh (${moCashflows.filter(cf=>cf.type==='expense').length} khoản)`,
+            moCashflows.filter(cf=>cf.type==='expense').slice(0,3).map(cf=>cf.note||cf.category||'Chi').join(' · '),
+            '−', cashflowExpense, 'var(--red)', false, false));
+        }
+
+        // ── BƯỚC 6: HOÀN HÀNG (thông tin tham khảo) ─────────────
         // Khi khách trả hàng: đơn gốc đã được trừ SL & doanh thu ngay lúc tạo phiếu trả
         // → revenueNet đã tự giảm → KHÔNG trừ thêm vào LN (tránh đếm đúp)
         if (moReturns.length > 0) {
@@ -9226,6 +9252,217 @@ ${tongTT>0?`<p class="bangchu">(Bằng chữ: <i>${soThanhChu(tongTT)}</i>)</p>`
     ));
   }
 
+  rebuild();
+  return wrap;
+}
+
+// ── THU / CHI PHÁT SINH ──────────────────────────────────────
+function pgCashflow() {
+  const wrap = h('div', {});
+  let showForm = false;
+  let editId = null;
+
+  // Danh mục mặc định
+  const INCOME_CATS  = ['Thu khác', 'Thu hồi công nợ', 'Lãi tiền gửi', 'Hoàn thuế', 'Doanh thu khác'];
+  const EXPENSE_CATS = ['Tiền nhà / mặt bằng', 'Tiền điện nước', 'Thuế TNDN', 'Thuế GTGT nộp thêm', 'Lương nhân viên', 'Chi phí vận hành', 'Bảo hiểm', 'Marketing / quảng cáo', 'Sửa chữa thiết bị', 'Chi phí khác'];
+
+  let form = { date: today(), type: 'expense', category: EXPENSE_CATS[0], amount: '', note: '' };
+
+  function rebuild() {
+    wrap.innerHTML = '';
+    const cfs = (S.cashflows || []).slice().sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+
+    const totalIncome  = cfs.filter(c => c.type === 'income').reduce((a, c) => a + (c.amount || 0), 0);
+    const totalExpense = cfs.filter(c => c.type === 'expense').reduce((a, c) => a + (c.amount || 0), 0);
+    const netCashflow  = totalIncome - totalExpense;
+
+    // Header
+    wrap.appendChild(h('div', { className: 'page-header' },
+      h('div', {},
+        h('div', { className: 'page-title' }, '💵 Thu / Chi Phát Sinh'),
+        h('div', { className: 'page-sub' }, 'Ghi nhận thu chi ngoài hoạt động mua bán — tiền nhà, điện nước, thuế...')
+      ),
+      h('button', { className: 'btn btn-primary', onClick: () => {
+        showForm = !showForm;
+        editId = null;
+        form = { date: today(), type: 'expense', category: EXPENSE_CATS[0], amount: '', note: '' };
+        rebuild();
+      }}, showForm ? '✕ Đóng' : '➕ Thêm phiếu thu/chi')
+    ));
+
+    // Stats tổng hợp
+    wrap.appendChild(h('div', { className: 'stats-grid', style: { gridTemplateColumns: 'repeat(3,1fr)' } },
+      h('div', { className: 'stat' },
+        h('div', { className: 'stat-label' }, 'Tổng thu phát sinh'),
+        h('div', { className: 'stat-val', style: { color: 'var(--green)' } }, '+' + fmt(totalIncome) + 'đ'),
+        h('div', { className: 'stat-change' }, cfs.filter(c => c.type === 'income').length + ' khoản thu')
+      ),
+      h('div', { className: 'stat' },
+        h('div', { className: 'stat-label' }, 'Tổng chi phát sinh'),
+        h('div', { className: 'stat-val', style: { color: 'var(--red)' } }, '−' + fmt(totalExpense) + 'đ'),
+        h('div', { className: 'stat-change' }, cfs.filter(c => c.type === 'expense').length + ' khoản chi')
+      ),
+      h('div', { className: 'stat' },
+        h('div', { className: 'stat-label' }, 'Ảnh hưởng lợi nhuận'),
+        h('div', { className: 'stat-val', style: { color: netCashflow >= 0 ? 'var(--green)' : 'var(--red)' } },
+          (netCashflow >= 0 ? '+' : '') + fmt(netCashflow) + 'đ'),
+        h('div', { className: 'stat-change' }, netCashflow >= 0 ? '↑ Tăng lợi nhuận' : '↓ Giảm lợi nhuận')
+      )
+    ));
+
+    // Form thêm / sửa
+    if (showForm) {
+      const editing = editId ? (S.cashflows || []).find(c => c.id === editId) : null;
+      if (editing && !form._loaded) {
+        form = { date: editing.date, type: editing.type, category: editing.category || '', amount: editing.amount, note: editing.note || '', _loaded: true };
+      }
+      const cats = form.type === 'income' ? INCOME_CATS : EXPENSE_CATS;
+
+      const inpDate = h('input', { type: 'date', className: 'form-input', value: form.date, onInput: e => { form.date = e.target.value; } });
+      const selType = h('select', { className: 'form-input', onInput: e => {
+        form.type = e.target.value;
+        form.category = (e.target.value === 'income' ? INCOME_CATS : EXPENSE_CATS)[0];
+        rebuild();
+      }});
+      [['expense','💸 Chi'], ['income','💵 Thu']].forEach(([v, lbl]) => {
+        const opt = h('option', { value: v }, lbl);
+        if (form.type === v) opt.selected = true;
+        selType.appendChild(opt);
+      });
+
+      const selCat = h('select', { className: 'form-input', onInput: e => { form.category = e.target.value; } });
+      cats.forEach(c => {
+        const opt = h('option', { value: c }, c);
+        if (form.category === c) opt.selected = true;
+        selCat.appendChild(opt);
+      });
+
+      const inpAmount = h('input', { type: 'number', className: 'form-input', placeholder: 'Số tiền (đ)', value: form.amount || '', onInput: e => { form.amount = parseFloat(e.target.value) || 0; } });
+      const inpNote   = h('input', { type: 'text', className: 'form-input', placeholder: 'Ghi chú (VD: Tiền nhà tháng 6, Điện tháng 5...)', value: form.note || '', onInput: e => { form.note = e.target.value; } });
+
+      wrap.appendChild(h('div', { className: 'card', style: { border: `1px solid ${form.type === 'income' ? 'rgba(76,175,125,.4)' : 'rgba(224,92,92,.4)'}` } },
+        h('div', { className: 'card-title' }, editId ? '✏️ Sửa phiếu' : (form.type === 'income' ? '💵 Thêm khoản thu' : '💸 Thêm khoản chi')),
+        h('div', { className: 'fg fg2', style: { gap: 12 } },
+          h('div', { className: 'form-group' },
+            h('label', { className: 'form-label' }, 'Loại'),
+            selType
+          ),
+          h('div', { className: 'form-group' },
+            h('label', { className: 'form-label' }, 'Ngày'),
+            inpDate
+          ),
+          h('div', { className: 'form-group' },
+            h('label', { className: 'form-label' }, 'Danh mục'),
+            selCat
+          ),
+          h('div', { className: 'form-group' },
+            h('label', { className: 'form-label' }, 'Số tiền (đ) *'),
+            inpAmount
+          ),
+          h('div', { className: 'form-group fg-full' },
+            h('label', { className: 'form-label' }, 'Ghi chú'),
+            inpNote
+          )
+        ),
+        h('div', { className: 'modal-footer', style: { paddingTop: 12, marginTop: 12 } },
+          h('button', { className: 'btn', onClick: () => { showForm = false; editId = null; rebuild(); } }, 'Huỷ'),
+          h('button', { className: 'btn btn-primary', onClick: () => {
+            const amt = parseFloat(inpAmount.value) || form.amount || 0;
+            if (!amt || amt <= 0) { toast('❌ Vui lòng nhập số tiền hợp lệ!', 'error'); return; }
+            const dt = inpDate.value || form.date || today();
+            const cat = selCat.value || form.category;
+            const note = inpNote.value || form.note || '';
+            const type = selType.value || form.type;
+            const now = new Date().toISOString();
+
+            if (!S.cashflows) S.cashflows = [];
+            if (editId) {
+              const idx = S.cashflows.findIndex(c => c.id === editId);
+              if (idx >= 0) S.cashflows[idx] = { ...S.cashflows[idx], date: dt, type, category: cat, amount: amt, note, _updated: now };
+            } else {
+              S.cashflows.push({ id: uid(), date: dt, type, category: cat, amount: amt, note, _updated: now, createdAt: now });
+            }
+            save('cashflows');
+            showForm = false; editId = null;
+            toast(editId ? '✅ Đã cập nhật phiếu!' : (type === 'income' ? '✅ Đã thêm khoản thu!' : '✅ Đã thêm khoản chi!'), 'success');
+            rebuild();
+          }}, editId ? '💾 Lưu thay đổi' : (form.type === 'income' ? '💵 Thêm thu' : '💸 Thêm chi'))
+        )
+      ));
+    }
+
+    // Table danh sách
+    if (cfs.length === 0) {
+      wrap.appendChild(h('div', { className: 'empty' },
+        h('div', { className: 'empty-icon' }, '💵'),
+        h('div', {}, 'Chưa có phiếu thu/chi nào'),
+        h('div', { style: { fontSize: 12, color: 'var(--text3)', marginTop: 6 } }, 'Nhấn "Thêm phiếu thu/chi" để bắt đầu ghi nhận')
+      ));
+      return;
+    }
+
+    // Group by month for summary
+    const byMonth = {};
+    cfs.forEach(c => {
+      const mk = (c.date || '').slice(0,7);
+      if (!byMonth[mk]) byMonth[mk] = { income: 0, expense: 0 };
+      if (c.type === 'income') byMonth[mk].income += c.amount || 0;
+      else byMonth[mk].expense += c.amount || 0;
+    });
+
+    wrap.appendChild(h('div', { className: 'card' },
+      h('div', { className: 'card-title' }, '📋 Danh sách phiếu thu/chi'),
+      h('div', { className: 'table-wrap' },
+        h('table', {},
+          h('thead', {},
+            h('tr', {},
+              h('th', {}, 'Ngày'),
+              h('th', {}, 'Loại'),
+              h('th', {}, 'Danh mục'),
+              h('th', {}, 'Ghi chú'),
+              h('th', { style: { textAlign: 'right' } }, 'Số tiền'),
+              h('th', {}, '')
+            )
+          ),
+          h('tbody', {},
+            ...cfs.map(c => h('tr', {},
+              h('td', {}, fmtD(c.date)),
+              h('td', {}, c.type === 'income'
+                ? h('span', { className: 'badge badge-green' }, '💵 Thu')
+                : h('span', { className: 'badge badge-red' }, '💸 Chi')
+              ),
+              h('td', {}, h('span', { className: 'chip' }, c.category || '—')),
+              h('td', { style: { color: 'var(--text2)', fontSize: 12 } }, c.note || '—'),
+              h('td', { style: { textAlign: 'right', fontWeight: 700, color: c.type === 'income' ? 'var(--green)' : 'var(--red)' } },
+                (c.type === 'income' ? '+' : '−') + fmt(c.amount) + 'đ'
+              ),
+              h('td', {},
+                h('div', { style: { display: 'flex', gap: 6 } },
+                  h('button', { className: 'btn btn-xs btn-ghost', onClick: () => {
+                    editId = c.id;
+                    form = { date: c.date, type: c.type, category: c.category || '', amount: c.amount, note: c.note || '', _loaded: true };
+                    showForm = true;
+                    rebuild();
+                  }}, '✏️'),
+                  h('button', { className: 'btn btn-xs btn-ghost', style: { color: 'var(--red)' }, onClick: () => {
+                    S.confirm = {
+                      msg: `Xoá phiếu ${c.type === 'income' ? 'thu' : 'chi'} "${c.note || c.category}" — ${fmt(c.amount)}đ?`,
+                      onYes: () => {
+                        softDelete('cashflows', c.id);
+                        toast('🗑️ Đã xoá phiếu!', 'success');
+                        render();
+                      }
+                    };
+                    render();
+                  }}, '🗑️')
+                )
+              )
+            ))
+          )
+        )
+      )
+    ));
+  }
   rebuild();
   return wrap;
 }
