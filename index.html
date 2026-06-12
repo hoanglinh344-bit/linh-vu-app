@@ -2635,7 +2635,20 @@ function h(tag, attrs, ...children) {
 function inp(type, placeholder, value, onInput, extra = {}) {
   if (type === 'number') extra = { step: 'any', inputmode: 'decimal', ...extra };
   const el = h('input', { type, placeholder, value: value ?? '', className: 'form-input', ...extra });
-  el.addEventListener('input', e => onInput(e.target.value));
+  el.addEventListener('input', e => {
+    let caret = null;
+    try { caret = e.target.selectionStart; } catch(_) {}
+    onInput(e.target.value);
+    // Nếu onInput gọi rebuild() → input này bị gỡ khỏi DOM và tạo lại → mất focus.
+    // Tìm input mới cùng placeholder và focus lại để gõ liên tục không phải click.
+    if (!el.isConnected) {
+      const nw = [...document.querySelectorAll('input.form-input')].find(x => x.placeholder === placeholder && x.isConnected);
+      if (nw) {
+        nw.focus();
+        if (caret != null) { try { nw.setSelectionRange(caret, caret); } catch(_) {} }
+      }
+    }
+  });
   return el;
 }
 
@@ -5329,13 +5342,14 @@ function pgSales() {
 .pricelist-search{background:var(--bg3);border:1.5px solid var(--border2);border-radius:var(--r2);padding:7px 11px;color:var(--text);font-size:12px;font-family:inherit;width:200px;transition:border-color .15s}
 .pricelist-search:focus{outline:none;border-color:var(--accent)}
 .pricelist-search::placeholder{color:var(--text3)}
-.pl-row{display:flex;align-items:center;gap:12px;padding:9px 12px;border-radius:var(--r2);transition:background .13s;cursor:default;border-bottom:1px solid var(--border)}
+.pl-row{display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:9px 12px;border-radius:var(--r2);transition:background .13s;cursor:default;border-bottom:1px solid var(--border)}
 .pl-row:last-child{border-bottom:none}
 .pl-row:hover{background:rgba(255,255,255,.03)}
 .pl-row.out-of-stock{opacity:.55}
 .pl-thumb{width:40px;height:40px;border-radius:7px;object-fit:cover;border:1px solid var(--border2);flex-shrink:0}
 .pl-thumb-ph{width:40px;height:40px;border-radius:7px;background:var(--bg4);border:1px solid var(--border2);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0}
-.pl-name{flex:1;min-width:0}
+/* min-width 140px: tên sản phẩm không bao giờ bị ép mất — thiếu chỗ thì các cột sau xuống dòng */
+.pl-name{flex:1;min-width:140px}
 .pl-name-text{font-size:13px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .pl-name-sub{font-size:10px;color:var(--text3);margin-top:2px}
 .pl-sell{font-size:14px;font-weight:700;color:var(--accent);white-space:nowrap;text-align:right;min-width:110px}
@@ -5353,6 +5367,16 @@ function pgSales() {
   .cat-info{padding:8px 9px 9px}
   .pl-buy,.pl-margin{display:none}
   .pricelist-search{width:100%}
+  /* Màn hẹp: tên sản phẩm chiếm trọn dòng đầu (cạnh ảnh), giá/tồn/nút xuống dòng 2
+     — nếu không tên bị ép về 0px, nhân viên chỉ thấy hình ảnh */
+  .pl-row{row-gap:6px}
+  .pl-name{flex:1 1 calc(100% - 52px);min-width:calc(100% - 52px)}
+  .pl-name-text{white-space:normal;line-height:1.4}
+  .pl-sell{flex:1;text-align:left;min-width:0}
+}
+/* Header cột chỉ thẳng hàng khi đủ rộng — màn vừa/hẹp các hàng tự xuống dòng nên ẩn đi */
+@media(max-width:900px){
+  .pl-col-hdr{display:none!important}
 }
         `;
         document.head.appendChild(st);
@@ -5453,7 +5477,17 @@ function pgSales() {
         searchInp.type = 'text';
         searchInp.placeholder = '🔍 Tìm sản phẩm...';
         searchInp.value = plSearch;
-        searchInp.addEventListener('input', e => { plSearch = e.target.value; buildPriceList(); });
+        searchInp.addEventListener('input', e => {
+          const caret = e.target.selectionStart;
+          plSearch = e.target.value;
+          buildPriceList();
+          // buildPriceList() tạo lại ô tìm kiếm → focus lại để gõ liên tục
+          const ni = sec2.querySelector('.pricelist-search');
+          if (ni) {
+            ni.focus();
+            if (caret != null) { try { ni.setSelectionRange(caret, caret); } catch(_) {} }
+          }
+        });
         hdr2.appendChild(titleWrap);
         hdr2.appendChild(searchInp);
         sec2.appendChild(hdr2);
@@ -5485,6 +5519,7 @@ function pgSales() {
         tableWrap.style.cssText = 'background:var(--bg3);border-radius:var(--r);border:1px solid var(--border);overflow:hidden';
 
         const colHdr = document.createElement('div');
+        colHdr.className = 'pl-col-hdr';
         colHdr.style.cssText = 'display:flex;align-items:center;gap:12px;padding:7px 12px;background:var(--bg4);border-bottom:2px solid var(--border2)';
         colHdr.innerHTML = `
           <div style="width:40px;flex-shrink:0"></div>
@@ -10723,33 +10758,38 @@ function pgSearch() {
   if (!pgSearch._q) pgSearch._q = '';
   let q = pgSearch._q;
 
+  // Header + ô tìm kiếm tạo 1 lần — không tạo lại khi gõ để không mất focus
+  wrap.appendChild(h('div', { className: 'page-header' },
+    h('div', {},
+      h('div', { className: 'page-title' }, '🔍 Tìm Kiếm Toàn Cục'),
+      h('div', { className: 'page-sub' }, 'Tìm theo tên khách hàng, sản phẩm, SĐT, ghi chú')
+    )
+  ));
+
+  // Search box
+  const inp = document.createElement('input');
+  inp.type = 'text'; inp.className = 'form-input';
+  inp.placeholder = 'Nhập từ khoá tìm kiếm... (tên khách, SĐT, tên sản phẩm)';
+  inp.value = q;
+  inp.style.cssText = 'font-size:16px;margin-bottom:16px;width:100%';
+  inp.setAttribute('autofocus', '');
+  inp.addEventListener('input', e => {
+    pgSearch._q = e.target.value;
+    rebuild();
+  });
+  wrap.appendChild(inp);
+  setTimeout(() => inp.focus(), 50);
+
+  // Chỉ phần kết quả được rebuild khi gõ
+  const resWrap = h('div', {});
+  wrap.appendChild(resWrap);
+
   function rebuild() {
     q = pgSearch._q;
-    wrap.innerHTML = '';
-
-    wrap.appendChild(h('div', { className: 'page-header' },
-      h('div', {},
-        h('div', { className: 'page-title' }, '🔍 Tìm Kiếm Toàn Cục'),
-        h('div', { className: 'page-sub' }, 'Tìm theo tên khách hàng, sản phẩm, SĐT, ghi chú')
-      )
-    ));
-
-    // Search box
-    const inp = document.createElement('input');
-    inp.type = 'text'; inp.className = 'form-input';
-    inp.placeholder = 'Nhập từ khoá tìm kiếm... (tên khách, SĐT, tên sản phẩm)';
-    inp.value = q;
-    inp.style.cssText = 'font-size:16px;margin-bottom:16px;width:100%';
-    inp.setAttribute('autofocus', '');
-    inp.addEventListener('input', e => {
-      pgSearch._q = e.target.value;
-      rebuild();
-    });
-    wrap.appendChild(inp);
-    setTimeout(() => inp.focus(), 50);
+    resWrap.innerHTML = '';
 
     if (!q || q.trim().length < 2) {
-      wrap.appendChild(h('div', { style:{textAlign:'center',padding:'40px 20px',color:'var(--text3)'} },
+      resWrap.appendChild(h('div', { style:{textAlign:'center',padding:'40px 20px',color:'var(--text3)'} },
         h('div',{style:{fontSize:36,marginBottom:12}},'🔍'),
         h('div',{},'Nhập ít nhất 2 ký tự để tìm kiếm')
       ));
@@ -10783,7 +10823,7 @@ function pgSearch() {
     );
 
     const total = salRes.length + prodRes.length + impRes.length;
-    wrap.appendChild(h('div', { style:{fontSize:13,color:'var(--text2)',marginBottom:16,padding:'8px 14px',background:'var(--bg2)',borderRadius:'var(--r2)',border:'1px solid var(--border)'} },
+    resWrap.appendChild(h('div', { style:{fontSize:13,color:'var(--text2)',marginBottom:16,padding:'8px 14px',background:'var(--bg2)',borderRadius:'var(--r2)',border:'1px solid var(--border)'} },
       `🔍 Tìm được ${total} kết quả cho "${q}"`
     ));
 
@@ -10804,7 +10844,7 @@ function pgSearch() {
         )))
       )));
       if (salRes.length > 50) card.appendChild(h('div',{style:{fontSize:12,color:'var(--text3)',marginTop:8,textAlign:'center'}},'Hiển thị 50/'+salRes.length+' kết quả đầu tiên'));
-      wrap.appendChild(card);
+      resWrap.appendChild(card);
     }
 
     // Product results
@@ -10821,7 +10861,7 @@ function pgSearch() {
           h('td',{style:{textAlign:'right',fontWeight:700,color:'var(--accent)'}},fmt(p.sellPrice)+'đ')
         )))
       )));
-      wrap.appendChild(card);
+      resWrap.appendChild(card);
     }
 
     // Import results
@@ -10838,11 +10878,11 @@ function pgSearch() {
           h('td',{style:{textAlign:'right',fontWeight:700}},fmt(i.total)+'đ')
         )))
       )));
-      wrap.appendChild(card);
+      resWrap.appendChild(card);
     }
 
     if (total === 0) {
-      wrap.appendChild(h('div', { style:{textAlign:'center',padding:'40px 20px',color:'var(--text3)'} },
+      resWrap.appendChild(h('div', { style:{textAlign:'center',padding:'40px 20px',color:'var(--text3)'} },
         h('div',{style:{fontSize:36,marginBottom:12}},'😔'),
         h('div',{},'Không tìm thấy kết quả nào cho "'+q+'"')
       ));
@@ -11024,13 +11064,17 @@ ${productList || '(Chưa có sản phẩm nào)'}
 NHIỆM VỤ:
 1. Trả lời câu hỏi về sản phẩm, giá cả một cách tự nhiên, thân thiện.
 2. Khi người dùng yêu cầu tạo báo giá hoặc gửi báo giá (ví dụ: "báo giá đá granite 50m²", "gửi báo giá đá marble cho khách Nguyễn Văn A số 100m²", "tạo báo giá cho anh Tuấn 0901234567 đá travertine 30m²"), hãy:
-   - Tìm sản phẩm phù hợp nhất trong danh sách dựa trên tên, loại, xuất xứ
+   - QUY TẮC CHỌN SẢN PHẨM (bắt buộc tuân thủ nghiêm ngặt):
+     a) Chỉ chọn sản phẩm khi tên trong DANH SÁCH SẢN PHẨM khớp với TẤT CẢ từ khoá mô tả người dùng nêu, đặc biệt là MÀU SẮC (vàng, nâu, xám, xanh, đen, trắng...) và quy cách/kích thước.
+     b) Ví dụ: người dùng hỏi "đá rối vàng nâu đất" mà danh sách chỉ có "Đá Rối Màu Xám" và "Đá Rối Vàng Ánh Kim" → KHÔNG được chọn sản phẩm nào (màu "xám" ≠ "vàng nâu đất", "ánh kim" ≠ "nâu đất") → áp dụng mục 3 bên dưới.
+     c) TUYỆT ĐỐI KHÔNG đoán hoặc lấy sản phẩm "gần giống" khi màu sắc/tên không khớp — báo giá sai sản phẩm gây thiệt hại thực tế cho cửa hàng.
+     d) productId và productName PHẢI sao chép NGUYÊN VĂN từ danh sách ở trên, không được tự bịa hoặc sửa tên.
    - Nếu người dùng đề cập tên khách hàng → điền vào customerName
    - Nếu người dùng đề cập số điện thoại khách → điền vào customerPhone
    - Nếu người dùng đề cập địa chỉ khách → điền vào customerAddress
    - Tính toán chính xác (số lượng × đơn giá)
    - Trả về JSON báo giá trong thẻ <QUOTATION>...</QUOTATION>
-3. Nếu không tìm thấy sản phẩm phù hợp, liệt kê các sản phẩm gần nhất và hỏi thêm.
+3. Nếu không có sản phẩm nào khớp đúng yêu cầu → TUYỆT ĐỐI KHÔNG tạo thẻ <QUOTATION>. Thay vào đó, liệt kê 2-3 sản phẩm có tên gần nhất kèm giá và hỏi người dùng xác nhận muốn báo giá sản phẩm nào.
 4. QUAN TRỌNG: TUYỆT ĐỐI KHÔNG đề cập đến tồn kho, số lượng tồn, hàng còn hay hết. Nếu khách hỏi tình trạng hàng → bảo liên hệ hotline.
 5. KHÔNG bao giờ hiển thị giá nhập, lợi nhuận, chi phí nội bộ trong báo giá.
 6. Ngày báo giá LUÔN LUÔN dùng ngày hiện tại: ${todayLocal} — KHÔNG được tự ý thay đổi.
@@ -11168,12 +11212,20 @@ Sau thẻ QUOTATION, tiếp tục trả lời bình thường để giải thíc
     if (!match) return null;
     try {
       const q = JSON.parse(match[1].trim());
-      // Gắn ảnh từ S.products (lấy thời gian thực, bỏ qua sản phẩm đã xoá)
+      // Đối chiếu từng dòng với kho hàng thật: ưu tiên khớp ID, sau đó khớp tên
+      // (không phân biệt hoa thường) — tránh AI gắn nhầm tên/ảnh sản phẩm khác
       if (q.items) {
         const activeProducts = (S.products || []).filter(p => !p._deleted);
+        const norm = s => (s || '').toString().toLowerCase().replace(/\s+/g, ' ').trim();
         q.items = q.items.map(item => {
-          const prod = activeProducts.find(p => p.id === item.productId || p.name === item.productName);
-          return { ...item, image: prod?.image || '', description: prod?.description || '' };
+          const prod = activeProducts.find(p => p.id === item.productId)
+                    || activeProducts.find(p => norm(p.name) === norm(item.productName));
+          if (prod) {
+            // Đồng bộ lại ID + tên theo dữ liệu thật để báo giá luôn đúng sản phẩm
+            return { ...item, productId: prod.id, productName: prod.name, unit: item.unit || prod.unit || '', image: prod.image || '', description: prod.description || '' };
+          }
+          // Không tìm thấy trong kho → đánh dấu để hiển thị cảnh báo
+          return { ...item, image: '', description: '', _unverified: true };
         });
       }
       return q;
@@ -11650,8 +11702,11 @@ th.r{text-align:right}th.c{text-align:center}
       const imgEl = item.image
         ? `<img class="qc-img" src="${item.image}" alt="">`
         : `<div class="qc-img-ph">💎</div>`;
+      const warnHtml = item._unverified
+        ? `<br><span style="font-size:10px;color:#e8a53a;font-weight:700">⚠️ Không khớp sản phẩm nào trong kho — kiểm tra lại trước khi gửi khách!</span>`
+        : '';
       row.innerHTML = `${imgEl}
-        <div class="qc-name">${item.productName||''}<br><span style="font-size:10px;color:#9a9590;font-weight:400">${item.qty} ${item.unit||''} × ${fmtVND(item.unitPrice)}đ</span></div>
+        <div class="qc-name">${item.productName||''}${warnHtml}<br><span style="font-size:10px;color:#9a9590;font-weight:400">${item.qty} ${item.unit||''} × ${fmtVND(item.unitPrice)}đ</span></div>
         <div class="qc-price">${fmtVND(item.total)}đ</div>`;
       card.appendChild(row);
     });
