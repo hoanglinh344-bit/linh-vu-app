@@ -5559,35 +5559,39 @@ function pgSales() {
 
       let plSearch = '';
 
+      // searchInp tạo 1 lần — không bị xóa khi buildPriceList() — fix gõ tiếng Việt bị vỡ chữ
+      const _plHdr = document.createElement('div');
+      _plHdr.className = 'pricelist-hdr';
+      const _plTitleWrap = document.createElement('div');
+      _plTitleWrap.innerHTML = `
+        <div class="pricelist-title">📋 Bảng Giá Tất Cả Sản Phẩm</div>
+        <div style="font-size:11px;color:var(--text3);margin-top:3px">${allProds.length} sản phẩm · Giá bán & tồn kho tổng hợp</div>
+      `;
+      const _plSearchInp = document.createElement('input');
+      _plSearchInp.className = 'pricelist-search';
+      _plSearchInp.type = 'text';
+      _plSearchInp.placeholder = '🔍 Tìm sản phẩm...';
+      // IME guard: fix tiếng Việt (Unikey) bị vỡ chữ khi gõ có dấu
+      let _plIme = false;
+      _plSearchInp.addEventListener('compositionstart', () => { _plIme = true; });
+      _plSearchInp.addEventListener('compositionend', e => {
+        _plIme = false;
+        plSearch = e.target.value;
+        buildPriceList();
+      });
+      _plSearchInp.addEventListener('input', e => {
+        if (_plIme) return;
+        plSearch = e.target.value;
+        buildPriceList();
+      });
+      _plHdr.appendChild(_plTitleWrap);
+      _plHdr.appendChild(_plSearchInp);
+
       function buildPriceList() {
         sec2.innerHTML = '';
+        sec2.appendChild(_plHdr); // header với search input luôn đống — không bị tạo lại
 
-        const hdr2 = document.createElement('div');
-        hdr2.className = 'pricelist-hdr';
-        const titleWrap = document.createElement('div');
-        titleWrap.innerHTML = `
-          <div class="pricelist-title">📋 Bảng Giá Tất Cả Sản Phẩm</div>
-          <div style="font-size:11px;color:var(--text3);margin-top:3px">${allProds.length} sản phẩm · Giá bán & tồn kho tổng hợp</div>
-        `;
-        const searchInp = document.createElement('input');
-        searchInp.className = 'pricelist-search';
-        searchInp.type = 'text';
-        searchInp.placeholder = '🔍 Tìm sản phẩm...';
-        searchInp.value = plSearch;
-        searchInp.addEventListener('input', e => {
-          const caret = e.target.selectionStart;
-          plSearch = e.target.value;
-          buildPriceList();
-          // buildPriceList() tạo lại ô tìm kiếm → focus lại để gõ liên tục
-          const ni = sec2.querySelector('.pricelist-search');
-          if (ni) {
-            ni.focus();
-            if (caret != null) { try { ni.setSelectionRange(caret, caret); } catch(_) {} }
-          }
-        });
-        hdr2.appendChild(titleWrap);
-        hdr2.appendChild(searchInp);
-        sec2.appendChild(hdr2);
+        const hdr2 = _plHdr; // alias cho cấu trúc cũ tương thích
 
         const q = plSearch.toLowerCase();
         const filtered2 = allProds.filter(p =>
