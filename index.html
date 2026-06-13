@@ -2643,13 +2643,20 @@ function inp(type, placeholder, value, onInput, extra = {}) {
     try { caret = e.target.selectionStart; } catch(_) {}
     onInput(e.target.value);
     // Nếu onInput gọi rebuild() → input này bị gỡ khỏi DOM và tạo lại → mất focus.
-    // Tìm input mới cùng placeholder và focus lại để gõ liên tục không phải click.
+    // Dùng requestAnimationFrame để đảm bảo DOM render xong rồi mới focus lại.
     if (!el.isConnected) {
-      const nw = [...document.querySelectorAll('input.form-input')].find(x => x.placeholder === placeholder && x.isConnected);
-      if (nw) {
-        nw.focus();
-        if (caret != null) { try { nw.setSelectionRange(caret, caret); } catch(_) {} }
-      }
+      requestAnimationFrame(() => {
+        const nw = [...document.querySelectorAll('input.form-input')].find(x => x.placeholder === placeholder && x.isConnected);
+        if (nw) {
+          nw.focus();
+          if (caret != null) {
+            try {
+              const safePos = Math.min(caret, (nw.value || '').length);
+              nw.setSelectionRange(safePos, safePos);
+            } catch(_) {}
+          }
+        }
+      });
     }
   });
   return el;
@@ -3783,6 +3790,21 @@ function pgInventory() {
   const wrap = h('div', {});
   let search = '', ftype = 'all';
 
+  // Search row: created ONCE - never destroyed on rebuild - fixes focus loss on desktop
+  const _searchRow = document.createElement('div');
+  _searchRow.style.cssText = 'display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap';
+  const _searchInp = document.createElement('input');
+  _searchInp.type = 'text'; _searchInp.className = 'form-input';
+  _searchInp.placeholder = '🔍 Tìm tên, loại đá, xuất xứ...';
+  _searchInp.style.flex = '1 1 180px';
+  _searchInp.addEventListener('input', e => { search = e.target.value; rebuild(); });
+  const _selType = document.createElement('select');
+  _selType.className = 'form-input'; _selType.style.width = '140px';
+  const _defOpt = document.createElement('option'); _defOpt.value = 'all';
+  _defOpt.textContent = 'Tất cả loại'; _selType.appendChild(_defOpt);
+  _selType.addEventListener('change', e => { ftype = e.target.value; rebuild(); });
+  _searchRow.appendChild(_searchInp); _searchRow.appendChild(_selType);
+
   const rebuild = () => {
     const { products } = S;
     const types = [...new Set(products.map(p => p.type))];
@@ -3797,6 +3819,7 @@ function pgInventory() {
     const totalSellValue = S.sales.reduce((a, s) => a + (s.subTotal || s.unitPrice * s.qty || 0), 0);
 
     wrap.innerHTML = '';
+    wrap.appendChild(_searchRow); // keep search bar persistent
     // ── Phát hiện sản phẩm trùng tên ───────────────────────────
     const dupGroups = (() => {
       const byName = {};
@@ -3886,7 +3909,7 @@ function pgInventory() {
               negVts.map(vt => {
                 const m2 = vt.stockM2||0; const pcs = vt.stockPieces||0;
                 return `<div style="background:rgba(224,92,92,.15);border:1px solid rgba(224,92,92,.35);border-radius:6px;padding:5px 9px;font-size:11px">
-                  <b style="color:var(--accent)">${vt.tileW}×${vt.tileH}cm</b><br>
+                  <b style="color:var(--accent)">${vt.tileW}×${vt.tileH}${vt.tileThickness?'×'+vt.tileThickness:''}cm</b><br>
                   <span style="color:var(--red);font-weight:700">${m2.toFixed(2)} m²</span>
                   <span style="color:var(--text3);font-size:10px"> / ${pcs} viên</span><br>
                   <span style="color:var(--amber);font-size:10px;font-weight:700">⬆️ Cần: ${Math.abs(m2).toFixed(2)}m² (${Math.abs(pcs)} viên)</span>
@@ -3941,10 +3964,14 @@ function pgInventory() {
       h('div', { style: { background: 'rgba(201,168,76,.07)', border: '1px solid rgba(201,168,76,.25)', borderRadius: 'var(--r2)', padding: '9px 14px', marginBottom: 12, fontSize: 11, color: 'var(--accent)' } },
         '💡 <b>Lưu ý LN%:</b> Cột LN% = chênh lệch giá bán/giá nhập gốc (chưa tính VAT). Lợi nhuận thực tế sau VAT xem tại <b>Tổng Quan</b>. VAT được khai báo tại phiếu Nhập hàng và đơn Bán hàng.'
       ),
-      h('div', { style: { display: 'flex', gap: 8, marginBottom: 14, flexWrap: 'wrap' } },
-        inp('text', '🔍 Tìm tên, loại đá, xuất xứ...', search, v => { search = v; rebuild(); }, { style: { flex: '1 1 180px' } }),
-        sel([{ value: 'all', label: 'Tất cả loại' }, ...types.map(t => ({ value: t, label: t }))], ftype, v => { ftype = v; rebuild(); }, { style: { width: '140px' } })
-      ),
+      (() => {
+        // Update _selType options only - do not recreate element - preserves focus
+        const curVal = _selType.value;
+        while (_selType.options.length > 1) _selType.remove(1);
+        types.forEach(t => { const o = document.createElement('option'); o.value = t; o.textContent = t; _selType.appendChild(o); });
+        _selType.value = curVal || ftype;
+        return null;
+      })(),
       h('div', { className: 'table-wrap' },
         h('table', {},
           h('thead', {}, h('tr', {}, th('Sản phẩm'), th('Loại'), th('Xuất xứ'), th('Giá nhập'), th('Giá bán'), th('LN% (chưa VAT)'), th('Quy cách'), th('Tồn kho'), th('Giá trị tồn'), th(''))),
@@ -3974,7 +4001,7 @@ function pgInventory() {
                       ...p.variants.map(vt => h('div', {
                         style: { display:'flex', alignItems:'center', gap:4, flexWrap:'wrap' }
                       },
-                        h('span', { className:'badge badge-gold', style:{ fontSize:10, padding:'2px 7px' } }, '📐 ' + (vt.size || (vt.tileW+'×'+vt.tileH))),
+                        h('span', { className:'badge badge-gold', style:{ fontSize:10, padding:'2px 7px' } }, '📐 ' + (vt.tileW+'×'+vt.tileH) + (vt.tileThickness ? ('×'+vt.tileThickness) : '') + 'cm'),
                         vt.sellPrice && h('span', { style:{ fontSize:11, color:'var(--accent)' } }, fmt(vt.sellPrice)+'đ/m²'),
                         (vt.stockM2 > 0 || vt.stockPieces > 0)
                           ? h('span', { style:{ fontSize:10, color:'var(--green)' } }, '(' + (vt.stockPieces||0) + ' viên · ' + (vt.stockM2||0).toFixed(1) + 'm²)')
@@ -4037,7 +4064,7 @@ function openProduct(prod, rebuild) {
   const taDesc    = mkTextarea('Đặc điểm, màu sắc, ứng dụng...', f.description, v => f.description = v);
 
   // ── Quy cách kích thước (Variants) ─────────────────────────
-  // Mỗi variant: { id, size (vd "10x60"), tileW (cm), tileH (cm), buyPrice, sellPrice, piecesPerM2 (viên/m²), stock_pieces, stock_m2 }
+  // Mỗi variant: { id, size (vd "10x60"), tileW (cm), tileH (cm), tileThickness (cm), buyPrice, sellPrice, piecesPerM2 (viên/m²), stock_pieces, stock_m2 }
   // Nhập: số viên → tính m²  HOẶC  nhập m² → tính số viên
   // Công thức: 1 m² = 10000 cm² / (tileW × tileH) viên
 
@@ -4059,7 +4086,7 @@ function openProduct(prod, rebuild) {
   }
 
   function makeVariantRow(vt) {
-    // vt = { id, size, tileW, tileH, buyPrice, sellPrice, stockPieces, stockM2 }
+    // vt = { id, size, tileW, tileH, tileThickness, buyPrice, sellPrice, stockPieces, stockM2 }
     const rowWrap = document.createElement('div');
     rowWrap.style.cssText = 'background:var(--bg3);border:1.5px solid var(--border2);border-radius:var(--r);padding:14px 16px;position:relative';
 
@@ -4113,7 +4140,28 @@ function openProduct(prod, rebuild) {
       rowWrap.remove();
     };
 
+    // Thickness input per variant
+    const thickSep = document.createElement('span');
+    thickSep.textContent = '×'; thickSep.style.cssText = 'font-size:16px;color:var(--text2);font-weight:700';
+
+    const inpThick = document.createElement('input');
+    inpThick.type = 'number'; inpThick.step = '0.1'; inpThick.min = '0';
+    inpThick.placeholder = 'Dày (cm)';
+    inpThick.value = vt.tileThickness || '';
+    inpThick.className = 'form-input';
+    inpThick.style.cssText = 'width:90px;text-align:center';
+    inpThick.title = 'Độ dày viên đá (cm)';
+
+    const thickLabel = document.createElement('span');
+    thickLabel.style.cssText = 'font-size:11px;color:var(--text2);background:rgba(201,168,76,.10);border:1px solid rgba(201,168,76,.25);border-radius:99px;padding:2px 8px;white-space:nowrap';
+    thickLabel.textContent = 'dày';
+
+    inpThick.addEventListener('input', () => {
+      vt.tileThickness = parseFloat(inpThick.value) || 0;
+    });
+
     hdr.appendChild(inpW); hdr.appendChild(xSep); hdr.appendChild(inpH); hdr.appendChild(cmLabel);
+    hdr.appendChild(thickSep); hdr.appendChild(inpThick); hdr.appendChild(thickLabel);
     hdr.appendChild(ppm2Badge); hdr.appendChild(delBtn);
     rowWrap.appendChild(hdr);
 
@@ -4266,7 +4314,7 @@ function openProduct(prod, rebuild) {
   addVariantBtn.style.cssText = 'margin-top:6px;background:var(--blue);color:#fff;border:none;width:100%';
   addVariantBtn.innerHTML = '➕ Thêm quy cách kích thước';
   addVariantBtn.onclick = () => {
-    const newVt = { id: 'vt' + Date.now() + Math.random().toString(36).slice(2,7), size:'', tileW:0, tileH:0, buyPrice:0, sellPrice:0, stockPieces:0, stockM2:0 };
+    const newVt = { id: 'vt' + Date.now() + Math.random().toString(36).slice(2,7), size:'', tileW:0, tileH:0, tileThickness:0, buyPrice:0, sellPrice:0, stockPieces:0, stockM2:0 };
     f.variants.push(newVt);
     variantsContainer.appendChild(makeVariantRow(newVt));
   };
@@ -4332,7 +4380,7 @@ function openProduct(prod, rebuild) {
 
   const varNote = document.createElement('div');
   varNote.style.cssText = 'font-size:11px;color:var(--text2);background:rgba(91,143,232,.07);border:1px solid rgba(91,143,232,.2);border-radius:6px;padding:7px 10px;margin-bottom:10px;line-height:1.7';
-  varNote.innerHTML = '💡 <b>Ví dụ:</b> Đá ong xám quy cách 10×60cm → <b>10.000÷(10×60) = 16.67 viên/m²</b>. Nhập số viên sẽ tự tính m² và ngược lại.<br>Giá nhập/bán của từng quy cách sẽ <b>ghi đè</b> giá mặc định khi tạo đơn/phiếu nhập.';
+  varNote.innerHTML = '💡 <b>Ví dụ:</b> Đá ong xám quy cách 10×60cm → <b>10.000÷(10×60) = 16.67 viên/m²</b>. Nhập số viên sẽ tự tính m² và ngược lại.<br>Trường <b>Dày</b> để ghi độ dày viên đá (VD: 1.5 cm). Giá nhập/bán của từng quy cách sẽ <b>ghi đè</b> giá mặc định khi tạo đơn/phiếu nhập.';
 
   variantsSectionWrap.appendChild(varHdr);
   variantsSectionWrap.appendChild(varNote);
@@ -4539,7 +4587,7 @@ function pgImports() {
                   i.variantId && (() => {
                     const prod = S.products.find(p => p.id === i.productId);
                     const vt = prod && prod.variants && prod.variants.find(v => v.id === i.variantId);
-                    return vt ? h('div', { style:{fontSize:10,color:'var(--accent)',marginTop:2} }, '📐 ' + vt.tileW+'×'+vt.tileH+'cm') : null;
+                    return vt ? h('div', { style:{fontSize:10,color:'var(--accent)',marginTop:2} }, '📐 ' + vt.tileW+'×'+vt.tileH+(vt.tileThickness?'×'+vt.tileThickness:'')+' cm') : null;
                   })()
                 ),
                 h('td', {}, fmtQty(i.qty) + ' ' + i.unit),
@@ -4992,7 +5040,7 @@ function openImport(existing, rebuild) {
         opt.value = vt.id;
         const ppm2 = (vt.tileW > 0 && vt.tileH > 0) ? (10000/(vt.tileW*vt.tileH)).toFixed(1) : '?';
         const stockStr = (vt.stockM2||0) > 0 ? ' · Tồn: '+(vt.stockM2||0).toFixed(1)+'m²/'+(vt.stockPieces||0)+' viên' : ' · (chưa có)';
-        opt.textContent = '📐 '+vt.tileW+'×'+vt.tileH+'cm — '+fmt(vt.buyPrice||p.buyPrice||0)+'đ/m² · '+ppm2+' viên/m²'+stockStr;
+        opt.textContent = '📐 '+vt.tileW+'×'+vt.tileH+(vt.tileThickness?'×'+vt.tileThickness:'')+' cm — '+fmt(vt.buyPrice||p.buyPrice||0)+'đ/m² · '+ppm2+' viên/m²'+stockStr;
         if (vt.id === it._vtSelId) opt.selected = true;
         vsel.appendChild(opt);
       });
@@ -5006,7 +5054,7 @@ function openImport(existing, rebuild) {
       });
       const vtInfo = document.createElement('div');
       vtInfo.style.cssText = 'margin-top:5px;font-size:11px;color:var(--blue);background:rgba(91,143,232,.07);border:1px solid rgba(91,143,232,.2);border-radius:6px;padding:5px 9px';
-      vtInfo.innerHTML = p.variants.map(vt => `<span style="margin-right:10px">📐${vt.tileW}×${vt.tileH}: <b style="color:var(--green)">${(vt.stockM2||0).toFixed(1)}m²</b>/${vt.stockPieces||0}v</span>`).join('');
+      vtInfo.innerHTML = p.variants.map(vt => `<span style="margin-right:10px">📐${vt.tileW}×${vt.tileH}${vt.tileThickness?'×'+vt.tileThickness:''}cm: <b style="color:var(--green)">${(vt.stockM2||0).toFixed(1)}m²</b>/${vt.stockPieces||0}v</span>`).join('');
       variantEl.appendChild(vlbl); variantEl.appendChild(vsel); variantEl.appendChild(vtInfo);
       if (it._vtSelId) {
         const sv = p.variants.find(vt => vt.id === it._vtSelId);
@@ -5748,7 +5796,7 @@ function pgSales() {
                       const totalM2 = qty * m2perPiece;
                       return h('td', { style:{color:'var(--blue)',fontWeight:600,fontSize:12} },
                         h('div', {}, totalM2.toFixed(2) + ' m²'),
-                        h('div', { style:{fontSize:10,color:'var(--text3)'} }, qty + ' viên · ' + vt.tileW+'×'+vt.tileH+'cm')
+                        h('div', { style:{fontSize:10,color:'var(--text3)'} }, qty + ' viên · ' + vt.tileW+'×'+vt.tileH+(vt.tileThickness?'×'+vt.tileThickness:'')+' cm')
                       );
                     }
                   }
@@ -6139,7 +6187,7 @@ function openSale(rebuild, preselectedProduct) {
         const ppm2=(vt.tileW>0&&vt.tileH>0)?(10000/(vt.tileW*vt.tileH)).toFixed(1):'?';
         const m2=vt.stockM2||0;
         const icon=m2<=0?'⛔':m2<=5?'⚠️':'✅';
-        opt.textContent=icon+' '+vt.tileW+'×'+vt.tileH+'cm — '+fmt(vt.sellPrice||p.sellPrice||0)+'đ/m² — Tồn: '+m2.toFixed(1)+'m²/'+(vt.stockPieces||0)+' viên';
+        opt.textContent=icon+' '+vt.tileW+'×'+vt.tileH+(vt.tileThickness?'×'+vt.tileThickness:'')+' cm — '+fmt(vt.sellPrice||p.sellPrice||0)+'đ/m² — Tồn: '+m2.toFixed(1)+'m²/'+(vt.stockPieces||0)+' viên';
         vsel.appendChild(opt);
       });
       // Grid tồn kho trực quan
@@ -6151,7 +6199,7 @@ function openSale(rebuild, preselectedProduct) {
         const bdr=m2<=0?'rgba(224,92,92,.4)':m2<=5?'rgba(232,165,58,.4)':'rgba(76,175,125,.4)';
         const box=document.createElement('div');
         box.style.cssText=`background:var(--bg4);border:1.5px solid ${bdr};border-radius:8px;padding:8px;text-align:center;cursor:pointer;transition:all .15s`;
-        box.innerHTML=`<div style="font-weight:700;color:var(--accent);font-size:12px">${vt.tileW}×${vt.tileH} cm</div><div style="color:${col};font-weight:700;font-size:16px;margin:2px 0">${m2.toFixed(1)} m²</div><div style="color:var(--text3);font-size:10px">${vt.stockPieces||0} viên</div>`;
+        box.innerHTML=`<div style="font-weight:700;color:var(--accent);font-size:12px">${vt.tileW}×${vt.tileH}${vt.tileThickness?'×'+vt.tileThickness:''} cm</div><div style="color:${col};font-weight:700;font-size:16px;margin:2px 0">${m2.toFixed(1)} m²</div><div style="color:var(--text3);font-size:10px">${vt.stockPieces||0} viên</div>`;
         box.onclick=()=>{vsel.value=vt.id;vsel.dispatchEvent(new Event('change'));};
         vtGrid.appendChild(box);
       });
@@ -6306,7 +6354,7 @@ function openSale(rebuild, preselectedProduct) {
           let vtSize=null;
           if(it.variantId && prod && prod.variants){
             const sv=prod.variants.find(vt=>vt.id===it.variantId);
-            if(sv) vtSize=sv.tileW+'×'+sv.tileH+'cm';
+            if(sv) vtSize=sv.tileW+'×'+sv.tileH+(sv.tileThickness?'×'+sv.tileThickness:'')+' cm';
           }
           const rec = {
             id:'s'+uid(), date:dateSaved, customer, phone:inpPhone.value.trim(),
@@ -6363,7 +6411,7 @@ function openSale(rebuild, preselectedProduct) {
             const negativeVariants = (prod.variants || [])
               .filter(vt => (vt.stockM2 || 0) < 0 || (vt.stockPieces || 0) < 0)
               .map(vt => ({
-                size: vt.tileW + '×' + vt.tileH + 'cm',
+                size: vt.tileW + '×' + vt.tileH + (vt.tileThickness?'×'+vt.tileThickness:'') + ' cm',
                 stockM2: vt.stockM2 || 0,
                 stockPieces: vt.stockPieces || 0,
                 needM2: (vt.stockM2 || 0) < 0 ? Math.abs(vt.stockM2) : 0,
@@ -11284,7 +11332,7 @@ const AICHAT = (() => {
       let line = `- ID:${p.id} | Tên: ${p.name} | Loại: ${p.type||''} | Xuất xứ: ${p.origin||''} | Đơn vị: ${p.unit||''} | Giá bán: ${p.sellPrice||0}đ`;
       if (p.description) line += ` | Mô tả: ${p.description}`;
       if (p.variants && p.variants.length > 0) {
-        line += ` | Quy cách: ` + p.variants.map(v => `${v.tileW||'?'}x${v.tileH||'?'}cm`).join(', ');
+        line += ` | Quy cách: ` + p.variants.map(v => `${v.tileW||'?'}x${v.tileH||'?'}${v.tileThickness?'x'+v.tileThickness:''}cm`).join(', ');
       }
       return line;
     }).join('\n');
