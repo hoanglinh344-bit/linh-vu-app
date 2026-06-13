@@ -2638,12 +2638,24 @@ function h(tag, attrs, ...children) {
 function inp(type, placeholder, value, onInput, extra = {}) {
   if (type === 'number') extra = { step: 'any', inputmode: 'decimal', ...extra };
   const el = h('input', { type, placeholder, value: value ?? '', className: 'form-input', ...extra });
+  // IME composition guard: fix go tieng Viet (Unikey) bi vo chu khi rebuild()
+  let _ime = false;
+  el.addEventListener('compositionstart', () => { _ime = true; });
+  el.addEventListener('compositionend', e => {
+    _ime = false;
+    onInput(e.target.value);
+    if (!el.isConnected) {
+      requestAnimationFrame(() => {
+        const nw = [...document.querySelectorAll('input.form-input')].find(x => x.placeholder === placeholder && x.isConnected);
+        if (nw) { nw.focus(); try { nw.setSelectionRange(nw.value.length, nw.value.length); } catch(_) {} }
+      });
+    }
+  });
   el.addEventListener('input', e => {
+    if (_ime) return; // dang composition (IME/bo go tieng Viet) - cho compositionend
     let caret = null;
     try { caret = e.target.selectionStart; } catch(_) {}
     onInput(e.target.value);
-    // Nếu onInput gọi rebuild() → input này bị gỡ khỏi DOM và tạo lại → mất focus.
-    // Dùng requestAnimationFrame để đảm bảo DOM render xong rồi mới focus lại.
     if (!el.isConnected) {
       requestAnimationFrame(() => {
         const nw = [...document.querySelectorAll('input.form-input')].find(x => x.placeholder === placeholder && x.isConnected);
@@ -3797,7 +3809,18 @@ function pgInventory() {
   _searchInp.type = 'text'; _searchInp.className = 'form-input';
   _searchInp.placeholder = '🔍 Tìm tên, loại đá, xuất xứ...';
   _searchInp.style.flex = '1 1 180px';
-  _searchInp.addEventListener('input', e => { search = e.target.value; rebuild(); });
+  let _composing = false;
+  _searchInp.addEventListener('compositionstart', () => { _composing = true; });
+  _searchInp.addEventListener('compositionend', e => {
+    _composing = false;
+    search = e.target.value;
+    rebuild();
+  });
+  _searchInp.addEventListener('input', e => {
+    if (_composing) return; // dang go IME (tieng Viet) - cho den khi xong
+    search = e.target.value;
+    rebuild();
+  });
   const _selType = document.createElement('select');
   _selType.className = 'form-input'; _selType.style.width = '140px';
   const _defOpt = document.createElement('option'); _defOpt.value = 'all';
