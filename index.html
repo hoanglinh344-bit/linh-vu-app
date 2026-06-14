@@ -5377,244 +5377,21 @@ function pgSales() {
   const wrap = h('div', {});
   let search = '', fStatus = 'all', curPage = 0;
   const PAGE_SIZE = 50;
-
-  // Persistent search row: fix tiếng Việt IME trên mobile/iOS (input không bị destroy khi gõ tìm kiếm)
-  let _salesIme = false;
-  const _salesTableContainer = document.createElement('div');
-  const _salesSearchRow = document.createElement('div');
-  _salesSearchRow.style.cssText = 'display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap';
-  const _salesSearchInp = document.createElement('input');
-  _salesSearchInp.type = 'text';
-  _salesSearchInp.className = 'form-input';
-  _salesSearchInp.placeholder = '🔍 Tìm khách hàng, sản phẩm...';
-  _salesSearchInp.style.flex = '1 1 180px';
-  _salesSearchInp.addEventListener('compositionstart', () => { _salesIme = true; });
-  _salesSearchInp.addEventListener('compositionend', e => {
-    _salesIme = false;
-    search = e.target.value; curPage = 0; rebuildTable();
-  });
-  _salesSearchInp.addEventListener('input', e => {
-    if (_salesIme) return;
-    search = e.target.value; curPage = 0; rebuildTable();
-  });
-  const _salesStatusSel = document.createElement('select');
-  _salesStatusSel.className = 'form-input';
-  _salesStatusSel.style.width = '130px';
-  [{value:'all',label:'Tất cả'},{value:'done',label:'✅ Đã xong'},{value:'debt',label:'⚠️ Còn nợ'}].forEach(o => {
-    const opt = document.createElement('option'); opt.value = o.value; opt.textContent = o.label;
-    _salesStatusSel.appendChild(opt);
-  });
-  _salesStatusSel.addEventListener('change', e => { fStatus = e.target.value; curPage = 0; rebuild(); });
-  _salesSearchRow.appendChild(_salesSearchInp);
-  _salesSearchRow.appendChild(_salesStatusSel);
-
-  function rebuildTable() {
-    const { sales } = S;
-    const currentUser = AUTH.currentUser();
-    const isAdmin = currentUser && currentUser.role === 'admin';
-    const mySales = isAdmin ? sales : sales.filter(s => s.staffId === currentUser.username);
-    const filtered = mySales.filter(s => {
-      const q = search.toLowerCase();
-      return (s.customer.toLowerCase().includes(q) || s.productName.toLowerCase().includes(q))
-        && (fStatus === 'all' || s.status === fStatus);
-    }).sort((a, b) => b.date.localeCompare(a.date));
-    const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
-    if (curPage >= totalPages) curPage = totalPages - 1;
-    const paginated = filtered.slice(curPage * PAGE_SIZE, (curPage + 1) * PAGE_SIZE);
-    _salesTableContainer.innerHTML = '';
-    _salesTableContainer.appendChild(h('div', { className: 'table-wrap' },
-      h('table', {},
-        h('thead', {}, h('tr', {},
-          th('Ngày'), th('Khách hàng'), th('Sản phẩm'), th('Tạm tính'), th('VAT HH'), th('Phí VC'), th('VAT VC'), th('Tổng'), isAdmin && th('Số m²'), th('Đã thu'), th('Còn nợ'), isAdmin && th('% LN'), th('TT'), th('')
-        )),
-        h('tbody', {},
-          ...paginated.map(s => {
-            const shipFeeNet = (s.shipVatRate||0) > 0 ? (s.shipFee||0)/(1+s.shipVatRate/100) : (s.shipFee||0);
-            return h('tr', {},
-              h('td', { style:{color:'var(--text2)',fontSize:12} }, fmtD(s.date)),
-              h('td', {},
-                h('div', { style:{fontWeight:600} }, s.customer),
-                h('div', { style:{fontSize:11,color:'var(--text3)'} }, s.phone||'')
-              ),
-              h('td', {},
-                h('div', { style:{fontWeight:500} }, s.productName),
-                s.variantSize && h('div', { style:{fontSize:10,color:'var(--accent)',marginTop:2} }, '📐 ' + s.variantSize)
-              ),
-              h('td', {}, fmt(s.subTotal||0) + 'đ'),
-              h('td', {},
-                s.vatRate > 0
-                  ? h('span', {className:'badge badge-blue'}, s.vatRate+'%')
-                  : h('span', {style:{color:'var(--text3)'}}, '0%')
-              ),
-              h('td', {},
-                (s.shipFee||0) > 0
-                  ? h('span', {style:{color:'var(--amber)',fontWeight:600}}, fmt(s.shipFee)+'đ' + (s.shipUnit ? '/'+s.shipUnit:''))
-                  : h('span', {style:{color:'var(--text3)'}}, '—')
-              ),
-              h('td', {},
-                (s.shipFee||0) > 0
-                  ? ((s.shipVatRate||0) > 0
-                      ? h('span',{className:'badge badge-blue'}, s.shipVatRate+'%')
-                      : h('span',{className:'badge',style:{background:'rgba(92,88,80,.15)',color:'var(--text3)',border:'1px solid rgba(92,88,80,.3)'}}, 'KT'))
-                  : h('span',{style:{color:'var(--text3)'}}, '—')
-              ),
-              h('td', { style:{fontWeight:700} }, fmt(s.total)+'đ'),
-              isAdmin && (() => {
-                // Tính số m² của đơn hàng
-                const prod = S.products.find(p => p.id === s.productId);
-                const unit = s.unit || (prod?.unit || '');
-                const qty = s.qty || 0;
-                if (unit === 'm²' || unit === 'm2') {
-                  return h('td', { style:{color:'var(--blue)',fontWeight:600,fontSize:12} }, qty.toFixed(2) + ' m²');
-                }
-                // Nếu có variantId, tính từ kích thước viên
-                if (s.variantId && prod && prod.variants) {
-                  const vt = prod.variants.find(v => v.id === s.variantId);
-                  if (vt && vt.tileW > 0 && vt.tileH > 0) {
-                    const m2perPiece = (vt.tileW * vt.tileH) / 10000;
-                    const totalM2 = qty * m2perPiece;
-                    return h('td', { style:{color:'var(--blue)',fontWeight:600,fontSize:12} },
-                      h('div', {}, totalM2.toFixed(2) + ' m²'),
-                      h('div', { style:{fontSize:10,color:'var(--text3)'} }, qty + ' viên · ' + vt.tileW+'×'+vt.tileH+(vt.tileThickness?'×'+vt.tileThickness:'')+' cm')
-                    );
-                  }
-                }
-                // Nếu đơn vị là viên và sản phẩm có 1 variant
-                if ((unit === 'viên' || unit === 'tấm') && prod && prod.variants && prod.variants.length === 1) {
-                  const vt = prod.variants[0];
-                  if (vt.tileW > 0 && vt.tileH > 0) {
-                    const m2perPiece = (vt.tileW * vt.tileH) / 10000;
-                    return h('td', { style:{color:'var(--blue)',fontWeight:600,fontSize:12} }, (qty * m2perPiece).toFixed(2) + ' m²');
-                  }
-                }
-                return h('td', { style:{color:'var(--text3)',fontSize:11} }, '—');
-              })(),
-              h('td', { style:{color:'var(--green)'} }, fmt(s.paid)+'đ'),
-              h('td', {className:'amount-neg'}, s.status==='debt' ? fmt(s.total-s.paid)+'đ' : '—'),
-              isAdmin && (() => {
-                // Tính % LN: (giá bán - giá vốn) / giá vốn
-                const imp = [...S.imports].filter(i => i.productId === s.productId && i.date <= s.date).sort((a,b)=>b.date.localeCompare(a.date))[0];
-                const buyP = imp ? (imp.unitPrice||0) : (S.products.find(p=>p.id===s.productId)?.buyPrice||0);
-                const sellP = s.unitPrice||0;
-                if (!buyP || !sellP) return h('td', {style:{color:'var(--text3)'}}, '—');
-                const pctVal = Math.round((sellP - buyP) / buyP * 100);
-                const profitPerUnit = sellP - buyP;
-                const totalProfit = profitPerUnit * (s.qty || 1);
-                const col = pctVal >= 0 ? 'var(--green)' : 'var(--red)';
-                return h('td', {},
-                  h('span', {className:'badge', style:{background: pctVal>=0?'rgba(76,175,125,.15)':'rgba(224,92,92,.15)', color:col, border:'1px solid '+(pctVal>=0?'rgba(76,175,125,.3)':'rgba(224,92,92,.3)'), fontWeight:700}}, (pctVal>=0?'+':'')+pctVal+'%'),
-                  h('div', {style:{fontSize:10,color:col,marginTop:3,fontWeight:600}}, (totalProfit>=0?'+':'')+fmt(Math.round(totalProfit))+'đ')
-                );
-              })(),
-              h('td', {}, h('span', {className:'badge badge-'+(s.status==='done'?'green':'red')}, s.status==='done'?'Xong':'Nợ')),
-              h('td', {}, h('div', {style:{display:'flex',gap:4}},
-                s.status==='debt' && h('button', {
-                  className:'btn btn-xs', style:{background:'var(--green)',color:'#fff',border:'none'},
-                  onClick: () => { S.sales=S.sales.map(x=>x.id===s.id?{...x,paid:x.total,status:'done',_updated:new Date().toISOString()}:x); save('sales'); toast('Đã thu hết nợ','success'); rebuild(); }
-                }, '✓ Thu'),
-                s.qty>0 && h('button', {
-                  className:'btn btn-xs', style:{background:'var(--amber)',color:'#fff',border:'none'},
-                  onClick: () => openReturnFromSale(s, rebuild)
-                }, '↩️ Trả'),
-                h('button', {
-                  className:'btn btn-ghost btn-xs',
-                  onClick: () => {
-                    // Kiểm tra phiếu trả hàng liên kết với đơn này
-                    const linkedReturns = (S.returns || []).filter(r => r.saleId === s.id);
-                    const linkedLogs    = (S.paymentlogs || []).filter(l => l.refId === s.id && l.type === 'customer');
-                    let confirmMsg = 'Xoá đơn hàng của "' + s.customer + '"?';
-                    if (linkedReturns.length > 0) {
-                      confirmMsg += '\n\n⚠️ Đơn này có ' + linkedReturns.length + ' phiếu trả hàng liên kết → sẽ bị xoá theo để tránh sai tồn kho.';
-                      confirmMsg += '\n(Hàng trả đã được cộng kho khi tạo phiếu → sẽ trừ lại khi xoá phiếu trả)';
-                    }
-                    if (linkedLogs.length > 0) {
-                      confirmMsg += '\n\n📋 ' + linkedLogs.length + ' lịch sử thanh toán của đơn cũng sẽ bị xoá.';
-                    }
-                    S.confirm = {
-                      msg: confirmMsg,
-                      onYes: () => {
-                        // 1. Hoàn kho: hoàn SL còn lại trong đơn + SL phiếu trả liên kết (để bù trừ bước 2)
-                        // Bước 2 sẽ trừ lại phần đã cộng khi tạo phiếu trả → net = hoàn đúng qty gốc bán
-                        const totalReturnQty = linkedReturns.reduce((a, r) => a + (r.returnQty || 0), 0);
-                        const qtyToRestore = s.qty + totalReturnQty; // qty gốc = qty còn lại + phần đã trả
-                        if (qtyToRestore > 0) {
-                          S.products = S.products.map(p => {
-                            if (p.id !== s.productId) return p;
-                            const newStock = p.stock + qtyToRestore;
-                            const newVariants = (p.variants||[]).map(vt => {
-                              if (!s.variantId || vt.id !== s.variantId) return vt;
-                              const ppm2=(vt.tileW>0&&vt.tileH>0)?10000/(vt.tileW*vt.tileH):0;
-                              const newM2=(vt.stockM2||0)+qtyToRestore;
-                              return {...vt, stockM2:newM2, stockPieces:ppm2>0?Math.round(newM2*ppm2):(vt.stockPieces||0)+Math.round(qtyToRestore*(ppm2||0))};
-                            });
-                            return {...p, stock:newStock, variants:newVariants, _updated: new Date().toISOString()};
-                          });
-                        }
-
-                        // 2. Xử lý phiếu trả hàng liên kết: trừ lại kho (hoàn kho đã cộng khi trả) rồi xoá phiếu
-                        if (linkedReturns.length > 0) {
-                          linkedReturns.forEach(r => {
-                            S.products = S.products.map(p => {
-                              if (p.id !== r.productId) return p;
-                              const newStock = p.stock - r.returnQty;
-                              return {...p, stock: newStock, _updated: new Date().toISOString()};
-                            });
-                          });
-                          // Soft-delete phiếu trả liên kết
-                          const _now = new Date().toISOString();
-                          S.returns = (S.returns || []).map(r => r.saleId !== s.id ? r : { ...r, _deleted: true, _updated: _now });
-                          save('returns');
-                          setTimeout(() => { S.returns = (S.returns||[]).filter(r=>!r._deleted); DB.set('dtn_returns', S.returns); }, 600);
-                        }
-
-                        // 3. Soft-delete paymentlogs của đơn này
-                        if (linkedLogs.length > 0) {
-                          const _now2 = new Date().toISOString();
-                          S.paymentlogs = (S.paymentlogs || []).map(l => (l.refId === s.id && l.type === 'customer') ? { ...l, _deleted: true, _updated: _now2 } : l);
-                          save('paymentlogs');
-                          setTimeout(() => { S.paymentlogs = (S.paymentlogs||[]).filter(l=>!l._deleted); DB.set('dtn_paymentlogs', S.paymentlogs); }, 600);
-                        }
-
-                        // 4. Soft-delete đơn bán
-                        save('products');
-                        softDelete('sales', s.id, () => {});
-
-                        const msg = linkedReturns.length > 0
-                          ? `Đã xoá đơn + ${linkedReturns.length} phiếu trả hàng liên kết`
-                          : 'Đã xoá đơn hàng';
-                        toast(msg, 'info');
-                        rebuild();
-                      }
-                    };
-                    render();
-                  }
-                }, '🗑')
-              ))
-            );
-          }),
-          filtered.length===0 && h('tr',{},h('td',{colspan:13,style:{textAlign:'center',padding:32,color:'var(--text3)'}},'Không có đơn hàng'))
-        )
-      )
-    ));
-    if (totalPages > 1) {
-      _salesTableContainer.appendChild(h('div', { style:{display:'flex',alignItems:'center',justifyContent:'center',gap:8,marginTop:14,flexWrap:'wrap'} },
-        h('button',{className:'btn btn-sm'+(curPage===0?' btn-ghost':''),style:{minWidth:36},onClick:()=>{curPage=0;rebuildTable();}},h('span',{},'«')),
-        h('button',{className:'btn btn-sm',disabled:curPage===0,style:{minWidth:36},onClick:()=>{if(curPage>0){curPage--;rebuildTable();}}},h('span',{},'‹')),
-        h('span',{style:{fontSize:12,color:'var(--text2)',padding:'0 8px'}},
-          'Trang '+(curPage+1)+'/'+totalPages+' ('+filtered.length+' đơn)'
-        ),
-        h('button',{className:'btn btn-sm',disabled:curPage>=totalPages-1,style:{minWidth:36},onClick:()=>{if(curPage<totalPages-1){curPage++;rebuildTable();}}},h('span',{},'›')),
-        h('button',{className:'btn btn-sm'+(curPage===totalPages-1?' btn-ghost':''),style:{minWidth:36},onClick:()=>{curPage=totalPages-1;rebuildTable();}},h('span',{},'»'))
-      ));
-    }
-  }
-
   const rebuild = () => {
     const { sales } = S;
     const currentUser = AUTH.currentUser();
     const isAdmin = currentUser && currentUser.role === 'admin';
     // Nhân viên chỉ thấy đơn của mình; admin thấy tất cả
     const mySales = isAdmin ? sales : sales.filter(s => s.staffId === currentUser.username);
+    const filtered = mySales.filter(s => {
+      const q = search.toLowerCase();
+      return (s.customer.toLowerCase().includes(q) || s.productName.toLowerCase().includes(q))
+        && (fStatus === 'all' || s.status === fStatus);
+    }).sort((a, b) => b.date.localeCompare(a.date));
+    // Pagination
+    const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+    if (curPage >= totalPages) curPage = totalPages - 1;
+    const paginated = filtered.slice(curPage * PAGE_SIZE, (curPage + 1) * PAGE_SIZE);
     const totalRev   = mySales.reduce((a, s) => a + s.total, 0);
     const totalDebt  = mySales.filter(s => s.status === 'debt').reduce((a, s) => a + (s.total - s.paid), 0);
     const totalShip  = mySales.reduce((a, s) => a + (s.shipFee || 0), 0);
@@ -5811,10 +5588,12 @@ function pgSales() {
       _plHdr.appendChild(_plSearchInp);
 
       function buildPriceList() {
-        sec2.innerHTML = '';
-        sec2.appendChild(_plHdr); // header với search input luôn đống — không bị tạo lại
+        // Xoa tat ca con tru _plHdr khoi sec2 -- giu _plHdr luon trong DOM, khong bao gio detach -> fix mat focus tren mobile
+        let _c = sec2.lastChild;
+        while (_c && _c !== _plHdr) { sec2.removeChild(_c); _c = sec2.lastChild; }
+        if (!sec2.contains(_plHdr)) sec2.insertBefore(_plHdr, sec2.firstChild);
 
-        const hdr2 = _plHdr; // alias cho cấu trúc cũ tương thích
+        const hdr2 = _plHdr; // alias tuong thich
 
         const q = plSearch.toLowerCase();
         const filtered2 = allProds.filter(p =>
@@ -5989,11 +5768,195 @@ function pgSales() {
         '👷 Bạn đang xem đơn hàng của tài khoản: <b>' + (currentUser?.displayName || currentUser?.username || '') + '</b> · Chỉ hiển thị đơn do bạn tạo'
       ),
       catalogueSection,
-      _salesSearchRow,
-      _salesTableContainer
+      h('div', { style: { display: 'flex', gap: 8, marginBottom: 14, flexWrap: 'wrap' } },
+        inp('text', '🔍 Tìm khách hàng, sản phẩm...', search, v => { search = v; curPage = 0; rebuild(); }, { style: { flex: '1 1 180px' } }),
+        sel([{ value:'all',label:'Tất cả' },{ value:'done',label:'✅ Đã xong' },{ value:'debt',label:'⚠️ Còn nợ' }], fStatus, v => { fStatus = v; curPage = 0; rebuild(); }, { style: { width:'130px' } })
+      ),
+      h('div', { className: 'table-wrap' },
+        h('table', {},
+          h('thead', {}, h('tr', {},
+            th('Ngày'), th('Khách hàng'), th('Sản phẩm'), th('Tạm tính'), th('VAT HH'), th('Phí VC'), th('VAT VC'), th('Tổng'), isAdmin && th('Số m²'), th('Đã thu'), th('Còn nợ'), isAdmin && th('% LN'), th('TT'), th('')
+          )),
+          h('tbody', {},
+            ...paginated.map(s => {
+              const shipFeeNet = (s.shipVatRate||0) > 0 ? (s.shipFee||0)/(1+s.shipVatRate/100) : (s.shipFee||0);
+              return h('tr', {},
+                h('td', { style:{color:'var(--text2)',fontSize:12} }, fmtD(s.date)),
+                h('td', {},
+                  h('div', { style:{fontWeight:600} }, s.customer),
+                  h('div', { style:{fontSize:11,color:'var(--text3)'} }, s.phone||'')
+                ),
+                h('td', {},
+                  h('div', { style:{fontWeight:500} }, s.productName),
+                  s.variantSize && h('div', { style:{fontSize:10,color:'var(--accent)',marginTop:2} }, '📐 ' + s.variantSize)
+                ),
+                h('td', {}, fmt(s.subTotal||0) + 'đ'),
+                h('td', {},
+                  s.vatRate > 0
+                    ? h('span', {className:'badge badge-blue'}, s.vatRate+'%')
+                    : h('span', {style:{color:'var(--text3)'}}, '0%')
+                ),
+                h('td', {},
+                  (s.shipFee||0) > 0
+                    ? h('span', {style:{color:'var(--amber)',fontWeight:600}}, fmt(s.shipFee)+'đ' + (s.shipUnit ? '/'+s.shipUnit:''))
+                    : h('span', {style:{color:'var(--text3)'}}, '—')
+                ),
+                h('td', {},
+                  (s.shipFee||0) > 0
+                    ? ((s.shipVatRate||0) > 0
+                        ? h('span',{className:'badge badge-blue'}, s.shipVatRate+'%')
+                        : h('span',{className:'badge',style:{background:'rgba(92,88,80,.15)',color:'var(--text3)',border:'1px solid rgba(92,88,80,.3)'}}, 'KT'))
+                    : h('span',{style:{color:'var(--text3)'}}, '—')
+                ),
+                h('td', { style:{fontWeight:700} }, fmt(s.total)+'đ'),
+                isAdmin && (() => {
+                  // Tính số m² của đơn hàng
+                  const prod = S.products.find(p => p.id === s.productId);
+                  const unit = s.unit || (prod?.unit || '');
+                  const qty = s.qty || 0;
+                  if (unit === 'm²' || unit === 'm2') {
+                    return h('td', { style:{color:'var(--blue)',fontWeight:600,fontSize:12} }, qty.toFixed(2) + ' m²');
+                  }
+                  // Nếu có variantId, tính từ kích thước viên
+                  if (s.variantId && prod && prod.variants) {
+                    const vt = prod.variants.find(v => v.id === s.variantId);
+                    if (vt && vt.tileW > 0 && vt.tileH > 0) {
+                      const m2perPiece = (vt.tileW * vt.tileH) / 10000;
+                      const totalM2 = qty * m2perPiece;
+                      return h('td', { style:{color:'var(--blue)',fontWeight:600,fontSize:12} },
+                        h('div', {}, totalM2.toFixed(2) + ' m²'),
+                        h('div', { style:{fontSize:10,color:'var(--text3)'} }, qty + ' viên · ' + vt.tileW+'×'+vt.tileH+(vt.tileThickness?'×'+vt.tileThickness:'')+' cm')
+                      );
+                    }
+                  }
+                  // Nếu đơn vị là viên và sản phẩm có 1 variant
+                  if ((unit === 'viên' || unit === 'tấm') && prod && prod.variants && prod.variants.length === 1) {
+                    const vt = prod.variants[0];
+                    if (vt.tileW > 0 && vt.tileH > 0) {
+                      const m2perPiece = (vt.tileW * vt.tileH) / 10000;
+                      return h('td', { style:{color:'var(--blue)',fontWeight:600,fontSize:12} }, (qty * m2perPiece).toFixed(2) + ' m²');
+                    }
+                  }
+                  return h('td', { style:{color:'var(--text3)',fontSize:11} }, '—');
+                })(),
+                h('td', { style:{color:'var(--green)'} }, fmt(s.paid)+'đ'),
+                h('td', {className:'amount-neg'}, s.status==='debt' ? fmt(s.total-s.paid)+'đ' : '—'),
+                isAdmin && (() => {
+                  // Tính % LN: (giá bán - giá vốn) / giá vốn
+                  const imp = [...S.imports].filter(i => i.productId === s.productId && i.date <= s.date).sort((a,b)=>b.date.localeCompare(a.date))[0];
+                  const buyP = imp ? (imp.unitPrice||0) : (S.products.find(p=>p.id===s.productId)?.buyPrice||0);
+                  const sellP = s.unitPrice||0;
+                  if (!buyP || !sellP) return h('td', {style:{color:'var(--text3)'}}, '—');
+                  const pctVal = Math.round((sellP - buyP) / buyP * 100);
+                  const profitPerUnit = sellP - buyP;
+                  const totalProfit = profitPerUnit * (s.qty || 1);
+                  const col = pctVal >= 0 ? 'var(--green)' : 'var(--red)';
+                  return h('td', {},
+                    h('span', {className:'badge', style:{background: pctVal>=0?'rgba(76,175,125,.15)':'rgba(224,92,92,.15)', color:col, border:'1px solid '+(pctVal>=0?'rgba(76,175,125,.3)':'rgba(224,92,92,.3)'), fontWeight:700}}, (pctVal>=0?'+':'')+pctVal+'%'),
+                    h('div', {style:{fontSize:10,color:col,marginTop:3,fontWeight:600}}, (totalProfit>=0?'+':'')+fmt(Math.round(totalProfit))+'đ')
+                  );
+                })(),
+                h('td', {}, h('span', {className:'badge badge-'+(s.status==='done'?'green':'red')}, s.status==='done'?'Xong':'Nợ')),
+                h('td', {}, h('div', {style:{display:'flex',gap:4}},
+                  s.status==='debt' && h('button', {
+                    className:'btn btn-xs', style:{background:'var(--green)',color:'#fff',border:'none'},
+                    onClick: () => { S.sales=S.sales.map(x=>x.id===s.id?{...x,paid:x.total,status:'done',_updated:new Date().toISOString()}:x); save('sales'); toast('Đã thu hết nợ','success'); rebuild(); }
+                  }, '✓ Thu'),
+                  s.qty>0 && h('button', {
+                    className:'btn btn-xs', style:{background:'var(--amber)',color:'#fff',border:'none'},
+                    onClick: () => openReturnFromSale(s, rebuild)
+                  }, '↩️ Trả'),
+                  h('button', {
+                    className:'btn btn-ghost btn-xs',
+                    onClick: () => {
+                      // Kiểm tra phiếu trả hàng liên kết với đơn này
+                      const linkedReturns = (S.returns || []).filter(r => r.saleId === s.id);
+                      const linkedLogs    = (S.paymentlogs || []).filter(l => l.refId === s.id && l.type === 'customer');
+                      let confirmMsg = 'Xoá đơn hàng của "' + s.customer + '"?';
+                      if (linkedReturns.length > 0) {
+                        confirmMsg += '\n\n⚠️ Đơn này có ' + linkedReturns.length + ' phiếu trả hàng liên kết → sẽ bị xoá theo để tránh sai tồn kho.';
+                        confirmMsg += '\n(Hàng trả đã được cộng kho khi tạo phiếu → sẽ trừ lại khi xoá phiếu trả)';
+                      }
+                      if (linkedLogs.length > 0) {
+                        confirmMsg += '\n\n📋 ' + linkedLogs.length + ' lịch sử thanh toán của đơn cũng sẽ bị xoá.';
+                      }
+                      S.confirm = {
+                        msg: confirmMsg,
+                        onYes: () => {
+                          // 1. Hoàn kho: hoàn SL còn lại trong đơn + SL phiếu trả liên kết (để bù trừ bước 2)
+                          // Bước 2 sẽ trừ lại phần đã cộng khi tạo phiếu trả → net = hoàn đúng qty gốc bán
+                          const totalReturnQty = linkedReturns.reduce((a, r) => a + (r.returnQty || 0), 0);
+                          const qtyToRestore = s.qty + totalReturnQty; // qty gốc = qty còn lại + phần đã trả
+                          if (qtyToRestore > 0) {
+                            S.products = S.products.map(p => {
+                              if (p.id !== s.productId) return p;
+                              const newStock = p.stock + qtyToRestore;
+                              const newVariants = (p.variants||[]).map(vt => {
+                                if (!s.variantId || vt.id !== s.variantId) return vt;
+                                const ppm2=(vt.tileW>0&&vt.tileH>0)?10000/(vt.tileW*vt.tileH):0;
+                                const newM2=(vt.stockM2||0)+qtyToRestore;
+                                return {...vt, stockM2:newM2, stockPieces:ppm2>0?Math.round(newM2*ppm2):(vt.stockPieces||0)+Math.round(qtyToRestore*(ppm2||0))};
+                              });
+                              return {...p, stock:newStock, variants:newVariants, _updated: new Date().toISOString()};
+                            });
+                          }
+
+                          // 2. Xử lý phiếu trả hàng liên kết: trừ lại kho (hoàn kho đã cộng khi trả) rồi xoá phiếu
+                          if (linkedReturns.length > 0) {
+                            linkedReturns.forEach(r => {
+                              S.products = S.products.map(p => {
+                                if (p.id !== r.productId) return p;
+                                const newStock = p.stock - r.returnQty;
+                                return {...p, stock: newStock, _updated: new Date().toISOString()};
+                              });
+                            });
+                            // Soft-delete phiếu trả liên kết
+                            const _now = new Date().toISOString();
+                            S.returns = (S.returns || []).map(r => r.saleId !== s.id ? r : { ...r, _deleted: true, _updated: _now });
+                            save('returns');
+                            setTimeout(() => { S.returns = (S.returns||[]).filter(r=>!r._deleted); DB.set('dtn_returns', S.returns); }, 600);
+                          }
+
+                          // 3. Soft-delete paymentlogs của đơn này
+                          if (linkedLogs.length > 0) {
+                            const _now2 = new Date().toISOString();
+                            S.paymentlogs = (S.paymentlogs || []).map(l => (l.refId === s.id && l.type === 'customer') ? { ...l, _deleted: true, _updated: _now2 } : l);
+                            save('paymentlogs');
+                            setTimeout(() => { S.paymentlogs = (S.paymentlogs||[]).filter(l=>!l._deleted); DB.set('dtn_paymentlogs', S.paymentlogs); }, 600);
+                          }
+
+                          // 4. Soft-delete đơn bán
+                          save('products');
+                          softDelete('sales', s.id, () => {});
+
+                          const msg = linkedReturns.length > 0
+                            ? `Đã xoá đơn + ${linkedReturns.length} phiếu trả hàng liên kết`
+                            : 'Đã xoá đơn hàng';
+                          toast(msg, 'info');
+                          rebuild();
+                        }
+                      };
+                      render();
+                    }
+                  }, '🗑')
+                ))
+              );
+            }),
+            filtered.length===0 && h('tr',{},h('td',{colspan:13,style:{textAlign:'center',padding:32,color:'var(--text3)'}},'Không có đơn hàng'))
+          )
+        )
+      ),
+      // ── Pagination bar ─────────────────────────────────────────
+      totalPages > 1 && h('div', { style:{display:'flex',alignItems:'center',justifyContent:'center',gap:8,marginTop:14,flexWrap:'wrap'} },
+        h('button',{className:'btn btn-sm'+(curPage===0?' btn-ghost':''),style:{minWidth:36},onClick:()=>{curPage=0;rebuild();}},h('span',{},'«')),
+        h('button',{className:'btn btn-sm',disabled:curPage===0,style:{minWidth:36},onClick:()=>{if(curPage>0){curPage--;rebuild();}}},h('span',{},'‹')),
+        h('span',{style:{fontSize:12,color:'var(--text2)',padding:'0 8px'}},
+          'Trang '+(curPage+1)+'/'+totalPages+' ('+filtered.length+' đơn)'
+        ),
+        h('button',{className:'btn btn-sm',disabled:curPage>=totalPages-1,style:{minWidth:36},onClick:()=>{if(curPage<totalPages-1){curPage++;rebuild();}}},h('span',{},'›')),
+        h('button',{className:'btn btn-sm'+(curPage===totalPages-1?' btn-ghost':''),style:{minWidth:36},onClick:()=>{curPage=totalPages-1;rebuild();}},h('span',{},'»'))
+      )
     ));
-    _salesStatusSel.value = fStatus;
-    rebuildTable();
   };
   rebuild();
   return wrap;
