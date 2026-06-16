@@ -3147,6 +3147,7 @@ const ALL_PAGES = [
   {id:'accounts', label:'Tài khoản',   icon:'👥', adminOnly: true,  staffVisible: false},
   {id:'settings', label:'Cài đặt',     icon:'⚙️', adminOnly: true,  staffVisible: false},
   {id:'sync',     label:'Đồng Bộ',    icon:'🔄', adminOnly: true,  staffVisible: false},
+  {id:'recovery', label:'Khôi Phục',  icon:'🛠️', adminOnly: true,  staffVisible: false},
 ];
 const PAGES = ALL_PAGES; // kept for compat
 const BN = [
@@ -3244,7 +3245,7 @@ function buildApp() {
     staffreport: pgStaffReport,
     vatrpt: pgVatReport,
     search: pgSearch,
-    accounts: pgAccounts, settings: pgSettings, sync: pgSync };
+    accounts: pgAccounts, settings: pgSettings, sync: pgSync, recovery: pgRecovery };
   const content = (pageMap[safePage] || pgDashboard)();
 
   const els = [sidebar, overlay,
@@ -10768,6 +10769,465 @@ function pgSync() {
 
   // Lắng nghe thay đổi trạng thái cloud để cập nhật UI tự động
   CLOUD.onStatus(() => { try { rebuild(); } catch(e) {} });
+
+  rebuild();
+  return wrap;
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  KHÔI PHỤC DỮ LIỆU SẢN PHẨM BỊ MẤT (pgRecovery)
+//
+//  Quét toàn bộ sales / imports / paymentlogs / returns để tìm
+//  các productId / productName KHÔNG còn tồn tại trong S.products.
+//  Cho phép tái tạo lại sản phẩm từ thông tin đã lưu trong giao dịch.
+// ══════════════════════════════════════════════════════════════════
+function pgRecovery() {
+  const wrap = h('div', {});
+
+  // ── Phân tích toàn bộ giao dịch để tìm sản phẩm mất ──────────
+  function analyzeOrphans() {
+    const activeIds = new Set((S.products || []).map(p => p.id));
+    const orphanMap = {}; // productId → { productId, productName, sources: [] }
+
+    function addOrphan(productId, productName, source, record) {
+      if (!productId) return;
+      if (activeIds.has(productId)) return; // còn trong kho → bỏ qua
+      if (!orphanMap[productId]) {
+        orphanMap[productId] = {
+          productId,
+          productName: productName || '(không rõ tên)',
+          sources: [],
+          // Thu thập thông tin để tái tạo
+          unit: record.unit || '',
+          unitPrice: 0,    // giá nhập tốt nhất
+          sellPrice: 0,    // giá bán tốt nhất
+          totalQty: 0,     // tổng số lượng đã giao dịch
+          totalRevenue: 0, // tổng doanh thu
+          totalDebt: 0,    // tổng còn nợ liên quan
+        };
+      }
+      const o = orphanMap[productId];
+      // Cập nhật tên nếu chưa có hoặc đang là fallback
+      if (productName && o.productName === '(không rõ tên)') o.productName = productName;
+      if (record.unit && !o.unit) o.unit = record.unit;
+      o.sources.push({ type: source, record });
+    }
+
+    // Quét sales
+    (S.sales || []).forEach(s => {
+      if (s.productId) {
+        addOrphan(s.productId, s.productName, 'sale', s);
+        const o = orphanMap[s.productId];
+        if (o) {
+          if (s.unitPrice > o.sellPrice) o.sellPrice = s.unitPrice;
+          o.totalQty    += parseFloat(s.qty) || 0;
+          o.totalRevenue += s.total || 0;
+          const debt = Math.max(0, (s.total || 0) - (s.paid || 0));
+          o.totalDebt += debt;
+        }
+      }
+    });
+
+    // Quét imports
+    (S.imports || []).forEach(i => {
+      if (i.productId) {
+        addOrphan(i.productId, i.productName, 'import', i);
+        const o = orphanMap[i.productId];
+        if (o) {
+          if (i.unitPrice > o.unitPrice) o.unitPrice = i.unitPrice;
+          if (!o.unit && i.unit) o.unit = i.unit;
+        }
+      }
+    });
+
+    // Quét returns
+    (S.returns || []).forEach(r => {
+      if (r.productId) addOrphan(r.productId, r.productName, 'return', r);
+    });
+
+    // Quét paymentlogs (để thấy nợ liên quan)
+    (S.paymentlogs || []).forEach(l => {
+      // paymentlogs có refId trỏ đến sale id — lấy thông tin qua sale
+      if (l.refId) {
+        const relSale = (S.sales || []).find(s => s.id === l.refId);
+        if (relSale && relSale.productId && !activeIds.has(relSale.productId)) {
+          // đã được add qua sales loop, không cần add lại
+        }
+      }
+    });
+
+    return Object.values(orphanMap).sort((a, b) => b.totalRevenue - a.totalRevenue);
+  }
+
+  const rebuild = () => {
+    const orphans = analyzeOrphans();
+    wrap.innerHTML = '';
+
+    const section = h('div', {});
+
+    // ── Header ──
+    section.appendChild(h('div', { className: 'page-header' },
+      h('div', {},
+        h('div', { className: 'page-title' }, '🛠️ Khôi Phục Sản Phẩm Bị Mất'),
+        h('div', { className: 'page-sub' }, 'Quét toàn bộ giao dịch để tìm sản phẩm đã xoá khỏi kho hàng')
+      )
+    ));
+
+    // ── Tóm tắt ──
+    const totalDebtOrphan = orphans.reduce((a, o) => a + o.totalDebt, 0);
+    const totalRevenueOrphan = orphans.reduce((a, o) => a + o.totalRevenue, 0);
+
+    section.appendChild(h('div', { className: 'stats-grid', style: { gridTemplateColumns: 'repeat(3,1fr)', marginBottom: 20 } },
+      h('div', { className: 'stat' },
+        h('div', { className: 'stat-label' }, '🔴 Sản phẩm bị mất'),
+        h('div', { className: 'stat-val', style: { color: orphans.length > 0 ? 'var(--red)' : 'var(--green)' } }, orphans.length),
+        h('div', { className: 'stat-change' }, orphans.length > 0 ? 'Cần khôi phục' : '✅ Không có sản phẩm mất')
+      ),
+      h('div', { className: 'stat' },
+        h('div', { className: 'stat-label' }, '⚠️ Công nợ liên quan'),
+        h('div', { className: 'stat-val', style: { color: totalDebtOrphan > 0 ? 'var(--red)' : 'var(--text2)', fontSize: 17 } }, fmt(totalDebtOrphan) + 'đ'),
+        h('div', { className: 'stat-change' }, 'Từ đơn hàng của sản phẩm đã mất')
+      ),
+      h('div', { className: 'stat' },
+        h('div', { className: 'stat-label' }, '💰 Doanh thu liên quan'),
+        h('div', { className: 'stat-val', style: { color: 'var(--accent)', fontSize: 17 } }, fmt(totalRevenueOrphan) + 'đ'),
+        h('div', { className: 'stat-change' }, 'Tổng từ các đơn của SP bị mất')
+      )
+    ));
+
+    if (orphans.length === 0) {
+      section.appendChild(h('div', { className: 'card', style: { textAlign: 'center', padding: 48, color: 'var(--green)' } },
+        h('div', { style: { fontSize: 42, marginBottom: 12 } }, '✅'),
+        h('div', { style: { fontSize: 16, fontWeight: 700 } }, 'Không phát hiện sản phẩm bị mất!'),
+        h('div', { style: { fontSize: 13, color: 'var(--text2)', marginTop: 8 } }, 'Tất cả sản phẩm trong lịch sử giao dịch đều còn trong kho hàng.')
+      ));
+      wrap.appendChild(section);
+      return;
+    }
+
+    // ── Cảnh báo tổng ──
+    section.appendChild(h('div', { className: 'alert alert-err', style: { marginBottom: 16 } },
+      h('div', {},
+        h('div', { style: { fontWeight: 700, fontSize: 14 } },
+          '🚨 Phát hiện ' + orphans.length + ' sản phẩm có trong lịch sử giao dịch nhưng đã MẤT khỏi kho hàng'
+        ),
+        h('div', { style: { fontSize: 12, marginTop: 4, color: 'var(--text2)' } },
+          'Nhấn "Khôi phục" để tái tạo lại sản phẩm. App sẽ tự điền thông tin từ lịch sử giao dịch.'
+        )
+      )
+    ));
+
+    // ── Nút Khôi phục tất cả ──
+    const btnRecoverAll = document.createElement('button');
+    btnRecoverAll.className = 'btn btn-primary';
+    btnRecoverAll.style.marginBottom = '16px';
+    btnRecoverAll.innerHTML = '⚡ Khôi phục tất cả ' + orphans.length + ' sản phẩm';
+    btnRecoverAll.onclick = () => {
+      S.confirm = {
+        msg: 'Khôi phục tất cả ' + orphans.length + ' sản phẩm bị mất?\n\nApp sẽ tạo lại sản phẩm với thông tin từ lịch sử giao dịch (tên, đơn vị, giá bán/nhập tốt nhất).\n\nTồn kho ban đầu sẽ là 0 — bạn cần nhập hàng lại nếu thực tế còn hàng.',
+        onYes: () => {
+          let count = 0;
+          const nowIso = new Date().toISOString();
+          const usedSkus = new Set((S.products || []).map(p => (p.sku || '').toLowerCase()).filter(Boolean));
+
+          orphans.forEach(o => {
+            // Tái tạo SKU từ tên
+            const skuBase = (() => {
+              const viMap = {'à':'a','á':'a','â':'a','ã':'a','ă':'a','ắ':'a','ặ':'a','ằ':'a','ẳ':'a','ẵ':'a','ấ':'a','ầ':'a','ẩ':'a','ẫ':'a','ậ':'a','è':'e','é':'e','ê':'e','ẹ':'e','ề':'e','ế':'e','ệ':'e','ể':'e','ễ':'e','ẻ':'e','ẽ':'e','ì':'i','í':'i','ị':'i','ỉ':'i','ĩ':'i','ò':'o','ó':'o','ô':'o','õ':'o','ọ':'o','ồ':'o','ố':'o','ộ':'o','ổ':'o','ỗ':'o','ơ':'o','ờ':'o','ớ':'o','ợ':'o','ở':'o','ỡ':'o','ù':'u','ú':'u','ủ':'u','ũ':'u','ụ':'u','ư':'u','ừ':'u','ứ':'u','ự':'u','ử':'u','ữ':'u','ỳ':'y','ý':'y','ỵ':'y','ỷ':'y','ỹ':'y','đ':'d'};
+              const ascii = o.productName.toLowerCase().split('').map(c=>viMap[c]||c).join('');
+              const words = ascii.split(/[\s\-_\/\\\.]+/).filter(w=>w.length>0);
+              let bl = words.map(w=>{const m=w.match(/^[a-z0-9]+/);return m?m[0][0]:''}).filter(Boolean).join('');
+              if(bl.length<2) bl=(words[0]||'sp').replace(/[^a-z0-9]/g,'').slice(0,3);
+              return bl.slice(0,6);
+            })();
+            let sku = skuBase;
+            if (usedSkus.has(sku)) { for(let i=1;i<=9999;i++){sku=skuBase+i;if(!usedSkus.has(sku))break;} }
+            usedSkus.add(sku);
+
+            const newProd = {
+              id: o.productId, // GIỮ NGUYÊN productId cũ — để sales/imports/returns tự khớp lại
+              name: o.productName,
+              sku: sku,
+              type: 'Khác',
+              origin: '',
+              unit: o.unit || 'm²',
+              buyPrice: Math.round(o.unitPrice) || 0,
+              sellPrice: Math.round(o.sellPrice) || 0,
+              stock: 0, // tồn kho 0 — cần nhập hàng lại
+              description: '⚠️ Khôi phục tự động ' + new Date().toLocaleDateString('vi-VN') + ' từ lịch sử giao dịch',
+              image: '',
+              qrCode: '',
+              variants: [],
+              multiVariant: false,
+              thickness: 0, length: 0, width: 0,
+              createdAt: nowIso,
+              _updated: nowIso,
+              _stockTx: [],
+              _recovered: true // đánh dấu để biết đây là bản khôi phục
+            };
+            // Kiểm tra xem productId đó đã bị _deleted trên cloud chưa — nếu có thì push lại với _deleted:false
+            S.products = [...S.products, newProd];
+            count++;
+          });
+
+          save('products');
+          toast('✅ Đã khôi phục ' + count + ' sản phẩm! Vui lòng kiểm tra lại loại đá và giá nhập cho từng sản phẩm.', 'success');
+          rebuild();
+        }
+      };
+      render();
+    };
+    section.appendChild(btnRecoverAll);
+
+    // ── Danh sách từng sản phẩm mất ──
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.style.padding = '0';
+
+    orphans.forEach((o, idx) => {
+      const salesRecs   = o.sources.filter(s => s.type === 'sale').map(s => s.record);
+      const importRecs  = o.sources.filter(s => s.type === 'import').map(s => s.record);
+      const returnRecs  = o.sources.filter(s => s.type === 'return').map(s => s.record);
+      const debtRecs    = salesRecs.filter(s => s.status === 'debt');
+
+      // Tìm khách hàng liên quan
+      const customers = [...new Set(salesRecs.map(s => s.customer).filter(Boolean))];
+      // Tìm NCC liên quan
+      const suppliers = [...new Set(importRecs.map(i => i.supplier).filter(Boolean))];
+      // Ngày giao dịch gần nhất
+      const allDates = [...salesRecs, ...importRecs].map(r => r.date).filter(Boolean).sort().reverse();
+      const lastDate = allDates[0] || '';
+      const firstDate = allDates[allDates.length - 1] || '';
+
+      const row = document.createElement('div');
+      row.style.cssText = 'border-bottom:1px solid var(--border);padding:16px 20px' + (idx === orphans.length - 1 ? ';border-bottom:none' : '');
+
+      // Header của từng sản phẩm
+      const rowHdr = document.createElement('div');
+      rowHdr.style.cssText = 'display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap';
+
+      const info = document.createElement('div');
+      info.style.cssText = 'flex:1;min-width:0';
+
+      // Tên sản phẩm
+      const nameDiv = document.createElement('div');
+      nameDiv.style.cssText = 'font-size:15px;font-weight:700;color:var(--text);margin-bottom:5px;display:flex;align-items:center;gap:8px';
+      nameDiv.innerHTML = '<span style="color:var(--red)">🔴</span> ' + escHtml(o.productName);
+      const recTag = document.createElement('span');
+      recTag.style.cssText = 'font-size:10px;background:rgba(224,92,92,.15);color:var(--red);border:1px solid rgba(224,92,92,.3);border-radius:99px;padding:2px 8px;font-weight:700';
+      recTag.textContent = 'ĐÃ MẤT';
+      nameDiv.appendChild(recTag);
+      info.appendChild(nameDiv);
+
+      // ID và thông tin kỹ thuật
+      const idDiv = document.createElement('div');
+      idDiv.style.cssText = 'font-size:10px;color:var(--text3);font-family:monospace;margin-bottom:8px';
+      idDiv.textContent = 'ID: ' + o.productId + (o.unit ? ' · Đơn vị: ' + o.unit : '');
+      info.appendChild(idDiv);
+
+      // Thống kê giao dịch
+      const statsRow = document.createElement('div');
+      statsRow.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px';
+      const statChip = (label, val, color) => {
+        const c = document.createElement('div');
+        c.style.cssText = 'background:var(--bg3);border:1px solid var(--border2);border-radius:var(--r2);padding:5px 10px;font-size:11px';
+        c.innerHTML = '<span style="color:var(--text3)">' + escHtml(label) + '</span> <b style="color:' + color + '">' + escHtml(String(val)) + '</b>';
+        return c;
+      };
+      if (salesRecs.length > 0)   statsRow.appendChild(statChip('Đơn bán:', salesRecs.length + ' đơn', 'var(--accent)'));
+      if (importRecs.length > 0)  statsRow.appendChild(statChip('Phiếu nhập:', importRecs.length + ' phiếu', 'var(--blue)'));
+      if (returnRecs.length > 0)  statsRow.appendChild(statChip('Trả hàng:', returnRecs.length + ' lần', 'var(--amber)'));
+      if (o.totalRevenue > 0)     statsRow.appendChild(statChip('Doanh thu:', fmt(o.totalRevenue) + 'đ', 'var(--green)'));
+      if (o.totalDebt > 0)        statsRow.appendChild(statChip('Còn nợ:', fmt(o.totalDebt) + 'đ', 'var(--red)'));
+      if (o.sellPrice > 0)        statsRow.appendChild(statChip('Giá bán cao nhất:', fmt(o.sellPrice) + 'đ', 'var(--accent)'));
+      if (o.unitPrice > 0)        statsRow.appendChild(statChip('Giá nhập cao nhất:', fmt(o.unitPrice) + 'đ', 'var(--text2)'));
+      info.appendChild(statsRow);
+
+      // Khách hàng + NCC
+      if (customers.length > 0) {
+        const custDiv = document.createElement('div');
+        custDiv.style.cssText = 'font-size:11px;color:var(--text2);margin-bottom:4px';
+        custDiv.innerHTML = '👤 <b>Khách hàng:</b> ' + customers.slice(0, 5).map(escHtml).join(', ') + (customers.length > 5 ? '...' : '');
+        info.appendChild(custDiv);
+      }
+      if (suppliers.length > 0) {
+        const suppDiv = document.createElement('div');
+        suppDiv.style.cssText = 'font-size:11px;color:var(--text2);margin-bottom:4px';
+        suppDiv.innerHTML = '🏭 <b>Nhà cung cấp:</b> ' + suppliers.slice(0, 3).map(escHtml).join(', ');
+        info.appendChild(suppDiv);
+      }
+      if (firstDate || lastDate) {
+        const dateDiv = document.createElement('div');
+        dateDiv.style.cssText = 'font-size:11px;color:var(--text3)';
+        dateDiv.innerHTML = '📅 Giao dịch từ <b>' + fmtD(firstDate) + '</b> đến <b>' + fmtD(lastDate) + '</b>';
+        info.appendChild(dateDiv);
+      }
+
+      // Cảnh báo nợ
+      if (debtRecs.length > 0) {
+        const debtWarn = document.createElement('div');
+        debtWarn.style.cssText = 'margin-top:8px;padding:8px 12px;background:rgba(224,92,92,.08);border:1px solid rgba(224,92,92,.3);border-radius:var(--r2);font-size:11px;color:var(--red)';
+        debtWarn.innerHTML = '⚠️ <b>' + debtRecs.length + ' đơn hàng chưa thanh toán</b> liên quan đến sản phẩm này — '
+          + debtRecs.slice(0, 3).map(s => escHtml(s.customer) + ' (' + fmt(Math.max(0,(s.total||0)-(s.paid||0))) + 'đ)').join(', ');
+        info.appendChild(debtWarn);
+      }
+
+      rowHdr.appendChild(info);
+
+      // Nút khôi phục đơn lẻ
+      const btnRecover = document.createElement('button');
+      btnRecover.className = 'btn btn-primary btn-sm';
+      btnRecover.innerHTML = '🔧 Khôi phục';
+      btnRecover.onclick = () => {
+        // Form tái tạo sản phẩm
+        const fName    = document.createElement('input');
+        fName.className = 'form-input'; fName.type = 'text'; fName.value = o.productName;
+
+        const fUnit    = document.createElement('select');
+        fUnit.className = 'form-input';
+        ['m²','tấm','tấn','viên','m³','kg','cái','bao'].forEach(u => {
+          const opt = document.createElement('option'); opt.value = u; opt.textContent = u;
+          if (u === (o.unit || 'm²')) opt.selected = true;
+          fUnit.appendChild(opt);
+        });
+
+        const fBuy     = document.createElement('input');
+        fBuy.className = 'form-input'; fBuy.type = 'number'; fBuy.value = o.unitPrice || 0; fBuy.placeholder = 'Giá nhập (VNĐ)';
+
+        const fSell    = document.createElement('input');
+        fSell.className = 'form-input'; fSell.type = 'number'; fSell.value = o.sellPrice || 0; fSell.placeholder = 'Giá bán (VNĐ)';
+
+        const fType    = document.createElement('select');
+        fType.className = 'form-input';
+        ['Granite','Marble','Onyx','Basalt','Quartzite','Travertine','Slate','Serpentine','Khác'].forEach(t => {
+          const opt = document.createElement('option'); opt.value = t; opt.textContent = t;
+          if (t === 'Khác') opt.selected = true;
+          fType.appendChild(opt);
+        });
+
+        const fStock   = document.createElement('input');
+        fStock.className = 'form-input'; fStock.type = 'number'; fStock.value = 0; fStock.placeholder = 'Tồn kho hiện tại';
+
+        const fNote = document.createElement('textarea');
+        fNote.className = 'form-input'; fNote.rows = 2;
+        fNote.value = '⚠️ Khôi phục ' + new Date().toLocaleDateString('vi-VN') + ' — Kiểm tra & cập nhật thông tin';
+
+        // SKU auto
+        const usedSkus2 = new Set((S.products||[]).map(p=>(p.sku||'').toLowerCase()).filter(Boolean));
+        const skuBase2 = (() => {
+          const viMap2 = {'à':'a','á':'a','â':'a','ã':'a','ă':'a','ắ':'a','ặ':'a','ằ':'a','ẳ':'a','ẵ':'a','ấ':'a','ầ':'a','ẩ':'a','ẫ':'a','ậ':'a','è':'e','é':'e','ê':'e','ẹ':'e','ề':'e','ế':'e','ệ':'e','ể':'e','ễ':'e','ẻ':'e','ẽ':'e','ì':'i','í':'i','ị':'i','ỉ':'i','ĩ':'i','ò':'o','ó':'o','ô':'o','õ':'o','ọ':'o','ồ':'o','ố':'o','ộ':'o','ổ':'o','ỗ':'o','ơ':'o','ờ':'o','ớ':'o','ợ':'o','ở':'o','ỡ':'o','ù':'u','ú':'u','ủ':'u','ũ':'u','ụ':'u','ư':'u','ừ':'u','ứ':'u','ự':'u','ử':'u','ữ':'u','ỳ':'y','ý':'y','ỵ':'y','ỷ':'y','ỹ':'y','đ':'d'};
+          const ascii = (fName.value||'sp').toLowerCase().split('').map(c=>viMap2[c]||c).join('');
+          const words = ascii.split(/[\s\-_\/\\\.]+/).filter(w=>w.length>0);
+          let bl = words.map(w=>{const m=w.match(/^[a-z0-9]+/);return m?m[0][0]:''}).filter(Boolean).join('');
+          if(bl.length<2) bl=(words[0]||'sp').replace(/[^a-z0-9]/g,'').slice(0,3);
+          return bl.slice(0,6);
+        })();
+        let autoSku = skuBase2;
+        if (usedSkus2.has(autoSku)) { for(let i=1;i<=9999;i++){autoSku=skuBase2+i;if(!usedSkus2.has(autoSku))break;} }
+        const fSku = document.createElement('input');
+        fSku.className = 'form-input'; fSku.type = 'text'; fSku.value = autoSku; fSku.placeholder = 'Mã SKU';
+
+        const mkFG = (label, el) => {
+          const g = document.createElement('div'); g.className = 'form-group';
+          const lbl = document.createElement('label'); lbl.className = 'form-label'; lbl.textContent = label;
+          g.appendChild(lbl); g.appendChild(el); return g;
+        };
+
+        S.modal = {
+          title: '🔧 Khôi phục: ' + o.productName,
+          content: h('div', {},
+            h('div', { style: { background:'rgba(91,143,232,.08)', border:'1px solid rgba(91,143,232,.25)', borderRadius:'var(--r2)', padding:'10px 14px', fontSize:12, color:'var(--blue)', marginBottom:14 } },
+              '💡 App sẽ tái tạo sản phẩm với ID cũ (' + o.productId + ') — tự động khớp lại với ' + o.sources.length + ' giao dịch lịch sử.'
+            ),
+            (() => {
+              const g = document.createElement('div'); g.className = 'fg fg2';
+              g.appendChild(mkFG('Tên sản phẩm *', fName));
+              g.appendChild(mkFG('Mã SKU', fSku));
+              g.appendChild(mkFG('Loại đá', fType));
+              g.appendChild(mkFG('Đơn vị tính', fUnit));
+              g.appendChild(mkFG('Tồn kho hiện tại', fStock));
+              g.appendChild(mkFG('Giá nhập (VNĐ)', fBuy));
+              g.appendChild(mkFG('Giá bán (VNĐ)', fSell));
+              g.appendChild((() => { const g2 = document.createElement('div'); g2.className = 'form-group fg-full'; const lbl2=document.createElement('label'); lbl2.className='form-label'; lbl2.textContent='Ghi chú'; g2.appendChild(lbl2); g2.appendChild(fNote); return g2; })());
+              return g;
+            })()
+          ),
+          footer: [
+            h('button', { className: 'btn', onClick: () => { S.modal = null; render(); } }, 'Huỷ'),
+            h('button', { className: 'btn btn-primary', onClick: () => {
+              const nm = fName.value.trim();
+              if (!nm) { toast('⚠️ Vui lòng nhập tên sản phẩm!', 'error'); return; }
+              const skuVal = (fSku.value || '').trim().toLowerCase();
+              if (skuVal) {
+                const dup = (S.products||[]).find(p => p.sku && p.sku.toLowerCase() === skuVal);
+                if (dup) { toast('⚠️ SKU "' + skuVal + '" đã tồn tại!', 'error'); return; }
+              }
+              const nowIso2 = new Date().toISOString();
+              const restoredProd = {
+                id: o.productId, // GIỮ NGUYÊN ID CŨ
+                name: nm,
+                sku: skuVal || autoSku,
+                type: fType.value,
+                origin: '',
+                unit: fUnit.value,
+                buyPrice: parseFloat(fBuy.value) || 0,
+                sellPrice: parseFloat(fSell.value) || 0,
+                stock: parseFloat(fStock.value) || 0,
+                description: fNote.value.trim(),
+                image: '', qrCode: '', variants: [], multiVariant: false,
+                thickness: 0, length: 0, width: 0,
+                createdAt: nowIso2, _updated: nowIso2, _stockTx: [],
+                _recovered: true
+              };
+              S.products = [...S.products, restoredProd];
+              save('products');
+              toast('✅ Đã khôi phục "' + nm + '"! Kiểm tra Kho Hàng và cập nhật thêm thông tin.', 'success');
+              S.modal = null;
+              rebuild();
+              render();
+            } }, '✅ Khôi phục')
+          ]
+        };
+        render();
+      };
+
+      const btnArea = document.createElement('div');
+      btnArea.style.cssText = 'display:flex;flex-direction:column;gap:8px;flex-shrink:0';
+      btnArea.appendChild(btnRecover);
+
+      // Nút xem giao dịch liên quan
+      const btnView = document.createElement('button');
+      btnView.className = 'btn btn-ghost btn-sm';
+      btnView.innerHTML = '📋 ' + o.sources.length + ' giao dịch';
+      btnView.onclick = () => {
+        const lines = [];
+        salesRecs.slice(0,10).forEach(s => lines.push(
+          '🧾 Bán ' + fmtD(s.date) + ' — ' + escHtml(s.customer||'?') + ' · ' + fmtQty(s.qty) + ' ' + (s.unit||'') + ' · ' + fmt(s.total) + 'đ' + (s.status==='debt'?' ⚠️NỢ':'')
+        ));
+        importRecs.slice(0,5).forEach(i => lines.push(
+          '📥 Nhập ' + fmtD(i.date) + ' — ' + escHtml(i.supplier||'?') + ' · ' + fmtQty(i.qty) + ' ' + (i.unit||'') + ' · ' + fmt(i.total) + 'đ'
+        ));
+        returnRecs.slice(0,5).forEach(r => lines.push(
+          '🔄 Trả ' + fmtD(r.date) + ' — ' + escHtml(r.customer||'?')
+        ));
+        S.modal = {
+          title: '📋 Giao dịch liên quan: ' + o.productName,
+          content: h('div', {},
+            ...lines.map(l => h('div', { style: { padding: '7px 0', borderBottom: '1px solid var(--border)', fontSize: 12, color: 'var(--text2)' } }, l))
+          ),
+          footer: [h('button', { className: 'btn btn-primary', onClick: () => { S.modal = null; render(); } }, 'Đóng')]
+        };
+        render();
+      };
+      btnArea.appendChild(btnView);
+      rowHdr.appendChild(btnArea);
+      row.appendChild(rowHdr);
+      card.appendChild(row);
+    });
+
+    section.appendChild(card);
+    wrap.appendChild(section);
+  };
 
   rebuild();
   return wrap;
