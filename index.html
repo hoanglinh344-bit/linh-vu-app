@@ -6517,17 +6517,6 @@ function openSale(rebuild, preselectedProduct) {
   }
   rebuildItems();
 
-  // Banner xác nhận khi mở từ catalogue
-  if (preselectedProduct) {
-    const banner = document.createElement('div');
-    banner.style.cssText='display:flex;align-items:center;gap:10px;padding:10px 14px;background:rgba(201,168,76,.12);border:1px solid rgba(201,168,76,.35);border-radius:var(--r2);margin-bottom:4px;font-size:12px;color:var(--accent)';
-    banner.innerHTML = (preselectedProduct.image
-      ? `<img src="${preselectedProduct.image}" style="width:36px;height:36px;object-fit:cover;border-radius:6px;border:1px solid rgba(201,168,76,.4);flex-shrink:0">`
-      : '<span style="font-size:22px">💎</span>') +
-      `<div><b style="font-size:13px">${preselectedProduct.name}</b><br><span style="color:var(--text2)">Giá bán: <b style="color:var(--accent)">${fmt(preselectedProduct.sellPrice)}đ/${preselectedProduct.unit}</b> · Tồn: <b style="color:var(--green)">${fmtQty(preselectedProduct.stock)} ${preselectedProduct.unit}</b></span></div>`;
-    itemsContainer.parentNode.insertBefore(banner, itemsContainer);
-  }
-
   const addItemBtn = document.createElement('button');
   addItemBtn.type='button'; addItemBtn.className='btn';
   addItemBtn.style.cssText='width:100%;background:rgba(201,168,76,.1);border:1px dashed rgba(201,168,76,.5);color:var(--accent);font-weight:700;margin-bottom:4px';
@@ -6543,6 +6532,18 @@ function openSale(rebuild, preselectedProduct) {
   itemsHdr.style.cssText='font-size:11px;font-weight:700;color:var(--amber);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px';
   itemsHdr.innerHTML='📋 Danh sách mặt hàng <span style="font-size:10px;font-weight:400;color:var(--text3)">(có thể thêm nhiều sản phẩm cùng lúc)</span>';
   itemsWrap.appendChild(itemsHdr);
+
+  // Banner xác nhận khi mở từ catalogue — đặt TRƯỚC itemsContainer (sau khi itemsWrap đã có hdr)
+  if (preselectedProduct) {
+    const banner = document.createElement('div');
+    banner.style.cssText='display:flex;align-items:center;gap:10px;padding:10px 14px;background:rgba(201,168,76,.12);border:1px solid rgba(201,168,76,.35);border-radius:var(--r2);margin-bottom:8px;font-size:12px;color:var(--accent)';
+    banner.innerHTML = (preselectedProduct.image
+      ? `<img src="${escHtml(preselectedProduct.image)}" style="width:36px;height:36px;object-fit:cover;border-radius:6px;border:1px solid rgba(201,168,76,.4);flex-shrink:0">`
+      : '<span style="font-size:22px">💎</span>') +
+      `<div><b style="font-size:13px">${escHtml(preselectedProduct.name)}</b><br><span style="color:var(--text2)">Giá bán: <b style="color:var(--accent)">${fmt(preselectedProduct.sellPrice)}đ/${escHtml(preselectedProduct.unit)}</b> · Tồn: <b style="color:var(--green)">${fmtQty(preselectedProduct.stock)} ${escHtml(preselectedProduct.unit)}</b></span></div>`;
+    itemsWrap.appendChild(banner);
+  }
+
   itemsWrap.appendChild(itemsContainer);
   itemsWrap.appendChild(addItemBtn);
 
