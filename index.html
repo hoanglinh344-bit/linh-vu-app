@@ -598,6 +598,11 @@ const CLOUD = (() => {
       S.products = mergedProducts;
       if (JSON.stringify(S.products) !== before) changed = true;
       _seedLastPushed(stateKey, S.products);
+      // ── Migrate SKU cho sản phẩm cũ vừa sync về từ cloud ──────
+      // Chạy bất đồng bộ nhẹ để không block onSnapshot handler
+      if (typeof migrateLegacySKU === 'function') {
+        setTimeout(() => { try { migrateLegacySKU(); } catch(e) {} }, 200);
+      }
       // ── Xử lý 2 SP cùng tên bị gộp: chuyển phiếu nhập/bán/trả của bản bị
       // loại sang bản còn lại + xoá tombstone bản bị loại trên cloud — nếu
       // không làm bước này, phiếu cũ sẽ "treo" vào 1 productId không còn tồn
@@ -1962,6 +1967,80 @@ function openPdfMobile(htmlContent, filename) {
 let _hbIv = null;
 let _visibilityHandler = null;
 
+// ═══════════════════════════════════════════════════════════════
+//  MIGRATE SKU — tự động gắn mã SKU cho sản phẩm cũ chưa có mã
+//
+//  Chạy 1 lần duy nhất khi boot: quét S.products, tìm sản phẩm
+//  không có trường sku (hoặc sku rỗng), generate SKU mới đảm bảo
+//  không trùng nhau, rồi lưu & push lên Firestore.
+//
+//  An toàn với multi-device: mỗi thiết bị chỉ patch sản phẩm CỦA NÓ
+//  (theo _updated) — Firestore merge giữ bản mới nhất nên không conflict.
+// ═══════════════════════════════════════════════════════════════
+function migrateLegacySKU() {
+  const missing = S.products.filter(p => !p.sku || p.sku.trim() === '');
+  if (missing.length === 0) return; // tất cả đã có SKU → không làm gì
+
+  console.log('[SKU] Migrate', missing.length, 'sản phẩm chưa có mã SKU...');
+
+  // Tập SKU đã tồn tại (các SP đã có sẵn)
+  const usedSkus = new Set(
+    S.products.filter(p => p.sku && p.sku.trim()).map(p => p.sku.toLowerCase())
+  );
+
+  // Hàm generate + đánh dấu vào usedSkus ngay để batch không trùng nhau
+  function assignSKU(product) {
+    const ascii = (() => {
+      const viMap = {
+        'à':'a','á':'a','â':'a','ã':'a','ä':'a','å':'a','ă':'a','ắ':'a','ặ':'a','ằ':'a','ẳ':'a','ẵ':'a','ấ':'a','ầ':'a','ẩ':'a','ẫ':'a','ậ':'a',
+        'è':'e','é':'e','ê':'e','ẹ':'e','ề':'e','ế':'e','ệ':'e','ể':'e','ễ':'e','ẻ':'e','ẽ':'e',
+        'ì':'i','í':'i','ị':'i','ỉ':'i','ĩ':'i',
+        'ò':'o','ó':'o','ô':'o','õ':'o','ö':'o','ő':'o','ọ':'o','ồ':'o','ố':'o','ộ':'o','ổ':'o','ỗ':'o','ơ':'o','ờ':'o','ớ':'o','ợ':'o','ở':'o','ỡ':'o',
+        'ù':'u','ú':'u','û':'u','ü':'u','ủ':'u','ũ':'u','ụ':'u','ư':'u','ừ':'u','ứ':'u','ự':'u','ử':'u','ữ':'u',
+        'ỳ':'y','ý':'y','ỵ':'y','ỷ':'y','ỹ':'y','đ':'d',
+        'À':'A','Á':'A','Â':'A','Ã':'A','Ă':'A','Ắ':'A','Ặ':'A','Ằ':'A','Ẳ':'A','Ẵ':'A','Ấ':'A','Ầ':'A','Ẩ':'A','Ẫ':'A','Ậ':'A',
+        'È':'E','É':'E','Ê':'E','Ẹ':'E','Ề':'E','Ế':'E','Ệ':'E','Ể':'E','Ễ':'E','Ẻ':'E','Ẽ':'E',
+        'Ì':'I','Í':'I','Ị':'I','Ỉ':'I','Ĩ':'I',
+        'Ò':'O','Ó':'O','Ô':'O','Õ':'O','Ö':'O','Ọ':'O','Ồ':'O','Ố':'O','Ộ':'O','Ổ':'O','Ỗ':'O','Ơ':'O','Ờ':'O','Ớ':'O','Ợ':'O','Ở':'O','Ỡ':'O',
+        'Ù':'U','Ú':'U','Û':'U','Ü':'U','Ủ':'U','Ũ':'U','Ụ':'U','Ư':'U','Ừ':'U','Ứ':'U','Ự':'U','Ử':'U','Ữ':'U',
+        'Ỳ':'Y','Ý':'Y','Ỵ':'Y','Ỷ':'Y','Ỹ':'Y','Đ':'D',
+      };
+      return (product.name || 'sp').split('').map(c => viMap[c] || c).join('').toLowerCase();
+    })();
+    const words = ascii.split(/[\s\-_\/\\\.]+/).filter(w => w.length > 0);
+    let baseLetters = words.map(w => { const m = w.match(/^[a-z0-9]+/); return m ? m[0][0] : ''; }).filter(Boolean).join('');
+    if (baseLetters.length < 2) {
+      baseLetters = (words[0] || 'sp').replace(/[^a-z0-9]/g, '').slice(0, 3);
+    }
+    const base = baseLetters.slice(0, 6);
+    let sku = base;
+    if (usedSkus.has(sku)) {
+      for (let i = 1; i <= 9999; i++) {
+        sku = base + i;
+        if (!usedSkus.has(sku)) break;
+      }
+    }
+    usedSkus.add(sku); // đánh dấu ngay để sản phẩm tiếp theo không trùng
+    return sku;
+  }
+
+  const nowIso = new Date().toISOString();
+  let count = 0;
+  S.products = S.products.map(p => {
+    if (p.sku && p.sku.trim()) return p; // đã có SKU → giữ nguyên
+    const sku = assignSKU(p);
+    count++;
+    return { ...p, sku, _updated: nowIso };
+  });
+
+  save('products');
+  console.log('[SKU] Đã gắn SKU cho', count, 'sản phẩm và push lên cloud.');
+  // Toast nhẹ — chỉ hiện nếu có migrate thực sự
+  setTimeout(() => {
+    try { toast('🏷️ Đã tự động gắn mã SKU cho ' + count + ' sản phẩm cũ', 'success'); } catch(e) {}
+  }, 1500);
+}
+
 async function bootApp() {
   _raf = false;
   const root = document.getElementById('app');
@@ -1989,6 +2068,10 @@ async function bootApp() {
     ]);
     if (root) root.innerHTML = ''; // xoá loading
   }
+
+  // ── Migrate SKU cho sản phẩm cũ chưa có mã ──────────────────
+  // Chạy sau bootSync để có đủ data cloud trước khi generate
+  migrateLegacySKU();
 
   render();
   setTimeout(() => {
@@ -2300,6 +2383,69 @@ const fmtS = n => {
 };
 const uid  = () => Math.random().toString(36).slice(2, 9);
 const today = () => new Date().toISOString().slice(0, 10);
+
+// ── Auto-generate SKU từ tên sản phẩm ────────────────────────────
+// Ví dụ: "Đá Cubic 10x10 1P" → "cb1", "Granite Đen Impala" → "gdi"
+// Đảm bảo không trùng với SKU đã tồn tại trong S.products
+function generateSKU(name, existingProducts, excludeId) {
+  if (!name) return '';
+  // Bảng chuyển ký tự tiếng Việt → ASCII
+  const viMap = {
+    'à':'a','á':'a','â':'a','ã':'a','ä':'a','å':'a','ă':'a','ắ':'a','ặ':'a','ằ':'a','ẳ':'a','ẵ':'a','ấ':'a','ầ':'a','ẩ':'a','ẫ':'a','ậ':'a',
+    'è':'e','é':'e','ê':'e','ẹ':'e','ề':'e','ế':'e','ệ':'e','ể':'e','ễ':'e','ẻ':'e','ẽ':'e',
+    'ì':'i','í':'i','ị':'i','ỉ':'i','ĩ':'i',
+    'ò':'o','ó':'o','ô':'o','õ':'o','ö':'o','ő':'o','ọ':'o','ồ':'o','ố':'o','ộ':'o','ổ':'o','ỗ':'o','ơ':'o','ờ':'o','ớ':'o','ợ':'o','ở':'o','ỡ':'o',
+    'ù':'u','ú':'u','û':'u','ü':'u','ủ':'u','ũ':'u','ụ':'u','ư':'u','ừ':'u','ứ':'u','ự':'u','ử':'u','ữ':'u',
+    'ỳ':'y','ý':'y','ỵ':'y','ỷ':'y','ỹ':'y',
+    'đ':'d',
+    'À':'A','Á':'A','Â':'A','Ã':'A','Ă':'A','Ắ':'A','Ặ':'A','Ằ':'A','Ẳ':'A','Ẵ':'A','Ấ':'A','Ầ':'A','Ẩ':'A','Ẫ':'A','Ậ':'A',
+    'È':'E','É':'E','Ê':'E','Ẹ':'E','Ề':'E','Ế':'E','Ệ':'E','Ể':'E','Ễ':'E','Ẻ':'E','Ẽ':'E',
+    'Ì':'I','Í':'I','Ị':'I','Ỉ':'I','Ĩ':'I',
+    'Ò':'O','Ó':'O','Ô':'O','Õ':'O','Ö':'O','Ọ':'O','Ồ':'O','Ố':'O','Ộ':'O','Ổ':'O','Ỗ':'O','Ơ':'O','Ờ':'O','Ớ':'O','Ợ':'O','Ở':'O','Ỡ':'O',
+    'Ù':'U','Ú':'U','Û':'U','Ü':'U','Ủ':'U','Ũ':'U','Ụ':'U','Ư':'U','Ừ':'U','Ứ':'U','Ự':'U','Ử':'U','Ữ':'U',
+    'Ỳ':'Y','Ý':'Y','Ỵ':'Y','Ỷ':'Y','Ỹ':'Y','Đ':'D',
+  };
+  function toAscii(str) {
+    return str.split('').map(c => viMap[c] || c).join('');
+  }
+
+  // Lấy các chữ cái đầu của từng từ (bỏ số, ký tự đặc biệt)
+  const ascii = toAscii(name).toLowerCase();
+  const words = ascii.split(/[\s\-_\/\\\.]+/).filter(w => w.length > 0);
+
+  // Lấy chữ đầu của mỗi từ (chỉ lấy a-z0-9)
+  let baseLetters = words.map(w => {
+    const m = w.match(/^[a-z0-9]+/);
+    return m ? m[0][0] : '';
+  }).filter(Boolean).join('');
+
+  // Nếu quá ngắn (< 2 ký tự) dùng 3 ký tự đầu của từ đầu tiên
+  if (baseLetters.length < 2) {
+    const firstWord = words[0] || 'sp';
+    baseLetters = (firstWord.match(/[a-z0-9]/g) || []).slice(0, 3).join('');
+  }
+
+  // Tối đa 6 ký tự cho base
+  const base = baseLetters.slice(0, 6);
+
+  // Lấy tất cả SKU hiện tại (ngoại trừ sản phẩm đang sửa)
+  const usedSkus = new Set(
+    (existingProducts || [])
+      .filter(p => p.id !== excludeId && p.sku)
+      .map(p => (p.sku || '').toLowerCase())
+  );
+
+  // Nếu base chưa dùng → dùng luôn
+  if (!usedSkus.has(base)) return base;
+
+  // Thêm số đuôi tăng dần: base1, base2, ...
+  for (let i = 1; i <= 999; i++) {
+    const candidate = base + i;
+    if (!usedSkus.has(candidate)) return candidate;
+  }
+  // Fallback dùng uid ngẫu nhiên
+  return base + uid().slice(0, 3);
+}
 const fmtD = s => {
   if (!s) return '';
   const [y, m, d] = s.split('-');
@@ -2515,9 +2661,10 @@ function exportExcel(sheetChoice) {
 
   // ─── 1. SHEET: KHO HÀNG ───────────────────────────────────────
   if (sheetChoice === 'all' || sheetChoice === 'inventory') {
-    const invHeaders = ['Tên sản phẩm','Loại đá','Xuất xứ','Đơn vị','Giá nhập (đ)','Giá bán (đ)','Tồn kho','Giá trị kho (đ)','Mô tả'];
+    const invHeaders = ['Tên sản phẩm','Mã SKU','Loại đá','Xuất xứ','Đơn vị','Giá nhập (đ)','Giá bán (đ)','Tồn kho','Giá trị kho (đ)','Mô tả'];
     const invRows = products.map(p => [
       p.name || '',
+      p.sku || '',
       p.type || '',
       p.origin || '',
       p.unit || '',
@@ -2530,7 +2677,7 @@ function exportExcel(sheetChoice) {
 
     // Thêm dòng tổng
     const totalKhoVal = products.reduce((a,p) => a + (parseFloat(p.stock)||0)*(p.buyPrice||0), 0);
-    invRows.push(['TỔNG CỘNG','','','','','',
+    invRows.push(['TỔNG CỘNG','','','','','','',
       products.reduce((a,p) => a + (parseFloat(p.stock)||0), 0),
       numFmt(totalKhoVal),
       ''
@@ -2563,16 +2710,16 @@ function exportExcel(sheetChoice) {
         if (ws[cellAddr]) {
           const isLast = ri === invRows.length - 1;
           ws[cellAddr].s = isLast
-            ? { font: { bold: true, name: 'Arial', sz: 10 }, fill: { fgColor: { rgb: 'FFF8E1' }, patternType: 'solid' }, alignment: { horizontal: ci >= 4 ? 'right' : 'left' } }
-            : dStyle(ci >= 4 ? 'right' : 'left');
+            ? { font: { bold: true, name: 'Arial', sz: 10 }, fill: { fgColor: { rgb: 'FFF8E1' }, patternType: 'solid' }, alignment: { horizontal: ci >= 5 ? 'right' : 'left' } }
+            : dStyle(ci >= 5 ? 'right' : 'left');
         }
       });
     });
 
-    ws['!cols'] = [{ wch: 28 },{ wch: 14 },{ wch: 14 },{ wch: 8 },{ wch: 16 },{ wch: 16 },{ wch: 10 },{ wch: 18 },{ wch: 30 }];
-    ws['!merges'] = [{ s:{r:0,c:0}, e:{r:0,c:8} }, { s:{r:1,c:0}, e:{r:1,c:8} }];
+    ws['!cols'] = [{ wch: 28 },{ wch: 10 },{ wch: 14 },{ wch: 14 },{ wch: 8 },{ wch: 16 },{ wch: 16 },{ wch: 10 },{ wch: 18 },{ wch: 30 }];
+    ws['!merges'] = [{ s:{r:0,c:0}, e:{r:0,c:9} }, { s:{r:1,c:0}, e:{r:1,c:9} }];
     ws['!rows'] = [{ hpt: 26 }, { hpt: 16 }, { hpt: 6 }, { hpt: 22 }];
-    ws['!ref'] = XLSX.utils.encode_range({ s:{r:0,c:0}, e:{r:4+invRows.length-1,c:8} });
+    ws['!ref'] = XLSX.utils.encode_range({ s:{r:0,c:0}, e:{r:4+invRows.length-1,c:9} });
     XLSX.utils.book_append_sheet(wb, ws, '💎 Kho hàng');
   }
 
@@ -4037,7 +4184,7 @@ function pgInventory() {
     const types = [...new Set(products.map(p => p.type))];
     const filtered = products.filter(p => {
       const q = search.toLowerCase();
-      return (p.name.toLowerCase().includes(q) || p.type.toLowerCase().includes(q) || (p.origin || '').toLowerCase().includes(q))
+      return (p.name.toLowerCase().includes(q) || p.type.toLowerCase().includes(q) || (p.origin || '').toLowerCase().includes(q) || (p.sku || '').toLowerCase().includes(q))
         && (ftype === 'all' || p.type === ftype);
     });
     const totalVal = filtered.reduce((a, p) => a + p.buyPrice * p.stock, 0);
@@ -4057,6 +4204,18 @@ function pgInventory() {
         byName[key].push(p);
       });
       return Object.entries(byName).filter(([, arr]) => arr.length > 1).map(([, arr]) => arr);
+    })();
+
+    // ── Phát hiện sản phẩm trùng SKU ────────────────────────────
+    const dupSkuGroups = (() => {
+      const bySku = {};
+      S.products.forEach(p => {
+        if (!p.sku) return;
+        const key = p.sku.toLowerCase();
+        if (!bySku[key]) bySku[key] = [];
+        bySku[key].push(p);
+      });
+      return Object.entries(bySku).filter(([, arr]) => arr.length > 1);
     })();
 
     wrap.appendChild(h('div', {},
@@ -4109,7 +4268,18 @@ function pgInventory() {
           h('button', { className: 'btn btn-primary', onClick: () => openProduct(null, rebuild) }, '+ Thêm sản phẩm')
         )
       ),
-      // ── Cảnh báo kho âm ────────────────────────────────────────
+      // ── Cảnh báo trùng SKU ────────────────────────────────────────
+      dupSkuGroups.length > 0 && h('div', {
+        style: { background:'rgba(224,92,92,.08)', border:'1.5px solid rgba(224,92,92,.4)', borderRadius:'var(--r)', padding:'12px 16px', marginBottom:14, fontSize:13 }
+      },
+        h('div', { style: { fontWeight:700, color:'var(--red)', marginBottom:8 } }, '⚠️ Phát hiện ' + dupSkuGroups.length + ' mã SKU bị trùng — cần sửa ngay để tránh nhầm lẫn tồn kho!'),
+        ...dupSkuGroups.map(([sku, arr]) =>
+          h('div', { style:{ marginBottom:5, color:'var(--amber)', fontSize:12 } },
+            '🏷️ SKU <b>' + escHtml(sku) + '</b> dùng cho: ' + arr.map(p => '"' + escHtml(p.name) + '"').join(', ') +
+            ' — Nhấn ✏️ để sửa mã SKU'
+          )
+        )
+      ),
       (() => {
         const alerts = (S.stockAlerts || []).filter(a => {
           const p = S.products.find(x => x.id === a.productId);
@@ -4201,7 +4371,7 @@ function pgInventory() {
       })(),
       h('div', { className: 'table-wrap' },
         h('table', {},
-          h('thead', {}, h('tr', {}, th('Sản phẩm'), th('Loại'), th('Xuất xứ'), th('Giá nhập'), th('Giá bán'), th('LN% (chưa VAT)'), th('Quy cách'), th('Tồn kho'), th('Giá trị tồn'), th(''))),
+          h('thead', {}, h('tr', {}, th('Sản phẩm'), th('Mã SKU'), th('Loại'), th('Xuất xứ'), th('Giá nhập'), th('Giá bán'), th('LN% (chưa VAT)'), th('Quy cách'), th('Tồn kho'), th('Giá trị tồn'), th(''))),
           h('tbody', {},
             ...filtered.map(p => h('tr', {},
               h('td', {},
@@ -4216,6 +4386,11 @@ function pgInventory() {
                     p.description && h('div', { style: { fontSize: 11, color: 'var(--text3)', marginTop: 2 } }, p.description)
                   )
                 )
+              ),
+              h('td', {},
+                p.sku
+                  ? h('span', { className: 'badge badge-gold', style: { fontFamily: 'monospace', fontSize: 12, letterSpacing: '.5px' } }, p.sku)
+                  : h('span', { style: { color: 'var(--text3)', fontSize: 11 } }, '—')
               ),
               h('td', {}, h('span', { className: 'chip' }, p.type)),
               h('td', { style: { color: 'var(--text2)' } }, p.origin || '—'),
@@ -4257,7 +4432,19 @@ function pgInventory() {
               h('td', {}, h('div', { style: { display: 'flex', gap: 4 } },
                 h('button', { className: 'btn btn-ghost btn-xs', onClick: () => openProduct(p, rebuild) }, '✏️'),
                 h('button', { className: 'btn btn-ghost btn-xs', onClick: () => {
-                  S.confirm = { msg: 'Xoá sản phẩm "' + p.name + '"?', onYes: () => { softDelete('products', p.id, () => {}); toast('Đã xoá sản phẩm', 'info'); rebuild(); } };
+                  // Kiểm tra liên kết: phiếu nhập, đơn bán, trả hàng
+                  const relImports = (S.imports || []).filter(i => i.productId === p.id || (i.items || []).some(it => it.productId === p.id));
+                  const relSales   = (S.sales   || []).filter(s => s.productId === p.id || (s.items || []).some(it => it.productId === p.id));
+                  const relReturns = (S.returns || []).filter(r => r.productId === p.id);
+                  const hasLinks   = relImports.length > 0 || relSales.length > 0 || relReturns.length > 0;
+                  const warnMsg    = hasLinks
+                    ? 'Sản phẩm "' + p.name + '" (SKU: ' + (p.sku || '—') + ') đang liên kết với:\n'
+                      + (relImports.length ? '• ' + relImports.length + ' phiếu nhập hàng\n' : '')
+                      + (relSales.length   ? '• ' + relSales.length   + ' đơn bán hàng\n'   : '')
+                      + (relReturns.length ? '• ' + relReturns.length + ' phiếu trả hàng\n' : '')
+                      + '\n⚠️ Xoá sẽ giữ lại lịch sử giao dịch nhưng sản phẩm sẽ biến mất khỏi kho. Tiếp tục?'
+                    : 'Xoá sản phẩm "' + p.name + '" (SKU: ' + (p.sku || '—') + ')?';
+                  S.confirm = { msg: warnMsg, onYes: () => { softDelete('products', p.id, () => {}); toast('Đã xoá sản phẩm ' + (p.sku ? '[' + p.sku + ']' : ''), 'info'); rebuild(); } };
                   render();
                 } }, '🗑')
               ))
@@ -4275,7 +4462,7 @@ function pgInventory() {
 function openProduct(prod, rebuild) {
   const TYPES = ['Granite','Marble','Onyx','Basalt','Quartzite','Travertine','Slate','Serpentine','Khác'];
   const UNITS  = ['m²','tấm','tấn','viên','m³','kg','cái','bao'];
-  let f = prod ? { ...prod } : { name: '', type: 'Granite', origin: '', unit: 'm²', buyPrice: '', sellPrice: '', stock: '', description: '', image: '', qrCode: '', variants: [], thickness: '', length: '', width: '', multiVariant: false };
+  let f = prod ? { ...prod } : { name: '', sku: '', type: 'Granite', origin: '', unit: 'm²', buyPrice: '', sellPrice: '', stock: '', description: '', image: '', qrCode: '', variants: [], thickness: '', length: '', width: '', multiVariant: false };
   // Đảm bảo luôn có trường variants và multiVariant
   if (!f.variants) f.variants = [];
   if (f.multiVariant === undefined) f.multiVariant = f.variants.length > 0;
@@ -4669,6 +4856,68 @@ function openProduct(prod, rebuild) {
   imgWrap.appendChild(imgPickBtn);
   imgWrap.appendChild(imgPreviewEl);
 
+  // ── Mã SKU ────────────────────────────────────────────────
+  // Auto-generate khi tạo mới; cho phép sửa thủ công; check trùng lặp
+  const skuDefaultVal = prod ? (prod.sku || '') : generateSKU(f.name, S.products, prod ? prod.id : null);
+  const inpSku = mkInput('text', 'VD: gran1, cb2, onyx3...', skuDefaultVal, v => { f.sku = v.trim().toLowerCase().replace(/\s+/g,''); });
+  inpSku.value = skuDefaultVal;
+  inpSku.style.textTransform = 'lowercase';
+
+  // Preview SKU + trạng thái trùng
+  const skuStatusEl = document.createElement('div');
+  skuStatusEl.style.cssText = 'margin-top:5px;font-size:11px;min-height:16px';
+  function updateSkuStatus() {
+    const val = (inpSku.value || '').trim().toLowerCase();
+    if (!val) { skuStatusEl.innerHTML = '<span style="color:var(--text3)">Chưa có mã SKU</span>'; return; }
+    const duplicate = (S.products || []).find(p => p.sku && p.sku.toLowerCase() === val && p.id !== (prod ? prod.id : '__new__'));
+    if (duplicate) {
+      skuStatusEl.innerHTML = '<span style="color:var(--red)">⚠️ Mã <b>' + escHtml(val) + '</b> đã được dùng cho "' + escHtml(duplicate.name) + '" — vui lòng dùng mã khác</span>';
+    } else {
+      skuStatusEl.innerHTML = '<span style="color:var(--green)">✓ Mã <b>' + escHtml(val) + '</b> hợp lệ</span>';
+    }
+  }
+  updateSkuStatus();
+  inpSku.addEventListener('input', function() {
+    f.sku = this.value.trim().toLowerCase().replace(/\s+/g,'');
+    this.value = f.sku; // force lowercase
+    updateSkuStatus();
+  });
+
+  // Nút "Tạo lại SKU" dựa theo tên
+  const genSkuBtn = document.createElement('button');
+  genSkuBtn.type = 'button';
+  genSkuBtn.className = 'btn btn-ghost btn-xs';
+  genSkuBtn.style.cssText = 'margin-top:6px;font-size:11px';
+  genSkuBtn.innerHTML = '🔄 Tạo lại từ tên';
+  genSkuBtn.onclick = function() {
+    const newSku = generateSKU(inpName.value.trim() || f.name, S.products, prod ? prod.id : null);
+    inpSku.value = newSku;
+    f.sku = newSku;
+    updateSkuStatus();
+  };
+
+  // Auto-generate SKU khi tên thay đổi (chỉ khi tạo mới VÀ chưa sửa thủ công)
+  let skuAutoMode = !prod; // true = auto (sản phẩm mới chưa sửa tay)
+  inpSku.addEventListener('focus', () => { skuAutoMode = false; }); // user chủ động sửa → tắt auto
+  inpName.addEventListener('input', function() {
+    if (skuAutoMode) {
+      const newSku = generateSKU(this.value.trim(), S.products, null);
+      inpSku.value = newSku;
+      f.sku = newSku;
+      updateSkuStatus();
+    }
+  });
+
+  const skuWrap = document.createElement('div');
+  skuWrap.className = 'form-group';
+  const skuLabel = document.createElement('label');
+  skuLabel.className = 'form-label';
+  skuLabel.innerHTML = '🏷️ Mã SKU sản phẩm <span style="color:var(--red)">*</span> <span style="font-size:10px;color:var(--text3);font-weight:400">(tự động tạo, có thể sửa)</span>';
+  skuWrap.appendChild(skuLabel);
+  skuWrap.appendChild(inpSku);
+  skuWrap.appendChild(skuStatusEl);
+  skuWrap.appendChild(genSkuBtn);
+
   // ── Mã QR ─────────────────────────────────────────────────
   const inpQrCode = mkInput('text', 'Nhập mã QR / barcode sản phẩm...', f.qrCode || '', v => { f.qrCode = v; });
 
@@ -4717,6 +4966,7 @@ function openProduct(prod, rebuild) {
     title: prod ? 'Cập nhật sản phẩm' : 'Thêm sản phẩm mới',
     content: h('div', { className: 'fg fg2' },
       fg('Tên sản phẩm *', true, inpName),
+      skuWrap,
       fg('Loại đá *',      null, selType),
       fg('Xuất xứ',        null, inpOrigin),
       fg('Đơn vị tính',    null, selUnit),
@@ -4741,13 +4991,18 @@ function openProduct(prod, rebuild) {
         const nm = inpName.value.trim();
         const bp = inpBuy.value, sp = inpSell.value;
         if (!nm || !sp) { toast('Vui lòng điền tên sản phẩm và giá bán!', 'error'); return; }
+        // Validate SKU
+        const skuVal = (inpSku.value || '').trim().toLowerCase();
+        if (!skuVal) { toast('⚠️ Vui lòng nhập mã SKU sản phẩm!', 'error'); inpSku.focus(); return; }
+        const skuDup = (S.products || []).find(p => p.sku && p.sku.toLowerCase() === skuVal && p.id !== (prod ? prod.id : '__new__'));
+        if (skuDup) { toast('⚠️ Mã SKU "' + skuVal + '" đã tồn tại! Vui lòng dùng mã khác.', 'error'); inpSku.focus(); return; }
         // Validate variants
         for (const vt of f.variants) {
           if (!vt.tileW || !vt.tileH || vt.tileW <= 0 || vt.tileH <= 0) {
             toast('⚠️ Vui lòng nhập kích thước (rộng × dài) cho tất cả quy cách!', 'error'); return;
           }
         }
-        const p = { name: nm, type: selType.value, origin: inpOrigin.value.trim(),
+        const p = { name: nm, sku: skuVal, type: selType.value, origin: inpOrigin.value.trim(),
           unit: selUnit.value, stock: parseFloat(inpStock.value)||0,
           buyPrice: parseFloat(bp)||0, sellPrice: parseFloat(sp)||0,
           description: taDesc.value.trim(),
@@ -5369,7 +5624,7 @@ function openImport(existing, rebuild, prefillProduct) {
     prodGroup.className = 'form-group';
     const prodLabel = document.createElement('label'); prodLabel.className = 'form-label'; prodLabel.textContent = 'Sản phẩm *';
     const selProd = mkSelect(
-      [{ value: '', label: '— Chọn sản phẩm —' }, ...products.map(p => ({ value: p.id, label: p.name + ' (tồn: ' + fmtQty(p.stock) + ' ' + p.unit + ')' }))],
+      [{ value: '', label: '— Chọn sản phẩm —' }, ...products.map(p => ({ value: p.id, label: (p.sku ? '[' + p.sku + '] ' : '') + p.name + ' (tồn: ' + fmtQty(p.stock) + ' ' + p.unit + ')' }))],
       it.productId,
       v => {
         it.productId = v;
@@ -6026,7 +6281,7 @@ function pgSales() {
           const nameWrap = document.createElement('div'); nameWrap.className = 'pl-name';
           const nameText = document.createElement('div'); nameText.className = 'pl-name-text'; nameText.textContent = p.name;
           const nameSub  = document.createElement('div'); nameSub.className = 'pl-name-sub';
-          nameSub.textContent = [p.type, p.origin].filter(Boolean).join(' · ');
+          nameSub.textContent = [p.sku ? ('SKU: ' + p.sku) : null, p.type, p.origin].filter(Boolean).join(' · ');
           nameWrap.appendChild(nameText); nameWrap.appendChild(nameSub);
           row.appendChild(nameWrap);
 
@@ -6615,7 +6870,7 @@ function openSale(rebuild, preselectedProduct) {
     const prodGrp = document.createElement('div'); prodGrp.className='form-group';
     const prodLbl = document.createElement('label'); prodLbl.className='form-label'; prodLbl.textContent='Sản phẩm *';
     const selProd = mkSelect(
-      [{value:'',label:'— Chọn sản phẩm —'}, ...products.map(p=>({value:p.id,label:p.name+' (còn '+fmtQty(p.stock)+' '+p.unit+')'}))],
+      [{value:'',label:'— Chọn sản phẩm —'}, ...products.map(p=>({value:p.id,label:(p.sku ? '['+p.sku+'] ' : '')+p.name+' (còn '+fmtQty(p.stock)+' '+p.unit+')'}))],
       it.productId, v => { it.productId=v; const p=products.find(x=>x.id===v); if(p){it.price=p.sellPrice;priceInp.value=p.sellPrice;} it.variantId=''; renderVtSel(p); updateMinHint(); updateSum(); }
     );
     prodGrp.appendChild(prodLbl); prodGrp.appendChild(selProd);
@@ -10820,7 +11075,7 @@ function openReturn(rebuild) {
   const inpCust      = mkInput('text',   'Tên khách hàng *', '', v => {});
   const inpPhone     = mkInput('tel',    '0909...', '', v => {});
   const selProd      = mkSelect(
-    [{ value: '', label: '— Chọn sản phẩm —' }, ...products.map(p => ({ value: p.id, label: p.name + ' (' + fmtQty(p.stock) + ' ' + p.unit + ' trong kho)' }))],
+    [{ value: '', label: '— Chọn sản phẩm —' }, ...products.map(p => ({ value: p.id, label: (p.sku ? '[' + p.sku + '] ' : '') + p.name + ' (' + fmtQty(p.stock) + ' ' + p.unit + ' trong kho)' }))],
     '', v => { updateSum(); }
   );
   const inpReturnQty = mkInput('number', 'Số lượng khách trả', '', v => updateSum());
@@ -11677,6 +11932,7 @@ function pgSearch() {
     // Search products
     const prodRes = products.filter(p =>
       (p.name||'').toLowerCase().includes(keyword) ||
+      (p.sku||'').toLowerCase().includes(keyword) ||
       (p.origin||'').toLowerCase().includes(keyword) ||
       (p.note||'').toLowerCase().includes(keyword)
     );
@@ -11718,9 +11974,10 @@ function pgSearch() {
       const card = h('div', { className: 'card' });
       card.appendChild(h('div', { className: 'card-title' }, `💎 Sản phẩm (${prodRes.length} kết quả)`));
       card.appendChild(h('div', { className: 'table-wrap' }, h('table',{},
-        h('thead',{},h('tr',{},th('Tên sản phẩm'),th('Xuất xứ'),th('Tồn kho'),th('Giá nhập',true),th('Giá bán',true))),
+        h('thead',{},h('tr',{},th('Tên sản phẩm'),th('Mã SKU'),th('Xuất xứ'),th('Tồn kho'),th('Giá nhập',true),th('Giá bán',true))),
         h('tbody',{},...prodRes.map(p=>h('tr',{},
           h('td',{},h('div',{style:{fontWeight:600}},highlight(p.name,keyword))),
+          h('td',{},p.sku ? h('span',{className:'badge badge-gold',style:{fontFamily:'monospace',fontSize:11}},p.sku) : h('span',{style:{color:'var(--text3)'}}, '—')),
           h('td',{style:{fontSize:12,color:'var(--text2)'}},p.origin||'—'),
           h('td',{},fmtQty(p.stock)+' '+(p.unit||'')),
           h('td',{style:{textAlign:'right'}},fmt(p.buyPrice)+'đ'),
@@ -11908,7 +12165,7 @@ const AICHAT = (() => {
 
     const productList = products.map(p => {
       // KHÔNG đưa tồn kho vào prompt — tránh AI báo hàng còn/hết với khách
-      let line = `- ID:${p.id} | Tên: ${p.name} | Loại: ${p.type||''} | Xuất xứ: ${p.origin||''} | Đơn vị: ${p.unit||''} | Giá bán: ${p.sellPrice||0}đ`;
+      let line = `- ID:${p.id} | SKU:${p.sku||'—'} | Tên: ${p.name} | Loại: ${p.type||''} | Xuất xứ: ${p.origin||''} | Đơn vị: ${p.unit||''} | Giá bán: ${p.sellPrice||0}đ`;
       if (p.description) line += ` | Mô tả: ${p.description}`;
       if (p.variants && p.variants.length > 0) {
         line += ` | Quy cách: ` + p.variants.map(v => `${v.tileW||'?'}x${v.tileH||'?'}${v.tileThickness?'x'+v.tileThickness:''}cm`).join(', ');
