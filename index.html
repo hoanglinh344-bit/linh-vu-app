@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Đá Tự Nhiên Linh Vũ">
-<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.9.5</title>
+<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.9.6</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
 <!-- Firebase SDK -->
@@ -198,6 +198,17 @@ textarea.form-input{resize:vertical;min-height:72px}
 <script>
 'use strict';
 let _raf = false; // render debounce flag — khai báo sớm để bootApp & logout dùng được
+
+// ── HTML escape helper — ngăn XSS khi insert user data vào innerHTML ──
+function escHtml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 // ═══════════════════════════════════════════════════════════════
 //  CLOUD — Firebase Firestore sync + Conflict Resolution (v7.9.0)
@@ -3798,7 +3809,7 @@ function pBox(label, color, sign, val, bold) {
 // ── INVENTORY ─────────────────────────────────────────────────
 function pgInventory() {
   const TYPES = ['Granite','Marble','Onyx','Basalt','Quartzite','Travertine','Slate','Serpentine','Khác'];
-  const UNITS  = ['m²','tấm','tấn','viên','m³','kg','cái'];
+  const UNITS  = ['m²','tấm','tấn','viên','m³','kg','cái','bao'];
   const wrap = h('div', {});
   let search = '', ftype = 'all';
 
@@ -4070,7 +4081,7 @@ function pgInventory() {
 
 function openProduct(prod, rebuild) {
   const TYPES = ['Granite','Marble','Onyx','Basalt','Quartzite','Travertine','Slate','Serpentine','Khác'];
-  const UNITS  = ['m²','tấm','tấn','viên','m³','kg','cái'];
+  const UNITS  = ['m²','tấm','tấn','viên','m³','kg','cái','bao'];
   let f = prod ? { ...prod } : { name: '', type: 'Granite', origin: '', unit: 'm²', buyPrice: '', sellPrice: '', stock: '', description: '', image: '', qrCode: '', variants: [], thickness: '', length: '', width: '', multiVariant: false };
   // Đảm bảo luôn có trường variants và multiVariant
   if (!f.variants) f.variants = [];
@@ -4472,12 +4483,12 @@ function openProduct(prod, rebuild) {
   const qrPreviewEl = document.createElement('div');
   qrPreviewEl.style.cssText = 'margin-top:8px;padding:10px;background:var(--bg4);border-radius:6px;border:1px solid var(--border);font-size:12px;color:var(--text2);display:' + (f.qrCode ? 'block' : 'none');
   if (f.qrCode) {
-    qrPreviewEl.innerHTML = '📱 Mã: <b style="color:var(--accent)">' + f.qrCode + '</b> — có thể quét QR để chọn sản phẩm tại mục Bán hàng';
+    qrPreviewEl.innerHTML = '📱 Mã: <b style="color:var(--accent)">' + escHtml(f.qrCode) + '</b> — có thể quét QR để chọn sản phẩm tại mục Bán hàng';
   }
   inpQrCode.addEventListener('input', function(){
     if (inpQrCode.value.trim()) {
       qrPreviewEl.style.display = 'block';
-      qrPreviewEl.innerHTML = '📱 Mã: <b style="color:var(--accent)">' + inpQrCode.value.trim() + '</b> — có thể quét QR để chọn sản phẩm tại mục Bán hàng';
+      qrPreviewEl.innerHTML = '📱 Mã: <b style="color:var(--accent)">' + escHtml(inpQrCode.value.trim()) + '</b> — có thể quét QR để chọn sản phẩm tại mục Bán hàng';
     } else {
       qrPreviewEl.style.display = 'none';
     }
@@ -5077,7 +5088,7 @@ function openImport(existing, rebuild) {
       });
       const vtInfo = document.createElement('div');
       vtInfo.style.cssText = 'margin-top:5px;font-size:11px;color:var(--blue);background:rgba(91,143,232,.07);border:1px solid rgba(91,143,232,.2);border-radius:6px;padding:5px 9px';
-      vtInfo.innerHTML = p.variants.map(vt => `<span style="margin-right:10px">📐${vt.tileW}×${vt.tileH}${vt.tileThickness?'×'+vt.tileThickness:''}cm: <b style="color:var(--green)">${(vt.stockM2||0).toFixed(1)}m²</b>/${vt.stockPieces||0}v</span>`).join('');
+      vtInfo.innerHTML = p.variants.map(vt => `<span style="margin-right:10px">📐${escHtml(vt.tileW)}×${escHtml(vt.tileH)}${vt.tileThickness?'×'+escHtml(vt.tileThickness):''}cm: <b style="color:var(--green)">${(vt.stockM2||0).toFixed(1)}m²</b>/${vt.stockPieces||0}v</span>`).join('');
       variantEl.appendChild(vlbl); variantEl.appendChild(vsel); variantEl.appendChild(vtInfo);
       if (it._vtSelId) {
         const sv = p.variants.find(vt => vt.id === it._vtSelId);
@@ -5664,7 +5675,7 @@ function pgSales() {
           // Giá bán
           const sellDiv = document.createElement('div'); sellDiv.className = 'pl-sell';
           if (p.sellPrice > 0) {
-            sellDiv.innerHTML = fmt(p.sellPrice) + '<span class="pl-sell-unit">đ/' + (p.unit||'m²') + '</span>';
+            sellDiv.innerHTML = fmt(p.sellPrice) + '<span class="pl-sell-unit">đ/' + escHtml(p.unit||'m²') + '</span>';
           } else {
             sellDiv.innerHTML = '<span style="color:var(--text3);font-size:12px">Liên hệ</span>';
           }
@@ -6228,7 +6239,7 @@ function openSale(rebuild, preselectedProduct) {
         const bdr=m2<=0?'rgba(224,92,92,.4)':m2<=5?'rgba(232,165,58,.4)':'rgba(76,175,125,.4)';
         const box=document.createElement('div');
         box.style.cssText=`background:var(--bg4);border:1.5px solid ${bdr};border-radius:8px;padding:8px;text-align:center;cursor:pointer;transition:all .15s`;
-        box.innerHTML=`<div style="font-weight:700;color:var(--accent);font-size:12px">${vt.tileW}×${vt.tileH}${vt.tileThickness?'×'+vt.tileThickness:''} cm</div><div style="color:${col};font-weight:700;font-size:16px;margin:2px 0">${m2.toFixed(1)} m²</div><div style="color:var(--text3);font-size:10px">${vt.stockPieces||0} viên</div>`;
+        box.innerHTML=`<div style="font-weight:700;color:var(--accent);font-size:12px">${escHtml(vt.tileW)}×${escHtml(vt.tileH)}${vt.tileThickness?'×'+escHtml(vt.tileThickness):''} cm</div><div style="color:${col};font-weight:700;font-size:16px;margin:2px 0">${m2.toFixed(1)} m²</div><div style="color:var(--text3);font-size:10px">${vt.stockPieces||0} viên</div>`;
         box.onclick=()=>{vsel.value=vt.id;vsel.dispatchEvent(new Event('change'));};
         vtGrid.appendChild(box);
       });
@@ -6353,6 +6364,7 @@ function openSale(rebuild, preselectedProduct) {
 
         // Tạo bản ghi cho từng dòng (chia phí VC theo tỉ lệ nếu tính cho khách)
         const newRecs2 = [];
+        const _orderGroupId = 'ord' + uid(); // ID đơn hàng — gộp nhiều SP cùng đơn
         saleItems.forEach((it,idx) => {
           const calc = itemCalcs2[idx];
           const prod = products.find(p=>p.id===it.productId);
@@ -6386,7 +6398,7 @@ function openSale(rebuild, preselectedProduct) {
             if(sv) vtSize=sv.tileW+'×'+sv.tileH+(sv.tileThickness?'×'+sv.tileThickness:'')+' cm';
           }
           const rec = {
-            id:'s'+uid(), date:dateSaved, customer, phone:inpPhone.value.trim(),
+            id:'s'+uid(), orderId: _orderGroupId, date:dateSaved, customer, phone:inpPhone.value.trim(),
             address:inpAddr.value.trim(), productId:it.productId, productName:prod?.name||'',
             qty:calc.qty, unit:prod?.unit||'', unitPrice:calc.price, vatRate:calc.vat,
             subTotal:calc.sub, vatAmt:calc.vatAmt, total:itemTotal, paid:itemPaid,
@@ -7081,7 +7093,7 @@ function pgDebt() {
                           remain -= pay;
                           const rowEl = document.createElement('div');
                           rowEl.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--bg3);border-radius:6px;margin-bottom:4px;font-size:12px';
-                          rowEl.innerHTML = `<div><span style="color:var(--text2)">📅 ${fmtD(s.date)} · ${s.productName}</span><br><span style="color:var(--red);font-size:11px">Nợ: ${fmt(owe)}đ</span></div><div style="font-weight:700;color:var(--green)">Thu: ${fmt(pay)}đ${pay >= owe ? ' ✅' : ''}</div>`;
+                          rowEl.innerHTML = `<div><span style="color:var(--text2)">📅 ${fmtD(s.date)} · ${escHtml(s.productName)}</span><br><span style="color:var(--red);font-size:11px">Nợ: ${fmt(owe)}đ</span></div><div style="font-weight:700;color:var(--green)">Thu: ${fmt(pay)}đ${pay >= owe ? ' ✅' : ''}</div>`;
                           previewEl.appendChild(rowEl);
                         });
                         if (remain > 0) {
@@ -7268,83 +7280,155 @@ function pgDebt() {
 // ── INVOICE ───────────────────────────────────────────────────
 function pgInvoice() {
   const wrap = h('div', {});
-  let selected = null, search = '';
+  let selectedGroup = null, search = '';
+
+  // Gộp các sale records thành nhóm đơn hàng để hiển thị + in gộp
+  function buildOrderGroups(sales) {
+    const groupMap = {};
+    sales.forEach(s => {
+      const key = s.orderId || s.id;
+      if (!groupMap[key]) {
+        groupMap[key] = {
+          groupId: key,
+          orderId: s.orderId || null,
+          date: s.date,
+          customer: s.customer,
+          phone: s.phone || '',
+          address: s.address || '',
+          note: s.note || '',
+          staffId: s.staffId,
+          staffName: s.staffName,
+          items: [],
+          totalGrand: 0,
+          totalPaid: 0,
+          hasVat: false,
+          vatRate: 0,
+          shipForCustomer: s.shipForCustomer,
+          status: 'done'
+        };
+      }
+      groupMap[key].items.push(s);
+      groupMap[key].totalGrand += s.total || 0;
+      groupMap[key].totalPaid  += s.paid  || 0;
+      if ((s.vatRate||0) > 0) { groupMap[key].hasVat = true; groupMap[key].vatRate = s.vatRate; }
+      if (s.status !== 'done') groupMap[key].status = 'debt';
+    });
+    return Object.values(groupMap).sort((a, b) => b.date.localeCompare(a.date));
+  }
+
   const rebuild = () => {
     const { sales, settings } = S;
     const currentUser = AUTH.currentUser();
     const isAdminInv = currentUser && currentUser.role === 'admin';
-    // Nhân viên chỉ thấy hoá đơn đơn hàng của mình
     const mySalesInv = isAdminInv ? sales : sales.filter(s => s.staffId === currentUser.username);
-    const filtered = mySalesInv.filter(s => s.customer.toLowerCase().includes(search.toLowerCase()) || s.productName.toLowerCase().includes(search.toLowerCase())).sort((a, b) => b.date.localeCompare(a.date));
+    const q = search.toLowerCase();
+    const filteredSales = mySalesInv.filter(s =>
+      (s.customer||'').toLowerCase().includes(q) ||
+      (s.productName||'').toLowerCase().includes(q) ||
+      (s.orderId||'').toLowerCase().includes(q)
+    );
+    const groups = buildOrderGroups(filteredSales);
+    if (selectedGroup && !groups.find(g => g.groupId === selectedGroup.groupId)) selectedGroup = null;
 
+    // ── Preview: render nhóm đơn hàng đã chọn ──
     let preview;
-    if (selected) {
-      const s = selected;
-      const sub   = s.subTotal || 0;
-      const vatAmt = s.vatAmt  || 0;
-      const remaining = s.total - s.paid;
+    if (selectedGroup) {
+      const grp = selectedGroup;
+      const remaining = grp.totalGrand - grp.totalPaid;
+      const totalSubAll  = grp.items.reduce((a, s) => a + (s.subTotal||0), 0);
+      const totalVatAll  = grp.items.reduce((a, s) => a + (s.vatAmt||0), 0);
+      const totalShipAll = grp.shipForCustomer ? grp.items.reduce((a, s) => a + (s.shipForCustomer ? (s.shipFee||0) : 0), 0) : 0;
+      // ID hoá đơn: nếu 1 SP dùng id riêng; nhiều SP dùng orderId
+      const invNo = grp.items.length === 1 ? grp.items[0].id.toUpperCase() : (grp.orderId||grp.groupId).toUpperCase();
+
       const invEl = h('div', { style: { background: '#fff', color: '#111', borderRadius: 'var(--r)', padding: '24px', fontSize: 13, lineHeight: 1.8 } },
-          h('div', { style: { display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12, marginBottom: 20, paddingBottom: 16, borderBottom: '2.5px solid #d4b84a' } },
-            h('div', {},
-              h('div', { style: { fontSize: 20, fontWeight: 700, fontFamily: 'Georgia,serif', color: '#8b6914' } }, settings.shopName || 'Đá Tự Nhiên'),
-              h('div', { style: { fontSize: 11, color: '#888', marginTop: 4, lineHeight: 1.9 } }, settings.address, h('br'), settings.phone + ' | ' + settings.email),
-              settings.taxId && h('div', { style: { fontSize: 11, color: '#888' } }, 'MST: ' + settings.taxId)
-            ),
-            h('div', { style: { textAlign: 'right' } },
-              h('div', { style: { fontSize: 16, fontWeight: 700, color: '#333', letterSpacing: 1 } }, 'HOÁ ĐƠN BÁN HÀNG'),
-              h('div', { style: { fontSize: 12, color: '#666', marginTop: 6 } }, 'Số: ', h('b', {}, s.id.toUpperCase())),
-              h('div', { style: { fontSize: 12, color: '#666' } }, 'Ngày: ', h('b', {}, fmtD(s.date)))
-            )
+        h('div', { style: { display:'flex', justifyContent:'space-between', flexWrap:'wrap', gap:12, marginBottom:20, paddingBottom:16, borderBottom:'2.5px solid #d4b84a' } },
+          h('div', {},
+            h('div', { style:{ fontSize:20, fontWeight:700, fontFamily:'Georgia,serif', color:'#8b6914' } }, settings.shopName || 'Đá Tự Nhiên'),
+            h('div', { style:{ fontSize:11, color:'#888', marginTop:4, lineHeight:1.9 } }, settings.address, h('br'), settings.phone + ' | ' + settings.email),
+            settings.taxId && h('div', { style:{ fontSize:11, color:'#888' } }, 'MST: ' + settings.taxId)
           ),
-          h('div', { style: { background: '#faf7f0', borderRadius: 6, padding: '10px 14px', marginBottom: 16, fontSize: 12 } },
-            h('b', {}, 'Khách hàng: '), s.customer, ' | ',
-            h('b', {}, 'SĐT: '), s.phone || '—',
-            s.address ? [' | ', h('b', {}, 'Địa chỉ: '), s.address] : null
-          ),
-          h('table', { style: { width: '100%', borderCollapse: 'collapse', marginBottom: 16, fontSize: 13, color: '#111' } },
-            h('thead', {}, h('tr', { style: { background: '#f0ece4' } },
-              h('th', { style: { padding: '8px 10px', textAlign: 'left', color: '#555', fontWeight: 600 } }, 'Sản phẩm'),
-              h('th', { style: { padding: '8px 10px', textAlign: 'center', color: '#555', fontWeight: 600 } }, 'ĐVT'),
-              h('th', { style: { padding: '8px 10px', textAlign: 'center', color: '#555', fontWeight: 600 } }, 'SL'),
-              h('th', { style: { padding: '8px 10px', textAlign: 'right', color: '#555', fontWeight: 600 } }, 'Đơn giá'),
-              h('th', { style: { padding: '8px 10px', textAlign: 'right', color: '#555', fontWeight: 600 } }, 'Thành tiền')
+          h('div', { style:{ textAlign:'right' } },
+            h('div', { style:{ fontSize:16, fontWeight:700, color:'#333', letterSpacing:1 } }, 'HOÁ ĐƠN BÁN HÀNG'),
+            h('div', { style:{ fontSize:12, color:'#666', marginTop:6 } }, 'Số: ', h('b', {}, invNo)),
+            h('div', { style:{ fontSize:12, color:'#666' } }, 'Ngày: ', h('b', {}, fmtD(grp.date)))
+          )
+        ),
+        h('div', { style:{ background:'#faf7f0', borderRadius:6, padding:'10px 14px', marginBottom:16, fontSize:12 } },
+          h('b', {}, 'Khách hàng: '), grp.customer, ' | ',
+          h('b', {}, 'SĐT: '), grp.phone || '—',
+          grp.address ? [' | ', h('b', {}, 'Địa chỉ: '), grp.address] : null
+        ),
+        h('table', { style:{ width:'100%', borderCollapse:'collapse', marginBottom:16, fontSize:13, color:'#111' } },
+          h('thead', {}, h('tr', { style:{ background:'#f0ece4' } },
+            h('th', { style:{ padding:'8px 10px', textAlign:'left', color:'#555', fontWeight:600 } }, 'STT'),
+            h('th', { style:{ padding:'8px 10px', textAlign:'left', color:'#555', fontWeight:600 } }, 'Sản phẩm'),
+            h('th', { style:{ padding:'8px 10px', textAlign:'center', color:'#555', fontWeight:600 } }, 'ĐVT'),
+            h('th', { style:{ padding:'8px 10px', textAlign:'center', color:'#555', fontWeight:600 } }, 'SL'),
+            h('th', { style:{ padding:'8px 10px', textAlign:'right', color:'#555', fontWeight:600 } }, 'Đơn giá'),
+            h('th', { style:{ padding:'8px 10px', textAlign:'right', color:'#555', fontWeight:600 } }, 'Thành tiền')
+          )),
+          h('tbody', {},
+            ...grp.items.map((s, idx) => h('tr', {},
+              h('td', { style:{ padding:'10px', borderBottom:'1px solid #eee', color:'#555' } }, String(idx+1)),
+              h('td', { style:{ padding:'10px', borderBottom:'1px solid #eee', fontWeight:500 } }, s.productName + (s.variantSize ? ' (' + s.variantSize + ')' : '')),
+              h('td', { style:{ padding:'10px', borderBottom:'1px solid #eee', textAlign:'center', color:'#555' } }, s.unit),
+              h('td', { style:{ padding:'10px', borderBottom:'1px solid #eee', textAlign:'center', color:'#555' } }, s.qty || '—'),
+              h('td', { style:{ padding:'10px', borderBottom:'1px solid #eee', textAlign:'right', color:'#555' } }, fmt(s.unitPrice) + 'đ'),
+              h('td', { style:{ padding:'10px', borderBottom:'1px solid #eee', textAlign:'right', fontWeight:700 } }, fmt(s.subTotal||0) + 'đ')
             )),
-            h('tbody', {}, h('tr', {},
-              h('td', { style: { padding: '10px', borderBottom: '1px solid #eee', fontWeight: 500 } }, s.productName),
-              h('td', { style: { padding: '10px', borderBottom: '1px solid #eee', textAlign: 'center', color: '#555' } }, s.unit),
-              h('td', { style: { padding: '10px', borderBottom: '1px solid #eee', textAlign: 'center', color: '#555' } }, s.qty || '—'),
-              h('td', { style: { padding: '10px', borderBottom: '1px solid #eee', textAlign: 'right', color: '#555' } }, fmt(s.unitPrice) + 'đ'),
-              h('td', { style: { padding: '10px', borderBottom: '1px solid #eee', textAlign: 'right', fontWeight: 700 } }, fmt(sub) + 'đ')
-            ))
-          ),
-          h('div', { style: { textAlign: 'right', fontSize: 13, lineHeight: 2.3 } },
-            h('div', { style: { color: '#555' } }, 'Tạm tính: ', h('b', { style: { color: '#222' } }, fmt(sub) + 'đ')),
-            s.vatRate > 0 && h('div', { style: { color: '#555' } }, `VAT (${s.vatRate}%): `, h('b', { style: { color: '#222' } }, fmt(vatAmt) + 'đ')),
-            (s.shipForCustomer && (s.shipFee||0) > 0) && h('div', { style: { color: '#555' } }, '🚚 Phí vận chuyển: ', h('b', { style: { color: '#222' } }, fmt(s.shipFee) + 'đ')),
-            h('div', { style: { fontSize: 16, fontWeight: 700, color: '#8b6914', borderTop: '2px solid #e0d9c8', paddingTop: 8, marginTop: 4 } }, 'TỔNG CỘNG: ', fmt(s.total) + 'đ'),
-            h('div', { style: { color: '#4a8c3f', fontWeight: 500 } }, 'Đã thanh toán: ', fmt(s.paid) + 'đ'),
-            remaining > 0 && h('div', { style: { color: '#c0392b', fontWeight: 700 } }, 'Còn lại: ', fmt(remaining) + 'đ')
-          ),
-          s.note && h('div', { style: { marginTop: 12, fontSize: 11, color: '#888', fontStyle: 'italic', borderTop: '1px solid #eee', paddingTop: 8 } }, 'Ghi chú: ', s.note),
-          h('div', { style: { marginTop: 36, display: 'flex', justifyContent: 'space-between', textAlign: 'center' } },
-            h('div', { style: { width: '44%' } },
-              h('div', { style: { fontSize: 12, fontWeight: 700, color: '#333', textTransform: 'uppercase', letterSpacing: .8 } }, 'Đại diện bán hàng'),
-              h('div', { style: { fontSize: 11, color: '#aaa', fontStyle: 'italic', marginBottom: 52, marginTop: 4 } }, '(Ký, ghi rõ họ tên)'),
-              h('div', { style: { borderTop: '1.5px solid #888', paddingTop: 6, fontSize: 12, color: '#444', fontWeight: 600 } }, settings.shopName)
-            ),
-            h('div', { style: { width: '44%' } },
-              h('div', { style: { fontSize: 12, fontWeight: 700, color: '#333', textTransform: 'uppercase', letterSpacing: .8 } }, 'Khách hàng xác nhận'),
-              h('div', { style: { fontSize: 11, color: '#aaa', fontStyle: 'italic', marginBottom: 52, marginTop: 4 } }, '(Ký, ghi rõ họ tên)'),
-              h('div', { style: { borderTop: '1.5px solid #888', paddingTop: 6, fontSize: 12, color: '#444', fontWeight: 600 } }, s.customer)
+            totalShipAll > 0 && h('tr', {},
+              h('td', { style:{ padding:'10px', borderBottom:'1px solid #eee', color:'#888' } }, ''),
+              h('td', { style:{ padding:'10px', borderBottom:'1px solid #eee', fontStyle:'italic', color:'#666' } }, '🚚 Phí vận chuyển'),
+              h('td', { style:{ padding:'10px', borderBottom:'1px solid #eee', textAlign:'center', color:'#888' } }, '—'),
+              h('td', { style:{ padding:'10px', borderBottom:'1px solid #eee', textAlign:'center', color:'#888' } }, '—'),
+              h('td', { style:{ padding:'10px', borderBottom:'1px solid #eee', textAlign:'right', color:'#888' } }, '—'),
+              h('td', { style:{ padding:'10px', borderBottom:'1px solid #eee', textAlign:'right', fontWeight:700 } }, fmt(totalShipAll) + 'đ')
             )
+          )
+        ),
+        h('div', { style:{ textAlign:'right', fontSize:13, lineHeight:2.3 } },
+          h('div', { style:{ color:'#555' } }, 'Tạm tính: ', h('b', { style:{ color:'#222' } }, fmt(totalSubAll) + 'đ')),
+          totalVatAll > 0 && h('div', { style:{ color:'#555' } }, `VAT: `, h('b', { style:{ color:'#222' } }, fmt(totalVatAll) + 'đ')),
+          totalShipAll > 0 && h('div', { style:{ color:'#555' } }, '🚚 Phí vận chuyển: ', h('b', { style:{ color:'#222' } }, fmt(totalShipAll) + 'đ')),
+          h('div', { style:{ fontSize:16, fontWeight:700, color:'#8b6914', borderTop:'2px solid #e0d9c8', paddingTop:8, marginTop:4 } }, 'TỔNG CỘNG: ', fmt(grp.totalGrand) + 'đ'),
+          h('div', { style:{ color:'#4a8c3f', fontWeight:500 } }, 'Đã thanh toán: ', fmt(grp.totalPaid) + 'đ'),
+          remaining > 0 && h('div', { style:{ color:'#c0392b', fontWeight:700 } }, 'Còn lại: ', fmt(remaining) + 'đ')
+        ),
+        grp.note && h('div', { style:{ marginTop:12, fontSize:11, color:'#888', fontStyle:'italic', borderTop:'1px solid #eee', paddingTop:8 } }, 'Ghi chú: ', grp.note),
+        h('div', { style:{ marginTop:36, display:'flex', justifyContent:'space-between', textAlign:'center' } },
+          h('div', { style:{ width:'44%' } },
+            h('div', { style:{ fontSize:12, fontWeight:700, color:'#333', textTransform:'uppercase', letterSpacing:.8 } }, 'Đại diện bán hàng'),
+            h('div', { style:{ fontSize:11, color:'#aaa', fontStyle:'italic', marginBottom:52, marginTop:4 } }, '(Ký, ghi rõ họ tên)'),
+            h('div', { style:{ borderTop:'1.5px solid #888', paddingTop:6, fontSize:12, color:'#444', fontWeight:600 } }, settings.shopName)
           ),
-          h('div', { style: { marginTop: 24, textAlign: 'center', fontSize: 11, color: '#aaa', borderTop: '1px solid #e0d9c8', paddingTop: 12 } }, 'Cảm ơn quý khách đã tin tưởng sử dụng sản phẩm của chúng tôi!')
-        );
-      // ── Helper tạo nội dung HTML hoá đơn (dùng chung cho In và PDF) ──
-      function buildInvoiceHTML(s, autoprint) {
-        const rem2 = s.total - s.paid;
+          h('div', { style:{ width:'44%' } },
+            h('div', { style:{ fontSize:12, fontWeight:700, color:'#333', textTransform:'uppercase', letterSpacing:.8 } }, 'Khách hàng xác nhận'),
+            h('div', { style:{ fontSize:11, color:'#aaa', fontStyle:'italic', marginBottom:52, marginTop:4 } }, '(Ký, ghi rõ họ tên)'),
+            h('div', { style:{ borderTop:'1.5px solid #888', paddingTop:6, fontSize:12, color:'#444', fontWeight:600 } }, grp.customer)
+          )
+        ),
+        h('div', { style:{ marginTop:24, textAlign:'center', fontSize:11, color:'#aaa', borderTop:'1px solid #e0d9c8', paddingTop:12 } }, 'Cảm ơn quý khách đã tin tưởng sử dụng sản phẩm của chúng tôi!')
+      );
+
+      // ── HTML hoá đơn gộp để In / PDF ──
+      function buildGroupInvoiceHTML(grp, autoprint) {
+        const rem2 = grp.totalGrand - grp.totalPaid;
+        const sub2 = grp.items.reduce((a, s) => a + (s.subTotal||0), 0);
+        const vat2 = grp.items.reduce((a, s) => a + (s.vatAmt||0), 0);
+        const ship2 = grp.items.reduce((a, s) => a + (s.shipForCustomer ? (s.shipFee||0) : 0), 0);
+        const invNo2 = grp.items.length === 1 ? grp.items[0].id.toUpperCase() : (grp.orderId||grp.groupId).toUpperCase();
+        const rowsHTML = grp.items.map((s, idx) => `<tr>
+          <td class="c">${idx+1}</td>
+          <td><b>${s.productName}</b>${s.variantSize ? ' <span style="color:#888;font-size:11px">('+s.variantSize+')</span>' : ''}</td>
+          <td class="c">${s.unit||''}</td>
+          <td class="c">${s.qty||'—'}</td>
+          <td class="r">${fmt(s.unitPrice)}đ</td>
+          <td class="r"><b>${fmt(s.subTotal||0)}đ</b></td>
+        </tr>`).join('');
+        const shipRow = ship2 > 0 ? `<tr><td class="c"></td><td><i>🚚 Phí vận chuyển</i></td><td class="c">—</td><td class="c">—</td><td class="r">—</td><td class="r"><b>${fmt(ship2)}đ</b></td></tr>` : '';
         return `<!DOCTYPE html><html><head><meta charset="UTF-8">
-<title>Hoá Đơn - ${s.customer}</title>
+<title>Hoá Đơn - ${grp.customer}</title>
 <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:ital,wght@0,400;0,600;0,700;1,400&display=swap" rel="stylesheet">
 <style>
 * { box-sizing:border-box; margin:0; padding:0; }
@@ -7387,30 +7471,25 @@ td.r { text-align:right; } td.c { text-align:center; }
       <div class="shop-name">${S.settings.shopName || 'Đá Tự Nhiên'}</div>
       <div class="shop-info">${S.settings.address || ''}<br>${S.settings.phone || ''} | ${S.settings.email || ''}${S.settings.taxId ? '<br>MST: ' + S.settings.taxId : ''}</div>
     </div>
-    <div class="inv-title"><h1>HOÁ ĐƠN BÁN HÀNG</h1><p>Số: <b>${s.id.toUpperCase()}</b></p><p>Ngày: <b>${fmtD(s.date)}</b></p></div>
+    <div class="inv-title"><h1>HOÁ ĐƠN BÁN HÀNG</h1><p>Số: <b>${invNo2}</b></p><p>Ngày: <b>${fmtD(grp.date)}</b></p></div>
   </div>
-  <div class="customer-box"><b>Khách hàng:</b> ${s.customer} &nbsp;|&nbsp; <b>SĐT:</b> ${s.phone || '—'}${s.address ? ' &nbsp;|&nbsp; <b>Địa chỉ:</b> ' + s.address : ''}</div>
+  <div class="customer-box"><b>Khách hàng:</b> ${grp.customer} &nbsp;|&nbsp; <b>SĐT:</b> ${grp.phone || '—'}${grp.address ? ' &nbsp;|&nbsp; <b>Địa chỉ:</b> ' + grp.address : ''}</div>
   <table>
-    <thead><tr><th>Sản phẩm</th><th class="c">ĐVT</th><th class="c">SL</th><th class="r">Đơn giá</th><th class="r">Thành tiền</th></tr></thead>
-    <tbody><tr>
-      <td><b>${s.productName}</b></td><td class="c">${s.unit}</td><td class="c">${s.qty || '—'}</td>
-      <td class="r">${fmt(s.unitPrice)}đ</td><td class="r"><b>${fmt(s.subTotal || 0)}đ</b></td>
-    </tr>
-    ${(s.shipForCustomer && (s.shipFee||0)>0) ? `<tr><td><i>🚚 Phí vận chuyển</i></td><td class="c">—</td><td class="c">—</td><td class="r">—</td><td class="r"><b>${fmt(s.shipFee)}đ</b></td></tr>` : ''}
-    </tbody>
+    <thead><tr><th class="c">STT</th><th>Sản phẩm</th><th class="c">ĐVT</th><th class="c">SL</th><th class="r">Đơn giá</th><th class="r">Thành tiền</th></tr></thead>
+    <tbody>${rowsHTML}${shipRow}</tbody>
   </table>
   <div class="totals">
-    <div>Tạm tính: <b>${fmt(s.subTotal || 0)}đ</b></div>
-    ${s.vatRate > 0 ? '<div>VAT (' + s.vatRate + '%): <b>' + fmt(s.vatAmt || 0) + 'đ</b></div>' : ''}
-    ${(s.shipForCustomer && (s.shipFee||0)>0) ? '<div>Phí vận chuyển: <b>' + fmt(s.shipFee) + 'đ</b></div>' : ''}
-    <div class="total-main">TỔNG CỘNG: ${fmt(s.total)}đ</div>
-    <div class="paid-row">Đã thanh toán: ${fmt(s.paid)}đ</div>
+    <div>Tạm tính: <b>${fmt(sub2)}đ</b></div>
+    ${vat2 > 0 ? '<div>VAT: <b>' + fmt(vat2) + 'đ</b></div>' : ''}
+    ${ship2 > 0 ? '<div>Phí vận chuyển: <b>' + fmt(ship2) + 'đ</b></div>' : ''}
+    <div class="total-main">TỔNG CỘNG: ${fmt(grp.totalGrand)}đ</div>
+    <div class="paid-row">Đã thanh toán: ${fmt(grp.totalPaid)}đ</div>
     ${rem2 > 0 ? '<div class="debt-row">Còn lại: ' + fmt(rem2) + 'đ</div>' : ''}
   </div>
-  ${s.note ? '<div class="note-box">Ghi chú: ' + s.note + '</div>' : ''}
+  ${grp.note ? '<div class="note-box">Ghi chú: ' + grp.note + '</div>' : ''}
   <div class="signatures">
     <div class="sig-box"><div class="sig-title">Đại diện bán hàng</div><div class="sig-note">(Ký, ghi rõ họ tên)</div><div class="sig-name">${S.settings.shopName || 'Đá Tự Nhiên'}</div></div>
-    <div class="sig-box"><div class="sig-title">Khách hàng xác nhận</div><div class="sig-note">(Ký, ghi rõ họ tên)</div><div class="sig-name">${s.customer}</div></div>
+    <div class="sig-box"><div class="sig-title">Khách hàng xác nhận</div><div class="sig-note">(Ký, ghi rõ họ tên)</div><div class="sig-name">${grp.customer}</div></div>
   </div>
   <div class="footer">Cảm ơn quý khách đã tin tưởng sử dụng sản phẩm của chúng tôi!</div>
 </div>
@@ -7420,54 +7499,56 @@ ${autoprint ? '<scr'+'ipt>document.title=" ";var _t=document.title;window.addEve
 
       preview = h('div', {},
         invEl,
-        h('div', { style: { marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' } },
-          // Nút In hoá đơn — mở cửa sổ mới rồi tự động in
-          h('button', { className: 'btn btn-primary', onClick: () => {
-            openPdfMobile(buildInvoiceHTML(s, true), 'Hóa đơn - ' + (s.customer||''));
+        h('div', { style:{ marginTop:12, display:'flex', gap:8, flexWrap:'wrap' } },
+          h('button', { className:'btn btn-primary', onClick: () => {
+            openPdfMobile(buildGroupInvoiceHTML(grp, true), 'Hóa đơn - ' + (grp.customer||''));
           } }, '🖨️ In hoá đơn'),
-          // Nút Xuất PDF — mở cửa sổ mới, người dùng chọn Save as PDF thủ công
-          h('button', { className: 'btn', onClick: () => {
-            openPdfMobile(buildInvoiceHTML(s, false), 'Hóa đơn PDF - ' + (s.customer||''));
+          h('button', { className:'btn', onClick: () => {
+            openPdfMobile(buildGroupInvoiceHTML(grp, false), 'Hóa đơn PDF - ' + (grp.customer||''));
           } }, '📄 Xuất PDF')
         )
       );
     } else {
-      preview = h('div', { className: 'empty', style: { paddingTop: 60 } },
-        h('div', { className: 'empty-icon' }, '📄'),
+      preview = h('div', { className:'empty', style:{ paddingTop:60 } },
+        h('div', { className:'empty-icon' }, '📄'),
         h('div', {}, 'Chọn một đơn hàng để xem hoá đơn')
       );
     }
 
     wrap.innerHTML = '';
     wrap.appendChild(h('div', {},
-      h('div', { className: 'page-header' },
+      h('div', { className:'page-header' },
         h('div', {},
-          h('div', { className: 'page-title' }, 'Hoá Đơn'),
-          h('div', { className: 'page-sub' }, 'Xem và in hoá đơn có VAT')
+          h('div', { className:'page-title' }, 'Hoá Đơn'),
+          h('div', { className:'page-sub' }, 'Xem và in hoá đơn · Nhiều sản phẩm gộp chung')
         )
       ),
-      h('div', { style: { display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-start' } },
-        h('div', { style: { minWidth: '260px', flex: '0 0 280px' } },
-          inp('text', '🔍 Tìm đơn hàng...', search, v => { search = v; rebuild(); }, { style: { marginBottom: 10 } }),
-          h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, maxHeight: '520px', overflowY: 'auto' } },
-            ...filtered.map(s => h('div', {
-              style: { padding: '12px 14px', background: selected?.id === s.id ? 'var(--bg4)' : 'var(--bg2)', border: `1px solid ${selected?.id === s.id ? 'var(--accent)' : 'var(--border)'}`, borderRadius: 'var(--r2)', cursor: 'pointer', transition: 'all .15s' },
-              onClick: () => { selected = s; rebuild(); }
+      h('div', { style:{ display:'flex', gap:16, flexWrap:'wrap', alignItems:'flex-start' } },
+        h('div', { style:{ minWidth:'260px', flex:'0 0 280px' } },
+          inp('text', '🔍 Tìm đơn hàng...', search, v => { search = v; rebuild(); }, { style:{ marginBottom:10 } }),
+          h('div', { style:{ display:'flex', flexDirection:'column', gap:6, maxHeight:'520px', overflowY:'auto' } },
+            ...groups.map(grp => h('div', {
+              style:{ padding:'12px 14px', background: selectedGroup?.groupId === grp.groupId ? 'var(--bg4)' : 'var(--bg2)', border:`1px solid ${selectedGroup?.groupId === grp.groupId ? 'var(--accent)' : 'var(--border)'}`, borderRadius:'var(--r2)', cursor:'pointer', transition:'all .15s' },
+              onClick: () => { selectedGroup = grp; rebuild(); }
             },
-              h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
-                h('span', { style: { fontWeight: 600 } }, s.customer),
-                h('span', { className: 'badge badge-' + (s.status === 'done' ? 'green' : 'red') }, s.status === 'done' ? 'Xong' : 'Nợ')
+              h('div', { style:{ display:'flex', justifyContent:'space-between', alignItems:'center' } },
+                h('span', { style:{ fontWeight:600 } }, grp.customer),
+                h('span', { className:'badge badge-' + (grp.status === 'done' ? 'green' : 'red') }, grp.status === 'done' ? 'Xong' : 'Nợ')
               ),
-              h('div', { style: { fontSize: 11, color: 'var(--text2)', marginTop: 4 } }, s.productName + ' · ' + fmtD(s.date)),
-              h('div', { style: { marginTop: 4, display: 'flex', gap: 8, alignItems: 'center' } },
-                h('span', { style: { fontSize: 12, fontWeight: 700, color: 'var(--accent)' } }, fmt(s.total) + 'đ'),
-                s.vatRate > 0 && h('span', { className: 'badge badge-blue', style: { fontSize: 10 } }, 'VAT ' + s.vatRate + '%')
+              h('div', { style:{ fontSize:11, color:'var(--text2)', marginTop:4 } },
+                grp.items.length > 1
+                  ? grp.items.length + ' sản phẩm · ' + fmtD(grp.date)
+                  : (grp.items[0]?.productName||'') + ' · ' + fmtD(grp.date)
+              ),
+              h('div', { style:{ marginTop:4, display:'flex', gap:8, alignItems:'center' } },
+                h('span', { style:{ fontSize:12, fontWeight:700, color:'var(--accent)' } }, fmt(grp.totalGrand) + 'đ'),
+                grp.items.length > 1 && h('span', { className:'badge badge-blue', style:{ fontSize:10 } }, grp.items.length + ' SP')
               )
             )),
-            filtered.length === 0 && h('div', { className: 'empty' }, 'Không có đơn hàng')
+            groups.length === 0 && h('div', { className:'empty' }, 'Không có đơn hàng')
           )
         ),
-        h('div', { style: { flex: 1, minWidth: '280px' } }, preview)
+        h('div', { style:{ flex:1, minWidth:'280px' } }, preview)
       )
     ));
   };
@@ -7897,7 +7978,7 @@ ${autoprint ? '<scr'+'ipt>document.title=" ";var _t=document.title;window.addEve
         ),
         h('div', { className: 'form-group', style: { minWidth: 90 } },
           h('label', { className: 'form-label' }, 'Đơn vị'),
-          sel([{value:'m²',label:'m²'},{value:'m³',label:'m³'},{value:'tấm',label:'tấm'},{value:'viên',label:'viên'},{value:'lô',label:'lô'},{value:'bộ',label:'bộ'},{value:'cái',label:'cái'}], it.unit, v => { it.unit = v; rebuild(); })
+          sel([{value:'m²',label:'m²'},{value:'m³',label:'m³'},{value:'tấm',label:'tấm'},{value:'viên',label:'viên'},{value:'lô',label:'lô'},{value:'bộ',label:'bộ'},{value:'cái',label:'cái'},{value:'bao',label:'bao'}], it.unit, v => { it.unit = v; rebuild(); })
         ),
         h('div', { className: 'form-group', style: { minWidth: 90 } },
           h('label', { className: 'form-label' }, 'Số lượng'),
@@ -11210,10 +11291,10 @@ function pgSearch() {
     const idx = text.toLowerCase().indexOf(kw.toLowerCase());
     if (idx < 0) return text;
     const span = document.createElement('span');
-    span.innerHTML = text.slice(0,idx) +
+    span.innerHTML = escHtml(text.slice(0,idx)) +
       '<mark style="background:rgba(201,168,76,.4);color:var(--text);border-radius:2px;padding:0 2px">' +
-      text.slice(idx, idx+kw.length) + '</mark>' +
-      text.slice(idx+kw.length);
+      escHtml(text.slice(idx, idx+kw.length)) + '</mark>' +
+      escHtml(text.slice(idx+kw.length));
     return span;
   }
 
