@@ -385,6 +385,16 @@ const CLOUD = (() => {
     });
     return Object.values(map).filter(r => !r._deleted);
   }
+  // ── _stockTx: tập id giao dịch (sales/imports/returns) ĐÃ được cộng/trừ
+  // vào field stock của sản phẩm này. Dùng để hoà giải tồn kho khi 2 thiết bị
+  // cùng bán/nhập SP này lúc offline — xem applyLedgerToStock() bên dưới.
+  // Giới hạn 300 id gần nhất/sản phẩm để tránh phình dữ liệu (đủ dư cho mọi
+  // phiên offline thực tế của một cửa hàng nhỏ).
+  const STOCK_TX_CAP = 300;
+  function unionStockTx(a, b) {
+    const merged = [...new Set([...(a || []), ...(b || [])])];
+    return merged.length > STOCK_TX_CAP ? merged.slice(merged.length - STOCK_TX_CAP) : merged;
+  }
   // Sau đó deduplicate theo tên — tránh tình trạng 2 thiết bị tạo cùng SP offline
   function mergeProducts(local, cloudDocs) {
     const map = {};
@@ -396,18 +406,28 @@ const CLOUD = (() => {
       } else {
         const localTs = safeTs(map[p.id]._updated || '');
         const cloudTs = safeTs(p._updated || '');
+        // Luôn hợp nhất _stockTx của cả 2 bên — bên thua vẫn có giao dịch riêng
+        // (sales/imports đã tạo lúc offline) cần được hoà giải bù vào stock
+        const mergedTx = unionStockTx(map[p.id]._stockTx, p._stockTx);
         // _deleted chỉ thắng khi cloud thực sự mới hơn local (dùng > không >=)
         if (p._deleted) {
-          if (cloudTs > localTs) map[p.id] = p;
+          if (cloudTs > localTs) map[p.id] = { ...p, _stockTx: mergedTx };
+          else map[p.id] = { ...map[p.id], _stockTx: mergedTx };
           // else: local update mới hơn hoặc bằng lệnh xóa → giữ local
-        } else if (cloudTs > localTs) { map[p.id] = p; }
+        } else if (cloudTs > localTs) { map[p.id] = { ...p, _stockTx: mergedTx }; }
+        else { map[p.id] = { ...map[p.id], _stockTx: mergedTx }; }
         // local mới hơn → giữ nguyên, sẽ push lên cloud
       }
     });
     // ── Deduplicate theo tên (normalize: lowercase + trim) ──────
-    // Nếu 2 sản phẩm cùng tên → giữ bản có _updated mới hơn, loại bản kia
-    // (không merge stock vì stock đã được cập nhật theo phiếu nhập/bán)
+    // Nếu 2 sản phẩm cùng tên (ví dụ 2 thiết bị tạo cùng SP offline) → giữ 1
+    // bản, CỘNG DỒN stock của bản bị loại vào bản còn lại (giống nút "Gộp SP
+    // trùng" thủ công) — KHÔNG được lặng lẽ vứt bỏ stock của bản thua, vì đó
+    // chính là tồn kho thật của hàng đã nhập. reroutes trả về để caller
+    // (applyCloudData) chuyển phiếu nhập/bán/trả của bản bị loại sang bản còn
+    // lại, nếu không các phiếu đó sẽ bị "treo" vào 1 productId không còn tồn tại.
     const byName = {};
+    const reroutes = []; // { loserId, winnerId }
     Object.values(map).forEach(p => {
       const key = (p.name || '').trim().toLowerCase();
       if (!key) return;
@@ -417,27 +437,83 @@ const CLOUD = (() => {
         // Giữ bản mới hơn theo _updated; safeTs() loại bỏ clock skew thiết bị
         const existTs = safeTs(byName[key]._updated || byName[key].createdAt || '');
         const newTs   = safeTs(p._updated || p.createdAt || '');
+        const mergedTx = unionStockTx(byName[key]._stockTx, p._stockTx);
         // _deleted chỉ thắng khi timestamp xóa THỰC SỰ MỚI HƠN (dùng > không >=)
         if (p._deleted && !byName[key]._deleted) {
-          if (newTs > existTs) byName[key] = p; // xóa thắng chỉ khi THỰC SỰ mới hơn
+          if (newTs > existTs) byName[key] = { ...p, _stockTx: mergedTx }; // xóa thắng chỉ khi THỰC SỰ mới hơn
+          else byName[key] = { ...byName[key], _stockTx: mergedTx };
         } else if (!p._deleted && byName[key]._deleted) {
           // Bản sống thắng khi mới hơn hoặc bằng lệnh xóa — đây là fix bug chính
           // (trước đây code giữ _deleted, gây mất sản phẩm khi tạo lại cùng tên)
-          if (newTs >= existTs) byName[key] = p;
+          if (newTs >= existTs) byName[key] = { ...p, _stockTx: mergedTx };
+          else byName[key] = { ...byName[key], _stockTx: mergedTx };
+        } else if (!p._deleted && !byName[key]._deleted) {
+          // Cả 2 còn sống và cùng tên thật → ĐÂY LÀ 2 SẢN PHẨM TRÙNG, không phải
+          // 1 cái bị xoá — gộp: giữ bản mới hơn làm "winner", cộng dồn stock,
+          // ghi nhận reroute để chuyển phiếu nhập/bán/trả sang winner.id
+          const winner = newTs > existTs ? p : byName[key];
+          const loser  = newTs > existTs ? byName[key] : p;
+          const totalStock = (parseFloat(winner.stock) || 0) + (parseFloat(loser.stock) || 0);
+          if (loser.id !== winner.id) reroutes.push({ loserId: loser.id, winnerId: winner.id, winnerName: winner.name });
+          byName[key] = { ...winner, stock: totalStock, _stockTx: mergedTx };
         } else if (newTs > existTs) {
-          // Bản mới hơn thắng — chỉ kế thừa stock khi cả 2 chưa bị xóa và bản mới = 0
-          const winnerStock = (!p._deleted && (p.stock || 0) === 0)
-            ? (byName[key].stock || 0) : (p.stock || 0);
-          byName[key] = { ...p, stock: winnerStock };
+          byName[key] = { ...p, _stockTx: mergedTx };
         } else {
-          // Bản cũ thắng
-          const winnerStock = (!byName[key]._deleted && (byName[key].stock || 0) === 0)
-            ? (p.stock || 0) : (byName[key].stock || 0);
-          byName[key] = { ...byName[key], stock: winnerStock };
+          byName[key] = { ...byName[key], _stockTx: mergedTx };
         }
       }
     });
-    return Object.values(byName).filter(p => !p._deleted);
+    return { products: Object.values(byName).filter(p => !p._deleted), reroutes };
+  }
+  // ── Hoà giải tồn kho khi 2 thiết bị cùng bán/nhập/trả 1 SP lúc offline ──
+  // Ý tưởng: mỗi sản phẩm giữ _stockTx = tập id giao dịch ĐÃ phản ánh trong
+  // field stock của nó. Khi nhận thêm sales/imports/returns mới từ cloud,
+  // chỉ giao dịch nào CHƯA có trong _stockTx của sản phẩm mới được cộng/trừ
+  // bù vào stock — tránh (a) MẤT giao dịch của thiết bị thua trong merge
+  // last-write-wins, và (b) đếm TRÙNG giao dịch đã có sẵn trong stock từ
+  // trước (ví dụ lần đầu 2 thiết bị từng dùng độc lập giờ mới nối cloud).
+  function applyLedgerToStock(stateKey, newRecords) {
+    if (!window._S || newRecords.length === 0) return;
+    const S = window._S;
+    const sign = stateKey === 'sales' ? -1 : 1; // imports/returns: +, sales: -
+    const byProduct = {}; // productId -> { stockDelta, variantDeltas, txIds }
+    newRecords.forEach(r => {
+      if (!r || !r.id || !r.productId) return;
+      const prod = (S.products || []).find(p => p.id === r.productId);
+      if (prod && (prod._stockTx || []).includes(r.id)) return; // đã hoà giải rồi
+      const qty = stateKey === 'returns' ? (parseFloat(r.returnQty) || 0) : (parseFloat(r.qty) || 0);
+      if (!qty) return;
+      if (!byProduct[r.productId]) byProduct[r.productId] = { stockDelta: 0, variantDeltas: {}, txIds: [] };
+      byProduct[r.productId].stockDelta += sign * qty;
+      byProduct[r.productId].txIds.push(r.id);
+      if (stateKey !== 'returns' && r.variantId) {
+        const vd = byProduct[r.productId].variantDeltas;
+        vd[r.variantId] = (vd[r.variantId] || 0) + sign * qty;
+      }
+    });
+    if (Object.keys(byProduct).length === 0) return;
+    const reconciled = [];
+    S.products = (S.products || []).map(p => {
+      const d = byProduct[p.id];
+      if (!d) return p;
+      const newStock = (parseFloat(p.stock) || 0) + d.stockDelta;
+      const newVariants = (p.variants || []).map(vt => {
+        const vAdd = d.variantDeltas[vt.id];
+        if (!vAdd) return vt;
+        const ppm2 = (vt.tileW > 0 && vt.tileH > 0) ? 10000 / (vt.tileW * vt.tileH) : 0;
+        const newM2 = (vt.stockM2 || 0) + vAdd;
+        return { ...vt, stockM2: newM2, stockPieces: ppm2 > 0 ? Math.round(newM2 * ppm2) : (vt.stockPieces || 0) + Math.round(vAdd * (ppm2 || 0)) };
+      });
+      const updated = { ...p, stock: newStock, variants: newVariants, _stockTx: unionStockTx(p._stockTx, d.txIds) };
+      reconciled.push(updated);
+      return updated;
+    });
+    try { if (typeof DB !== 'undefined') DB.set('dtn_products', S.products); } catch(e) {}
+    // Đẩy CHỈ những sản phẩm vừa hoà giải lên cloud (không đẩy cả mảng — tốn write quota)
+    // để thiết bị khác cũng thấy số tồn đã đúng, không phải chờ tới lần save() kế tiếp
+    if (reconciled.length > 0 && _db && _cfg?.enabled) {
+      pushCollection('dtn_products', reconciled).catch(e => console.warn('[CLOUD] push reconciled stock error:', e));
+    }
   }
   function applyCloudData(colName, cloudDocs, skipRender) {
     if (!window._S) return;
@@ -498,21 +574,70 @@ const CLOUD = (() => {
         } catch(e) {}
       }
     } else if (stateKey === 'settings') {
+      // QUAN TRỌNG: chỉ áp cloud nếu cloud THỰC SỰ mới hơn local (so _updated).
+      // Trước đây code áp cloud vô điều kiện → sửa cài đặt offline rồi mở lại
+      // app sẽ bị cloud (dữ liệu cũ) ghi đè mất, và bản cũ đó còn bị push
+      // ngược lên cloud xoá luôn thay đổi trên mọi thiết bị.
       if (cloudDocs.length > 0) {
-        const merged = { ...S.settings, ...cloudDocs[0] };
-        delete merged.id; delete merged._updated;
-        const before = JSON.stringify(S.settings);
-        S.settings = merged;
-        if (JSON.stringify(S.settings) !== before) changed = true;
+        const cloudDoc = cloudDocs[0];
+        const localTs = safeTs(S.settings && S.settings._updated || '');
+        const cloudTs = safeTs(cloudDoc._updated || '');
+        if (!localTs || cloudTs > localTs) {
+          const merged = { ...S.settings, ...cloudDoc };
+          delete merged.id;
+          merged._updated = cloudTs;
+          const before = JSON.stringify(S.settings);
+          S.settings = merged;
+          if (JSON.stringify(S.settings) !== before) changed = true;
+        }
+        // else: local mới hơn hoặc bằng → giữ local, save() sẽ push lại cloud sau
       }
     } else if (stateKey === 'products') {
       const before = JSON.stringify(S.products);
-      S.products = mergeProducts(S.products, cloudDocs);
+      const { products: mergedProducts, reroutes } = mergeProducts(S.products, cloudDocs);
+      S.products = mergedProducts;
       if (JSON.stringify(S.products) !== before) changed = true;
+      _seedLastPushed(stateKey, S.products);
+      // ── Xử lý 2 SP cùng tên bị gộp: chuyển phiếu nhập/bán/trả của bản bị
+      // loại sang bản còn lại + xoá tombstone bản bị loại trên cloud — nếu
+      // không làm bước này, phiếu cũ sẽ "treo" vào 1 productId không còn tồn
+      // tại (mất theo dõi tồn kho) và bản bị loại có thể quay lại ở lần sync sau.
+      if (reroutes.length > 0) {
+        const _mergeNow = new Date().toISOString();
+        const lossIds = new Set(reroutes.map(r => r.loserId));
+        const nameById = {}; reroutes.forEach(r => { nameById[r.loserId] = r.winnerName; nameById[r.winnerId] = r.winnerName; });
+        const winnerIdOf = {}; reroutes.forEach(r => { winnerIdOf[r.loserId] = r.winnerId; });
+        ['imports','sales','returns'].forEach(k => {
+          const reroutedRecs = [];
+          S[k] = (S[k] || []).map(r => {
+            if (!lossIds.has(r.productId)) return r;
+            const updated = { ...r, productId: winnerIdOf[r.productId], productName: nameById[r.productId] || r.productName, _updated: _mergeNow };
+            reroutedRecs.push(updated);
+            return updated;
+          });
+          if (reroutedRecs.length > 0) {
+            try { DB.set('dtn_' + k, S[k]); } catch(e) {}
+            // Chỉ đẩy CÁC BẢN GHI vừa reroute lên cloud — không đẩy cả mảng (tốn write quota)
+            CLOUD.push('dtn_' + k, reroutedRecs);
+            _seedLastPushed(k, reroutedRecs); // tránh save() sau này đẩy lại lần nữa
+          }
+        });
+        // Đẩy tombstone _deleted cho các bản bị loại lên cloud, để chúng không
+        // "sống lại" ở lần đồng bộ kế tiếp (mergeProducts sẽ gộp lại lần nữa)
+        const deletedLosers = reroutes.map(r => ({ id: r.loserId, _deleted: true, _updated: _mergeNow }));
+        if (typeof CLOUD !== 'undefined' && CLOUD._pushDeletedRecord) CLOUD._pushDeletedRecord('dtn_products', deletedLosers);
+      }
     } else {
       const before = JSON.stringify(S[stateKey]);
       S[stateKey] = mergeAppendOnly(S[stateKey], cloudDocs);
       if (JSON.stringify(S[stateKey]) !== before) changed = true;
+      _seedLastPushed(stateKey, S[stateKey]);
+      // Hoà giải tồn kho cho giao dịch thực sự mới (xem applyLedgerToStock).
+      // applyLedgerToStock tự bỏ qua giao dịch đã có trong _stockTx của SP
+      // nên gọi với TOÀN BỘ cloudDocs (không chỉ phần mới) vẫn an toàn.
+      if (stateKey === 'sales' || stateKey === 'imports' || stateKey === 'returns') {
+        applyLedgerToStock(stateKey, cloudDocs.filter(r => r && !r._deleted));
+      }
     }
 
     if (changed) {
@@ -949,6 +1074,9 @@ const CLOUD = (() => {
     markDownloaded,
     getRotatingBackup,
     getRotatingBackupTime,
+    // Dùng ở các nơi tạo sales/imports/returns để đánh dấu _stockTx
+    // (xem applyLedgerToStock) — tránh hoà giải tồn kho đếm trùng giao dịch
+    unionStockTx,
   };
 })();
 // ═══════════════════════════════════════════════════════════════
@@ -1169,6 +1297,15 @@ const AUTH = (() => {
       // Dừng realtime listeners và xóa sync queue pending khi đăng xuất
       if (window.CLOUD) { try { window.CLOUD.stopListeners(); } catch(e) {} }
       try { sessionStorage.removeItem('dtn_sync_queue'); } catch(e) {}
+      // Dọn heartbeat interval + visibilitychange listener của session vừa đăng xuất
+      // (nếu không, đăng nhập lại sẽ tạo bản mới trong khi bản cũ vẫn còn sống)
+      try {
+        if (typeof _hbIv !== 'undefined' && _hbIv) { clearInterval(_hbIv); _hbIv = null; }
+        if (typeof _visibilityHandler !== 'undefined' && _visibilityHandler) {
+          document.removeEventListener('visibilitychange', _visibilityHandler);
+          _visibilityHandler = null;
+        }
+      } catch(e) {}
     },
     currentUser() { return getSession(); },
     isAdmin() { const u = getSession(); return u && u.role === 'admin'; },
@@ -1818,6 +1955,13 @@ function openPdfMobile(htmlContent, filename) {
   }
 }
 
+// ── Theo dõi heartbeat interval + visibilitychange handler toàn cục ──
+// bootApp() chạy lại mỗi lần đăng nhập (đăng xuất rồi đăng nhập lại trong
+// cùng tab) — nếu không dọn cái cũ, interval/listener sẽ CHỒNG CHẤT, gây
+// flush/restart listener Firestore trùng lặp nhiều lần mỗi khi đổi tab.
+let _hbIv = null;
+let _visibilityHandler = null;
+
 async function bootApp() {
   _raf = false;
   const root = document.getElementById('app');
@@ -1853,21 +1997,26 @@ async function bootApp() {
     if (cloudCfg.enabled) {
       setTimeout(() => {
         CLOUD.startListeners();
+        // Dọn heartbeat/listener của lần đăng nhập trước (nếu có) — tránh
+        // chồng chất interval/listener khi đăng xuất rồi đăng nhập lại
+        if (_hbIv) clearInterval(_hbIv);
+        if (_visibilityHandler) document.removeEventListener('visibilitychange', _visibilityHandler);
         // Heartbeat nhẹ: chỉ flush queue tồn đọng — onSnapshot đã xử lý realtime
         // Không bootSync lại (tránh đọc Firestore ~8 collection mỗi 30s = 240 reads/phút)
-        let _hbIv = setInterval(() => {
+        _hbIv = setInterval(() => {
           if (!document.hidden && AUTH.currentUser() && navigator.onLine) {
             try { CLOUD.flushPending(); } catch(e) {}
           }
         }, 60000);
         // Khi app quay lại foreground: restart listener + chỉ flush queue offline
-        document.addEventListener('visibilitychange', () => {
+        _visibilityHandler = () => {
           if (!document.hidden && AUTH.currentUser() && cloudCfg.enabled) {
             CLOUD.stopListeners();
             CLOUD.startListeners();
             setTimeout(() => { try { CLOUD.flushPending(); } catch(e) {} }, 300);
           }
-        });
+        };
+        document.addEventListener('visibilitychange', _visibilityHandler);
       }, 500);
     }
   }, 1000);
@@ -1918,11 +2067,17 @@ function resetAutoLogoutTimer() {
   }, AUTO_LOGOUT_MS);
 }
 
+let _autoLogoutListenersBound = false;
 function startAutoLogoutTimer() {
-  // Reset timer khi có tương tác
-  ['click','keydown','touchstart','mousemove','scroll'].forEach(evt => {
-    document.addEventListener(evt, resetAutoLogoutTimer, { passive: true });
-  });
+  // Reset timer khi có tương tác — chỉ gắn listener MỘT LẦN cho cả vòng đời
+  // trang. Hàm này được gọi lại mỗi lần đăng nhập, nếu không guard thì mỗi
+  // lần đăng xuất/đăng nhập lại sẽ cộng thêm 5 listener trùng lặp trên document.
+  if (!_autoLogoutListenersBound) {
+    _autoLogoutListenersBound = true;
+    ['click','keydown','touchstart','mousemove','scroll'].forEach(evt => {
+      document.addEventListener(evt, resetAutoLogoutTimer, { passive: true });
+    });
+  }
   resetAutoLogoutTimer(); // bắt đầu đếm ngay
 }
 
@@ -2212,17 +2367,59 @@ const S = {
   _toastTimer: null
 };
 
+// ── Migrate một lần: seed _stockTx từ lịch sử sales/imports/returns hiện có ──
+// QUAN TRỌNG: phải chạy TRƯỚC lần bootSync/listener đầu tiên. Nếu không, mọi
+// giao dịch cũ (đã nằm trong stock từ trước) sẽ bị applyLedgerToStock() coi
+// là "giao dịch mới" và cộng/trừ ĐÈ THÊM lên stock hiện có → sai lệch tồn kho
+// ngay lần đồng bộ đầu tiên sau khi cập nhật code này.
+(function seedStockTxOnce() {
+  let touched = false;
+  S.products = (S.products || []).map(p => {
+    if (Array.isArray(p._stockTx)) return p; // sản phẩm tạo sau khi có _stockTx rồi
+    const ids = [];
+    (S.sales || []).forEach(s => { if (s.productId === p.id) ids.push(s.id); });
+    (S.imports || []).forEach(i => { if (i.productId === p.id) ids.push(i.id); });
+    (S.returns || []).forEach(r => { if (r.productId === p.id) ids.push(r.id); });
+    touched = true;
+    return { ...p, _stockTx: ids.slice(-300) };
+  });
+  if (touched) { try { DB.set('dtn_products', S.products); } catch(e) {} }
+})();
+
+// ── Theo dõi _updated đã push lần trước cho mỗi id, để chỉ push
+//    bản ghi THỰC SỰ thay đổi — tránh ghi đè lại toàn bộ mảng lên
+//    Firestore mỗi lần save() (tốn write quota + băng thông không cần thiết)
+const _lastPushed = {};
+// Đánh dấu các bản ghi vừa nhận từ cloud (qua bootSync/listener) là "đã đồng bộ"
+// — nếu không, lần save() local tiếp theo sẽ tưởng chúng "thay đổi" (vì _lastPushed
+// chưa biết) và đẩy ngược lên Firestore dữ liệu vốn đã lấy TỪ Firestore — ghi thừa.
+function _seedLastPushed(key, arr) {
+  const seen = _lastPushed[key] || (_lastPushed[key] = {});
+  (arr || []).forEach(r => { if (r && r.id) seen[r.id] = r._updated; });
+}
 function save(key) {
   const map = {products:'dtn_products',imports:'dtn_imports',sales:'dtn_sales',shipping:'dtn_shipping',settings:'dtn_settings',returns:'dtn_returns',paymentlogs:'dtn_paymentlogs',cashflows:'dtn_cashflows'};
   const colName = map[key];
 
-  // ── Firebase-first: push ngay lên Firestore ──────────────────
+  // ── Firebase-first: chỉ push các bản ghi thực sự thay đổi ─────
   // localStorage chỉ là cache tạm — nguồn dữ liệu chính là Firebase
   if (typeof CLOUD !== 'undefined' && colName && CLOUD.getCfg().enabled) {
-    const data = key === 'settings'
-      ? [{ id: 'settings', ...S[key] }]
-      : (S[key] || []);
-    CLOUD.push(colName, data);
+    if (key === 'settings') {
+      CLOUD.push(colName, [{ id: 'settings', ...S[key] }]);
+    } else {
+      const arr = S[key] || [];
+      const seen = _lastPushed[key] || (_lastPushed[key] = {});
+      const changed = arr.filter(r => r && r.id && seen[r.id] !== r._updated);
+      if (changed.length > 0) {
+        CLOUD.push(colName, changed);
+        changed.forEach(r => { seen[r.id] = r._updated; });
+      }
+      // Dọn id đã bị xoá khỏi mảng khỏi bộ nhớ theo dõi (softDelete tự push riêng)
+      if (arr.length !== Object.keys(seen).length) {
+        const aliveIds = new Set(arr.map(r => r.id));
+        Object.keys(seen).forEach(id => { if (!aliveIds.has(id)) delete seen[id]; });
+      }
+    }
   }
 
   // ── Cache vào localStorage (để hoạt động offline & boot nhanh) ──
@@ -2252,19 +2449,21 @@ function save(key) {
 function softDelete(arrayKey, id, extraFn) {
   const now = new Date().toISOString();
   if (!S[arrayKey]) return;
-  // Tạo bản _deleted để push lên cloud trước khi filter
-  const withDeleted = S[arrayKey].map(r => r.id === id ? { ...r, _deleted: true, _updated: now } : r);
+  // Tạo bản _deleted của riêng record bị xoá để push lên cloud
+  const deletedRecord = S[arrayKey].find(r => r.id === id);
   // Lọc sạch local NGAY LẬP TỨC để UI phản ánh đúng
-  S[arrayKey] = withDeleted.filter(r => !r._deleted);
+  S[arrayKey] = S[arrayKey].filter(r => r.id !== id);
   const dbMap = {products:'dtn_products',imports:'dtn_imports',sales:'dtn_sales',shipping:'dtn_shipping',returns:'dtn_returns',paymentlogs:'dtn_paymentlogs',cashflows:'dtn_cashflows'};
   if (dbMap[arrayKey]) DB.set(dbMap[arrayKey], S[arrayKey]);
   if (typeof extraFn === 'function') extraFn();
-  // Push lên cloud: dùng withDeleted (có _deleted:true) để thiết bị khác nhận lệnh xóa
-  if (typeof CLOUD !== 'undefined' && CLOUD._pushDeletedRecord) {
-    CLOUD._pushDeletedRecord(dbMap[arrayKey], withDeleted);
-  } else if (typeof CLOUD !== 'undefined') {
-    // Fallback: push withDeleted để cloud nhận lệnh xóa
-    CLOUD.push(dbMap[arrayKey], withDeleted);
+  // Push CHỈ record bị xoá lên cloud (không push lại toàn bộ mảng — tốn write quota)
+  if (deletedRecord) {
+    const withDeleted = [{ ...deletedRecord, _deleted: true, _updated: now }];
+    if (typeof CLOUD !== 'undefined' && CLOUD._pushDeletedRecord) {
+      CLOUD._pushDeletedRecord(dbMap[arrayKey], withDeleted);
+    } else if (typeof CLOUD !== 'undefined') {
+      CLOUD.push(dbMap[arrayKey], withDeleted);
+    }
   }
 }
 
@@ -4561,7 +4760,7 @@ function openProduct(prod, rebuild) {
           variants: f.multiVariant ? f.variants : [] };
         const nowIso = new Date().toISOString();
         if (prod) { S.products = S.products.map(x => x.id === prod.id ? { ...x, ...p, _updated: nowIso } : x); toast('Đã cập nhật sản phẩm', 'success'); }
-        else { S.products = [...S.products, { ...p, id: 'p' + uid(), createdAt: nowIso, _updated: nowIso }]; toast('Đã thêm sản phẩm mới', 'success'); }
+        else { S.products = [...S.products, { ...p, id: 'p' + uid(), createdAt: nowIso, _updated: nowIso, _stockTx: [] }]; toast('Đã thêm sản phẩm mới', 'success'); }
         save('products'); S.modal = null; rebuild(); render();
       } }, '💾 Lưu')
     ]
@@ -4659,14 +4858,16 @@ function pgImports() {
                 if (i.qty > 0) {
                   S.products = S.products.map(p => {
                     if (p.id !== i.productId) return p;
-                    const newStock = p.stock - i.qty;
+                    const newStock = (parseFloat(p.stock)||0) - i.qty;
                     const newVariants = (p.variants || []).map(vt => {
                       if (!i.variantId || vt.id !== i.variantId) return vt;
                       const ppm2 = (vt.tileW > 0 && vt.tileH > 0) ? 10000 / (vt.tileW * vt.tileH) : 0;
                       const newM2 = (vt.stockM2 || 0) - i.qty;
                       return { ...vt, stockM2: newM2, stockPieces: ppm2 > 0 ? Math.round(newM2 * ppm2) : (vt.stockPieces || 0) - Math.round(i.qty * (ppm2 || 0)) };
                     });
-                    return { ...p, stock: newStock, variants: newVariants, _updated: new Date().toISOString() };
+                    // Xoá txId khỏi _stockTx để applyLedgerToStock không áp lại khi sync cloud
+                    const newStockTx = (p._stockTx || []).filter(txId => txId !== i.id);
+                    return { ...p, stock: newStock, variants: newVariants, _stockTx: newStockTx, _updated: new Date().toISOString() };
                   });
                 }
                 save('products');
@@ -5383,8 +5584,7 @@ function openImport(existing, rebuild, prefillProduct) {
           S.products = S.products.map(p => {
             // Nếu đổi sang sản phẩm khác: revert stock sản phẩm cũ
             if (prodChanged && p.id === oldProdId) {
-              const ppm2old = 0; // dùng chung logic variants bên dưới
-              let revertStock = p.stock - oldQty;
+              let revertStock = (parseFloat(p.stock)||0) - oldQty;
               let revertVariants = (p.variants || []).map(vt => {
                 if (!oldVtId || vt.id !== oldVtId) return vt;
                 const ppm2 = (vt.tileW > 0 && vt.tileH > 0) ? 10000/(vt.tileW*vt.tileH) : 0;
@@ -5396,8 +5596,8 @@ function openImport(existing, rebuild, prefillProduct) {
             if (p.id !== newProdId) return p;
             // Sản phẩm mới (hoặc không đổi): tính delta
             let newStock = prodChanged
-              ? p.stock + newQty                    // Sản phẩm mới: chỉ cộng thêm
-              : p.stock - oldQty + newQty;          // Cùng sản phẩm: +delta
+              ? (parseFloat(p.stock)||0) + newQty                    // Sản phẩm mới: chỉ cộng thêm
+              : (parseFloat(p.stock)||0) - oldQty + newQty;          // Cùng sản phẩm: +delta
             let newVariants = (p.variants || []).map(vt => {
               const ppm2 = (vt.tileW > 0 && vt.tileH > 0) ? 10000/(vt.tileW*vt.tileH) : 0;
               if (!prodChanged) {
@@ -5502,9 +5702,10 @@ function openImport(existing, rebuild, prefillProduct) {
             const it = importItems[idx];
             const calc = itemCalcs[idx];
             const vtId = it._vtSelId || '';
-            if (!stockDelta[it.productId]) stockDelta[it.productId] = { stockAdd: 0, variantDeltas: {}, lastPrice: calc.price };
+            if (!stockDelta[it.productId]) stockDelta[it.productId] = { stockAdd: 0, variantDeltas: {}, lastPrice: calc.price, txIds: [] };
             stockDelta[it.productId].stockAdd += calc.qty;
             stockDelta[it.productId].lastPrice = calc.price;
+            stockDelta[it.productId].txIds.push(rec.id);
             if (vtId) {
               if (!stockDelta[it.productId].variantDeltas[vtId]) stockDelta[it.productId].variantDeltas[vtId] = 0;
               stockDelta[it.productId].variantDeltas[vtId] += calc.qty;
@@ -5513,7 +5714,7 @@ function openImport(existing, rebuild, prefillProduct) {
           S.products = S.products.map(p => {
             const delta = stockDelta[p.id];
             if (!delta) return p;
-            const newStock = p.stock + delta.stockAdd;
+            const newStock = (parseFloat(p.stock) || 0) + delta.stockAdd;
             const newVariants = (p.variants || []).map(vt => {
               const vtAdd = delta.variantDeltas[vt.id];
               if (!vtAdd) return vt;
@@ -5521,7 +5722,10 @@ function openImport(existing, rebuild, prefillProduct) {
               const newM2 = (vt.stockM2||0) + vtAdd;
               return { ...vt, stockM2: newM2, stockPieces: ppm2 > 0 ? Math.round(newM2 * ppm2) : (vt.stockPieces||0) };
             });
-            return { ...p, stock: newStock, buyPrice: delta.lastPrice, variants: newVariants, _updated: new Date().toISOString() };
+            // _stockTx: đánh dấu các phiếu nhập này ĐÃ phản ánh vào stock — để
+            // hoà giải đa thiết bị (applyLedgerToStock) không cộng trùng lần sau
+            return { ...p, stock: newStock, buyPrice: delta.lastPrice, variants: newVariants, _updated: new Date().toISOString(),
+              _stockTx: CLOUD.unionStockTx(p._stockTx, delta.txIds) };
           });
 
           S.imports = [...newRecs, ...S.imports];
@@ -6044,14 +6248,16 @@ return h('tr', {},
                           if (qtyToRestore > 0) {
                             S.products = S.products.map(p => {
                               if (p.id !== s.productId) return p;
-                              const newStock = p.stock + qtyToRestore;
+                              const newStock = (parseFloat(p.stock)||0) + qtyToRestore;
                               const newVariants = (p.variants||[]).map(vt => {
                                 if (!s.variantId || vt.id !== s.variantId) return vt;
                                 const ppm2=(vt.tileW>0&&vt.tileH>0)?10000/(vt.tileW*vt.tileH):0;
                                 const newM2=(vt.stockM2||0)+qtyToRestore;
                                 return {...vt, stockM2:newM2, stockPieces:ppm2>0?Math.round(newM2*ppm2):(vt.stockPieces||0)+Math.round(qtyToRestore*(ppm2||0))};
                               });
-                              return {...p, stock:newStock, variants:newVariants, _updated: new Date().toISOString()};
+                              // Xoá txId đơn bán khỏi _stockTx để applyLedgerToStock không áp lại khi sync cloud
+                              const newStockTx = (p._stockTx || []).filter(txId => txId !== s.id);
+                              return {...p, stock:newStock, variants:newVariants, _stockTx:newStockTx, _updated: new Date().toISOString()};
                             });
                           }
 
@@ -6060,8 +6266,10 @@ return h('tr', {},
                             linkedReturns.forEach(r => {
                               S.products = S.products.map(p => {
                                 if (p.id !== r.productId) return p;
-                                const newStock = p.stock - r.returnQty;
-                                return {...p, stock: newStock, _updated: new Date().toISOString()};
+                                const newStock = (parseFloat(p.stock)||0) - (parseFloat(r.returnQty)||0);
+                                // Xoá txId phiếu trả khỏi _stockTx
+                                const newStockTx = (p._stockTx || []).filter(txId => txId !== r.id);
+                                return {...p, stock: newStock, _stockTx: newStockTx, _updated: new Date().toISOString()};
                               });
                             });
                             // Soft-delete phiếu trả liên kết
@@ -6671,8 +6879,9 @@ function openSale(rebuild, preselectedProduct) {
         const stockDeduct = {};
         saleItems.forEach((it,idx) => {
           const calc = itemCalcs2[idx];
-          if(!stockDeduct[it.productId]) stockDeduct[it.productId]={stockMinus:0, variantDeltas:{}};
+          if(!stockDeduct[it.productId]) stockDeduct[it.productId]={stockMinus:0, variantDeltas:{}, txIds:[]};
           stockDeduct[it.productId].stockMinus += calc.qty;
+          stockDeduct[it.productId].txIds.push(newRecs2[idx].id);
           if(it.variantId){
             if(!stockDeduct[it.productId].variantDeltas[it.variantId]) stockDeduct[it.productId].variantDeltas[it.variantId]=0;
             stockDeduct[it.productId].variantDeltas[it.variantId] += calc.qty;
@@ -6687,7 +6896,10 @@ function openSale(rebuild, preselectedProduct) {
             const newM2=(vt.stockM2||0)-vtMinus; // cho phép âm kho
             return {...vt, stockM2:newM2, stockPieces:ppm2>0?Math.round(newM2*ppm2):(vt.stockPieces||0)-Math.round(vtMinus*(ppm2||0))};
           });
-          return {...p, stock:newStock, variants:newVariants, _updated: new Date().toISOString()};
+          // _stockTx: đánh dấu các đơn bán này ĐÃ phản ánh vào stock — hoà giải
+          // đa thiết bị (applyLedgerToStock) sẽ không trừ trùng lần sau
+          return {...p, stock:newStock, variants:newVariants, _updated: new Date().toISOString(),
+            _stockTx: CLOUD.unionStockTx(p._stockTx, d.txIds)};
         });
 
         S.sales=[...newRecs2, ...S.sales];
@@ -9901,7 +10113,7 @@ function pgSettings() {
         fg('Mã số thuế', null, inp('text', '', f.taxId, v => f.taxId = v))
       ),
       h('div', { style: { marginTop: 16 } },
-        h('button', { className: 'btn btn-primary', onClick: () => { S.settings = { ...f }; save('settings'); toast('Đã lưu cài đặt', 'success'); render(); } }, '💾 Lưu cài đặt')
+        h('button', { className: 'btn btn-primary', onClick: () => { S.settings = { ...f, _updated: new Date().toISOString() }; save('settings'); toast('Đã lưu cài đặt', 'success'); render(); } }, '💾 Lưu cài đặt')
       )
     ),
     h('div', { className: 'card', style: { maxWidth: '580px' } },
@@ -10378,7 +10590,7 @@ function pgReturns() {
                         msg: `Xoá phiếu trả hàng của "${r.customer}" (${fmtQty(r.returnQty)} ${r.unit} ${r.productName})?\n\n⚠️ Hàng sẽ bị lấy lại ra khỏi kho và doanh thu đơn gốc sẽ được khôi phục.`,
                         onYes: () => {
                           // Hoàn tác: trừ lại hàng khỏi kho (vì khi tạo phiếu trả đã cộng vào kho)
-                          S.products = S.products.map(p => p.id === r.productId ? { ...p, stock: p.stock - r.returnQty, _updated: new Date().toISOString() } : p);
+                          S.products = S.products.map(p => p.id === r.productId ? { ...p, stock: (parseFloat(p.stock)||0) - (parseFloat(r.returnQty)||0), _updated: new Date().toISOString() } : p);
                           // Hoàn tác: cộng lại doanh thu đơn gốc nếu có
                           if (r.saleId) {
                             S.sales = S.sales.map(s => {
@@ -10551,7 +10763,9 @@ function openReturnFromSale(sale, onDone) {
         };
 
         // Hoàn hàng vào kho
-        S.products = S.products.map(p => p.id === sale.productId ? { ...p, stock: p.stock + returnQty, _updated: new Date().toISOString() } : p);
+        S.products = S.products.map(p => p.id === sale.productId
+          ? { ...p, stock: (parseFloat(p.stock)||0) + returnQty, _updated: new Date().toISOString(), _stockTx: CLOUD.unionStockTx(p._stockTx, [rec.id]) }
+          : p);
 
         // Điều chỉnh đơn gốc
         S.sales = S.sales.map(s => {
@@ -10744,7 +10958,9 @@ function openReturn(rebuild) {
         };
 
         // Cộng hàng trả lại vào kho
-        S.products = S.products.map(p => p.id === productId ? { ...p, stock: p.stock + returnQty, _updated: new Date().toISOString() } : p);
+        S.products = S.products.map(p => p.id === productId
+          ? { ...p, stock: (parseFloat(p.stock)||0) + returnQty, _updated: new Date().toISOString(), _stockTx: CLOUD.unionStockTx(p._stockTx, [rec.id]) }
+          : p);
 
         // Điều chỉnh đơn bán gốc: trừ SL và doanh thu
         if (origSale) {
@@ -12809,18 +13025,24 @@ async function initMainApp() {
     if (cloudCfg.enabled) {
       setTimeout(() => {
         CLOUD.startListeners();
+        // Dùng chung _hbIv/_visibilityHandler với bootApp() — nếu không, đây
+        // là bản heartbeat/listener KHÔNG được theo dõi, không thể dọn khi
+        // đăng xuất, gây chồng chất vĩnh viễn mỗi khi đăng nhập lại sau đó.
+        if (_hbIv) clearInterval(_hbIv);
+        if (_visibilityHandler) document.removeEventListener('visibilitychange', _visibilityHandler);
         // Heartbeat nhẹ: chỉ flush queue tồn đọng, không pull lại toàn bộ cloud
-        setInterval(() => {
+        _hbIv = setInterval(() => {
           if (!document.hidden && AUTH.currentUser() && navigator.onLine) {
             try { CLOUD.flushPending(); } catch(e) {}
           }
         }, 60000);
-        document.addEventListener('visibilitychange', () => {
+        _visibilityHandler = () => {
           if (!document.hidden && AUTH.currentUser() && cloudCfg.enabled) {
             CLOUD.stopListeners(); CLOUD.startListeners();
             setTimeout(() => { try { CLOUD.flushPending(); } catch(e) {} }, 300);
           }
-        });
+        };
+        document.addEventListener('visibilitychange', _visibilityHandler);
       }, 500);
     }
   }, 1000);
