@@ -2445,7 +2445,7 @@ const DB = (() => {
         if (!lsOk) return { archivedSales: 0, archivedImports: 0 };
         const cutoff = new Date();
         cutoff.setMonth(cutoff.getMonth() - 12);
-        const cutoffStr = cutoff.toISOString().slice(0, 10); // 'YYYY-MM-DD'
+        const cutoffStr = localDateStr(cutoff); // 'YYYY-MM-DD' theo giờ local VN
 
         // Sales
         const sales = this.get('dtn_sales', []);
@@ -2509,7 +2509,18 @@ const fmtS = n => {
   return fmt(n);
 };
 const uid  = () => Math.random().toString(36).slice(2, 9);
-const today = () => new Date().toISOString().slice(0, 10);
+// FIX timezone VN (UTC+7): dùng local date thay vì toISOString() (UTC)
+const today = () => {
+  const d = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+};
+// Helper localDateStr: dùng cho mọi chỗ cần YYYY-MM-DD theo giờ local (không UTC)
+const localDateStr = (dateObj) => {
+  const d = dateObj instanceof Date ? dateObj : new Date(dateObj);
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+};
 
 // ── Auto-generate SKU từ tên sản phẩm ────────────────────────────
 // Ví dụ: "Đá Cubic 10x10 1P" → "cb1", "Granite Đen Impala" → "gdi"
@@ -2727,11 +2738,22 @@ function save(key) {
 // FIX: lưu tombstone {id, _deleted, _updated} vào sessionStorage để
 // mergeAppendOnly biết localTs khi record đã bị filter khỏi mảng,
 // tránh record "sống lại" từ onSnapshot của thiết bị khác.
+// FIX: tombstone dùng localStorage thay vì sessionStorage
+// sessionStorage bị xoá khi đóng tab → sản phẩm đã xoá có thể "sống lại" từ onSnapshot
+// localStorage persistent → tombstone giữ nguyên qua các lần đóng/mở tab
 const _softDeleteTombstones = (() => {
-  try { return JSON.parse(sessionStorage.getItem('dtn_tombstones') || '{}'); } catch(e) { return {}; }
+  try { return JSON.parse(localStorage.getItem('dtn_tombstones') || '{}'); } catch(e) { return {}; }
 })();
 function _saveTombstones() {
-  try { sessionStorage.setItem('dtn_tombstones', JSON.stringify(_softDeleteTombstones)); } catch(e) {}
+  try {
+    // Chỉ giữ tombstone của 90 ngày gần nhất để tránh localStorage phình to
+    const cutoff = new Date(Date.now() - 90 * 86400000).toISOString();
+    const pruned = {};
+    Object.entries(_softDeleteTombstones).forEach(([id, ts]) => { if (ts >= cutoff) pruned[id] = ts; });
+    Object.assign(_softDeleteTombstones, pruned);
+    Object.keys(_softDeleteTombstones).forEach(k => { if (!pruned[k]) delete _softDeleteTombstones[k]; });
+    localStorage.setItem('dtn_tombstones', JSON.stringify(_softDeleteTombstones));
+  } catch(e) {}
 }
 function softDelete(arrayKey, id, extraFn) {
   const now = new Date().toISOString();
@@ -3435,7 +3457,7 @@ function buildApp() {
             const data = DB.exportAll();
             const a = document.createElement('a');
             a.href = 'data:application/json;charset=utf-8,' + encodeURIComponent(data);
-            a.download = 'DaTuNhien_backup_' + new Date().toISOString().slice(0,10) + '.json';
+            a.download = 'DaTuNhien_backup_' + localDateStr(new Date()) + '.json';
             a.click();
             toast('✅ Đã xuất backup JSON! Lưu vào nơi an toàn.', 'success');
           }
@@ -3637,7 +3659,7 @@ function pgDashboard() {
 
   // ── State bộ lọc thời gian ──────────────────────────────────
   if (!pgDashboard._period) pgDashboard._period = 'month';
-  if (!pgDashboard._selDate) pgDashboard._selDate = now.toISOString().slice(0,10);
+  if (!pgDashboard._selDate) pgDashboard._selDate = localDateStr(now);
 
   const period   = pgDashboard._period;
   const selDate  = new Date(pgDashboard._selDate);
@@ -3848,7 +3870,7 @@ function pgDashboard() {
     if (period === 'day')   d.setDate(d.getDate() + dir);
     if (period === 'month') d.setMonth(d.getMonth() + dir);
     if (period === 'year')  d.setFullYear(d.getFullYear() + dir);
-    pgDashboard._selDate = d.toISOString().slice(0,10);
+    pgDashboard._selDate = localDateStr(d);
     render();
   }
 
@@ -3863,7 +3885,7 @@ function pgDashboard() {
       h('button', { className:'btn btn-ghost btn-sm', style:{padding:'2px 8px'}, onClick: () => navPeriod(-1) }, '◀'),
       h('span', { style:{fontWeight:700, fontSize:13, color:'var(--accent)', minWidth:140, textAlign:'center'} }, periodLabel()),
       h('button', { className:'btn btn-ghost btn-sm', style:{padding:'2px 8px'}, onClick: () => navPeriod(1) }, '▶'),
-      h('button', { className:'btn btn-ghost btn-sm', style:{fontSize:11, color:'var(--text3)'}, onClick: () => { pgDashboard._selDate = now.toISOString().slice(0,10); render(); } }, 'Hôm nay')
+      h('button', { className:'btn btn-ghost btn-sm', style:{fontSize:11, color:'var(--text3)'}, onClick: () => { pgDashboard._selDate = localDateStr(now); render(); } }, 'Hôm nay')
     )
   );
 
@@ -12104,7 +12126,7 @@ function pgStaffReport() {
     if (period === 'day') d.setDate(d.getDate() + dir);
     else if (period === 'month') d.setMonth(d.getMonth() + dir);
     else if (period === 'year') d.setFullYear(d.getFullYear() + dir);
-    pgStaffReport._selDate = d.toISOString().slice(0, 10);
+    pgStaffReport._selDate = localDateStr(d);
     rebuild();
   }
 
@@ -12466,7 +12488,7 @@ function pgStaffReport() {
               const log = {
                 id: 'pl' + Date.now() + Math.random().toString(36).slice(2,6),
                 refId: s.id, type: 'customer',
-                amount: debtLeft, date: now.toISOString().slice(0,10),
+                amount: debtLeft, date: localDateStr(now),
                 time: now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0'),
                 note: 'Thu nợ nhanh từ báo cáo nhân viên',
                 staffId: AUTH.currentUser()?.username || null,
@@ -12525,7 +12547,7 @@ function pgVatReport() {
       if (period === 'month') dd.setMonth(dd.getMonth() + dir);
       if (period === 'year')  dd.setFullYear(dd.getFullYear() + dir);
       if (period === 'quarter') dd.setMonth(dd.getMonth() + dir * 3);
-      pgVatReport._selDate = dd.toISOString().slice(0,10);
+      pgVatReport._selDate = localDateStr(dd);
       rebuild();
     }
 
