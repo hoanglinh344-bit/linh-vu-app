@@ -395,9 +395,11 @@ const CLOUD = (() => {
   // ── _stockTx: tập id giao dịch (sales/imports/returns) ĐÃ được cộng/trừ
   // vào field stock của sản phẩm này. Dùng để hoà giải tồn kho khi 2 thiết bị
   // cùng bán/nhập SP này lúc offline — xem applyLedgerToStock() bên dưới.
-  // Giới hạn 1000 id gần nhất/sản phẩm để tránh phình dữ liệu
-  // (tăng từ 300 lên 1000 để tránh trim quá sớm gây đếm trùng giao dịch)
-  const STOCK_TX_CAP = 1000;
+  // Giới hạn 3000 id gần nhất/sản phẩm để tránh phình dữ liệu.
+  // QUAN TRỌNG: trim chỉ xảy ra khi union vượt giới hạn này. Giữ id MỚI NHẤT
+  // (slice cuối) để các giao dịch hiện tại không bao giờ bị coi là "mới" và
+  // gây đếm trùng tồn kho. Tăng từ 1000 lên 3000 để giảm tần suất trim.
+  const STOCK_TX_CAP = 3000;
   function unionStockTx(a, b) {
     const merged = [...new Set([...(a || []), ...(b || [])])];
     return merged.length > STOCK_TX_CAP ? merged.slice(merged.length - STOCK_TX_CAP) : merged;
@@ -430,8 +432,10 @@ const CLOUD = (() => {
           const cloudTxLen = (p._stockTx || []).length;
           const localStock = parseFloat(map[p.id].stock) || 0;
           const cloudStock = parseFloat(p.stock) || 0;
-          // Nếu local có thêm giao dịch chưa có trong cloud → không để cloud ghi đè stock xuống thấp hơn
-          const safeStock = (localTxLen > cloudTxLen && localStock > cloudStock) ? localStock : cloudStock;
+          // Nếu local có thêm giao dịch chưa có trong cloud → tin tưởng local stock
+          // (không so sánh cao/thấp vì bán offline làm stock thấp hơn cloud, đó là đúng)
+          // applyLedgerToStock sẽ bù các giao dịch cloud chưa có trong local.
+          const safeStock = localTxLen > cloudTxLen ? localStock : cloudStock;
           map[p.id] = { ...p, stock: safeStock, _stockTx: mergedTx };
         }
         else { map[p.id] = { ...map[p.id], _stockTx: mergedTx }; }
@@ -627,6 +631,16 @@ const CLOUD = (() => {
       // không làm bước này, phiếu cũ sẽ "treo" vào 1 productId không còn tồn
       // tại (mất theo dõi tồn kho) và bản bị loại có thể quay lại ở lần sync sau.
       if (reroutes.length > 0) {
+        // Thông báo người dùng biết SP nào bị gộp — tránh nhầm lẫn "SP biến mất"
+        setTimeout(() => {
+          try {
+            const names = [...new Set(reroutes.map(r => r.winnerName))].slice(0, 3).join(', ');
+            const more  = reroutes.length > 3 ? ` và ${reroutes.length - 3} sản phẩm khác` : '';
+            if (typeof toast === 'function')
+              toast(`⚠️ Gộp ${reroutes.length} sản phẩm trùng tên: ${names}${more}. Tồn kho đã được cộng dồn.`, 'warn');
+            console.warn('[MERGE] Sản phẩm trùng tên đã gộp:', reroutes);
+          } catch(e) {}
+        }, 800);
         const _mergeNow = new Date().toISOString();
         const lossIds = new Set(reroutes.map(r => r.loserId));
         const nameById = {}; reroutes.forEach(r => { nameById[r.loserId] = r.winnerName; nameById[r.winnerId] = r.winnerName; });
@@ -2101,16 +2115,31 @@ function migrateLegacySKU() {
     return sku;
   }
 
-  const nowIso = new Date().toISOString();
   let count = 0;
+  const patched = [];
   S.products = S.products.map(p => {
     if (p.sku && p.sku.trim()) return p; // đã có SKU → giữ nguyên
     const sku = assignSKU(p);
     count++;
-    return { ...p, sku, _updated: nowIso };
+    // FIX: giữ nguyên _updated gốc của SP — không bump lên "now" vì sẽ làm
+    // bản migrate thắng conflict với thay đổi thực sự của thiết bị khác.
+    // Mỗi thiết bị tự chạy migrateLegacySKU khi boot nên không cần thiết bị A
+    // push SKU cho thiết bị B — B tự gắn SKU riêng (cùng tên → cùng SKU).
+    const updated = { ...p, sku };
+    patched.push(updated);
+    return updated;
   });
 
-  save('products');
+  // Push trực tiếp chỉ những SP vừa patch — không qua save() để không làm
+  // dirty-tracking _lastPushed hiểu nhầm và push lại toàn bộ mảng.
+  if (patched.length > 0) {
+    try { DB.set('dtn_products', S.products); } catch(e) {}
+    try {
+      CLOUD.push('dtn_products', patched);
+      // Seed _lastPushed sau khi nó được khai báo (hàm này gọi trước dòng khai báo)
+      if (typeof _seedLastPushed === 'function') _seedLastPushed('products', patched);
+    } catch(e) {}
+  }
   console.log('[SKU] Đã gắn SKU cho', count, 'sản phẩm và push lên cloud.');
   // Toast nhẹ — chỉ hiện nếu có migrate thực sự
   setTimeout(() => {
@@ -2603,13 +2632,18 @@ const S = {
 (function seedStockTxOnce() {
   let touched = false;
   S.products = (S.products || []).map(p => {
-    if (Array.isArray(p._stockTx)) return p; // sản phẩm tạo sau khi có _stockTx rồi
+    // Thu thập id giao dịch hiện tại của sản phẩm này
     const ids = [];
-    (S.sales || []).forEach(s => { if (s.productId === p.id) ids.push(s.id); });
-    (S.imports || []).forEach(i => { if (i.productId === p.id) ids.push(i.id); });
-    (S.returns || []).forEach(r => { if (r.productId === p.id) ids.push(r.id); });
+    (S.sales || []).forEach(s => { if (s.productId === p.id && s.id) ids.push(s.id); });
+    (S.imports || []).forEach(i => { if (i.productId === p.id && i.id) ids.push(i.id); });
+    (S.returns || []).forEach(r => { if (r.productId === p.id && r.id) ids.push(r.id); });
+    // Bỏ qua nếu _stockTx đã có đủ id (kể cả mảng rỗng khi không có giao dịch nào)
+    // FIX: không dùng Array.isArray() làm điều kiện dừng vì _stockTx = [] (rỗng) có
+    // thể là chưa seed thật sự — phải kiểm tra xem có id giao dịch nào còn thiếu không.
+    if (Array.isArray(p._stockTx) && ids.every(id => p._stockTx.includes(id))) return p;
+    const fullTx = CLOUD.unionStockTx(p._stockTx, ids);
     touched = true;
-    return { ...p, _stockTx: ids.slice(-300) };
+    return { ...p, _stockTx: fullTx };
   });
   if (touched) { try { DB.set('dtn_products', S.products); } catch(e) {} }
 })();
