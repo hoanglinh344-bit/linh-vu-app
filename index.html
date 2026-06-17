@@ -5541,7 +5541,7 @@ function makeProdSearchWidget(products, initProductId, onSelect) {
     if (!prod) { badge.style.display = 'none'; return; }
     badge.innerHTML = '';
     const txt = document.createElement('span');
-    txt.textContent = '✅ ' + prod.name + (prod.sku ? ' [' + prod.sku + ']' : '') + ' — Tồn: ' + fmtQty(prod.stock) + ' ' + prod.unit;
+    txt.textContent = '✅ ' + prod.name + (prod.sku ? ' [' + prod.sku + ']' : '') + ' — Tồn: ' + (parseFloat(prod.stock)||0) + ' ' + prod.unit;
     const clrBtn = document.createElement('button');
     clrBtn.type = 'button';
     clrBtn.title = 'Xoá chọn';
@@ -5592,7 +5592,8 @@ function makeProdSearchWidget(products, initProductId, onSelect) {
         nameEl.textContent = (p.sku ? '[' + p.sku + '] ' : '') + p.name;
         const metaEl = document.createElement('div');
         metaEl.className = 'prod-search-item-meta';
-        metaEl.textContent = 'Tồn: ' + fmtQty(p.stock) + ' ' + p.unit
+        const stockStr = (typeof p.stock === 'number' ? (Number.isInteger(p.stock) ? p.stock : +p.stock.toFixed(2)) : (parseFloat(p.stock)||0));
+        metaEl.textContent = 'Tồn: ' + stockStr + ' ' + p.unit
           + (p.buyPrice ? ' · Giá nhập: ' + fmt(p.buyPrice) + 'đ' : '')
           + (p.type ? ' · ' + p.type : '');
         item.appendChild(nameEl);
