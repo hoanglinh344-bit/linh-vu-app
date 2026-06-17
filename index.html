@@ -183,6 +183,22 @@ textarea.form-input{resize:vertical;min-height:72px}
 @media(prefers-color-scheme:light){
   /* Giữ dark mode vì phù hợp với đá tự nhiên */
 }
+/* ── Product search autocomplete (nhập hàng) ── */
+.prod-search-wrap{position:relative;width:100%}
+.prod-search-inp{width:100%;background:var(--bg3);border:1.5px solid var(--accent);border-radius:var(--r2);padding:9px 13px;color:var(--text);font-size:13px;font-family:inherit;outline:none}
+.prod-search-inp::placeholder{color:var(--text3)}
+.prod-search-inp:focus{background:var(--bg4)}
+.prod-search-drop{position:absolute;top:100%;left:0;right:0;z-index:500;background:var(--bg2);border:1.5px solid var(--accent);border-top:none;border-radius:0 0 var(--r2) var(--r2);max-height:220px;overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.5);display:none}
+.prod-search-drop.show{display:block}
+.prod-search-item{padding:9px 13px;cursor:pointer;font-size:13px;border-bottom:1px solid var(--border);display:flex;flex-direction:column;gap:2px;transition:background .1s}
+.prod-search-item:last-child{border-bottom:none}
+.prod-search-item:hover,.prod-search-item.active{background:var(--accent-dim)}
+.prod-search-item-name{color:var(--text);font-weight:600}
+.prod-search-item-meta{color:var(--text2);font-size:11px}
+.prod-search-item-empty{padding:12px 13px;font-size:12px;color:var(--text3);text-align:center}
+.prod-selected-badge{display:flex;align-items:center;justify-content:space-between;background:rgba(201,168,76,.1);border:1px solid rgba(201,168,76,.4);border-radius:var(--r2);padding:6px 10px;margin-top:5px;font-size:12px;color:var(--accent);font-weight:600}
+.prod-selected-badge button{background:none;border:none;cursor:pointer;color:var(--text3);font-size:14px;padding:0 3px;line-height:1}
+.prod-selected-badge button:hover{color:var(--red)}
 /* Print */
 @media print{
   .sidebar,.topbar,.bottom-nav,.btn,.modal-bg,.overlay,.toast{display:none!important}
@@ -5489,6 +5505,139 @@ function mkVatRow(initVal, onChange) {
   return wrapper;
 }
 
+// ── Widget tìm kiếm sản phẩm nhanh cho phiếu nhập ────────────────
+function makeProdSearchWidget(products, initProductId, onSelect) {
+  const wrap = document.createElement('div');
+  wrap.className = 'prod-search-wrap';
+
+  // Input tìm kiếm
+  const inp = document.createElement('input');
+  inp.type = 'text';
+  inp.className = 'prod-search-inp';
+  inp.placeholder = '🔍 Gõ tên sản phẩm để tìm nhanh...';
+  inp.autocomplete = 'off';
+  inp.setAttribute('autocorrect', 'off');
+  inp.setAttribute('autocapitalize', 'off');
+  inp.setAttribute('spellcheck', 'false');
+
+  // Dropdown kết quả
+  const drop = document.createElement('div');
+  drop.className = 'prod-search-drop';
+
+  // Badge hiển thị sản phẩm đã chọn
+  const badge = document.createElement('div');
+  badge.className = 'prod-selected-badge';
+  badge.style.display = 'none';
+
+  wrap.appendChild(inp);
+  wrap.appendChild(drop);
+  wrap.appendChild(badge);
+
+  let selectedId = initProductId || '';
+  let activeIdx = -1;
+  let dropItems = [];
+
+  function showBadge(prod) {
+    if (!prod) { badge.style.display = 'none'; return; }
+    badge.innerHTML = '';
+    const txt = document.createElement('span');
+    txt.textContent = '✅ ' + prod.name + (prod.sku ? ' [' + prod.sku + ']' : '') + ' — Tồn: ' + fmtQty(prod.stock) + ' ' + prod.unit;
+    const clrBtn = document.createElement('button');
+    clrBtn.type = 'button';
+    clrBtn.title = 'Xoá chọn';
+    clrBtn.textContent = '✕';
+    clrBtn.onclick = (e) => {
+      e.stopPropagation();
+      selectedId = '';
+      inp.value = '';
+      badge.style.display = 'none';
+      inp.style.display = '';
+      onSelect('');
+      inp.focus();
+    };
+    badge.appendChild(txt);
+    badge.appendChild(clrBtn);
+    badge.style.display = 'flex';
+    inp.style.display = 'none';
+  }
+
+  // Init nếu đã có sản phẩm chọn sẵn
+  if (selectedId) {
+    const initProd = products.find(p => p.id === selectedId);
+    if (initProd) showBadge(initProd);
+  }
+
+  function renderDrop(query) {
+    drop.innerHTML = '';
+    activeIdx = -1;
+    const q = query.trim().toLowerCase();
+    if (!q) { drop.classList.remove('show'); return; }
+    const matches = products.filter(p => {
+      const haystack = (p.name + ' ' + (p.sku || '') + ' ' + (p.type || '')).toLowerCase();
+      return haystack.includes(q);
+    }).slice(0, 20);
+    dropItems = matches;
+    if (matches.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'prod-search-item-empty';
+      empty.textContent = 'Không tìm thấy sản phẩm "' + query + '"';
+      drop.appendChild(empty);
+    } else {
+      matches.forEach((p, i) => {
+        const item = document.createElement('div');
+        item.className = 'prod-search-item';
+        item.dataset.idx = i;
+        const nameEl = document.createElement('div');
+        nameEl.className = 'prod-search-item-name';
+        nameEl.textContent = (p.sku ? '[' + p.sku + '] ' : '') + p.name;
+        const metaEl = document.createElement('div');
+        metaEl.className = 'prod-search-item-meta';
+        metaEl.textContent = 'Tồn: ' + fmtQty(p.stock) + ' ' + p.unit
+          + (p.buyPrice ? ' · Giá nhập: ' + fmt(p.buyPrice) + 'đ' : '')
+          + (p.type ? ' · ' + p.type : '');
+        item.appendChild(nameEl);
+        item.appendChild(metaEl);
+        item.addEventListener('mousedown', e => { e.preventDefault(); selectProduct(p); });
+        drop.appendChild(item);
+      });
+    }
+    drop.classList.add('show');
+  }
+
+  function selectProduct(p) {
+    selectedId = p.id;
+    inp.value = '';
+    drop.classList.remove('show');
+    showBadge(p);
+    onSelect(p.id);
+  }
+
+  inp.addEventListener('input', () => renderDrop(inp.value));
+  inp.addEventListener('focus', () => { if (inp.value) renderDrop(inp.value); });
+  inp.addEventListener('blur', () => setTimeout(() => drop.classList.remove('show'), 150));
+  inp.addEventListener('keydown', e => {
+    const items = drop.querySelectorAll('.prod-search-item');
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      activeIdx = Math.min(activeIdx + 1, items.length - 1);
+      items.forEach((el, i) => el.classList.toggle('active', i === activeIdx));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      activeIdx = Math.max(activeIdx - 1, 0);
+      items.forEach((el, i) => el.classList.toggle('active', i === activeIdx));
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (activeIdx >= 0 && dropItems[activeIdx]) selectProduct(dropItems[activeIdx]);
+    } else if (e.key === 'Escape') {
+      drop.classList.remove('show');
+    }
+  });
+
+  // Expose method để lấy giá trị hiện tại
+  wrap._getProductId = () => selectedId;
+  return wrap;
+}
+
 function openImport(existing, rebuild, prefillProduct) {
   const { products } = S;
   const isEdit = !!existing;
@@ -5750,10 +5899,26 @@ function openImport(existing, rebuild, prefillProduct) {
     const grid = document.createElement('div');
     grid.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px';
 
-    // Chọn sản phẩm
+    // Chọn sản phẩm — có ô tìm kiếm nhanh phía trên
     const prodGroup = document.createElement('div');
     prodGroup.className = 'form-group';
     const prodLabel = document.createElement('label'); prodLabel.className = 'form-label'; prodLabel.textContent = 'Sản phẩm *';
+
+    // Widget tìm kiếm nhanh
+    const searchWidget = makeProdSearchWidget(products, it.productId, v => {
+      it.productId = v;
+      // Sync sang select bên dưới
+      selProd.value = v;
+      const p = products.find(x => x.id === v);
+      if (p) { it.price = p.buyPrice; priceInp.value = p.buyPrice; }
+      renderVariantSel(p || null);
+      updateSum();
+    });
+
+    const selProdLabel = document.createElement('div');
+    selProdLabel.style.cssText = 'font-size:11px;color:var(--text3);margin-top:6px;margin-bottom:3px';
+    selProdLabel.textContent = 'Hoặc chọn từ danh sách:';
+
     const selProd = mkSelect(
       [{ value: '', label: '— Chọn sản phẩm —' }, ...products.map(p => ({ value: p.id, label: (p.sku ? '[' + p.sku + '] ' : '') + p.name + ' (tồn: ' + fmtQty(p.stock) + ' ' + p.unit + ')' }))],
       it.productId,
@@ -5762,10 +5927,18 @@ function openImport(existing, rebuild, prefillProduct) {
         const p = products.find(x => x.id === v);
         if (p) { it.price = p.buyPrice; priceInp.value = p.buyPrice; }
         renderVariantSel(p);
+        // Sync lại search widget badge
+        if (v) {
+          const pp = products.find(x => x.id === v);
+          if (pp) { searchWidget._getProductId; }
+        }
         updateSum();
       }
     );
-    prodGroup.appendChild(prodLabel); prodGroup.appendChild(selProd);
+    prodGroup.appendChild(prodLabel);
+    prodGroup.appendChild(searchWidget);
+    prodGroup.appendChild(selProdLabel);
+    prodGroup.appendChild(selProd);
     grid.appendChild(prodGroup);
 
     // Số lượng
