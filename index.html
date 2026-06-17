@@ -2784,6 +2784,8 @@ function softDelete(arrayKey, id, extraFn) {
 // ═══════════════════════════════════════════════════════════════
 //  EXCEL EXPORT — SheetJS (XLSX)
 // ═══════════════════════════════════════════════════════════════
+function numFmt(n) { return isNaN(n) ? 0 : Math.round(n); }
+
 function exportExcel(sheetChoice) {
   const { products, imports, sales, returns, settings } = S;
   const shop = settings.shopName || 'DaTuNhien';
@@ -2822,8 +2824,6 @@ function exportExcel(sheetChoice) {
       }
     };
   }
-  function numFmt(n) { return isNaN(n) ? 0 : Math.round(n); }
-
   // Tạo workbook
   const wb = XLSX.utils.book_new();
 
