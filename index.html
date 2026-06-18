@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Đá Tự Nhiên Linh Vũ">
-<title>Đá Tự Nhiên Linh Vũ — Quản Lý v7.9.8-fix</title>
+<title>Đá Tự Nhiên Linh Vũ — Quản Lý v8.0.1</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
 <!-- Firebase SDK -->
@@ -578,11 +578,9 @@ const CLOUD = (() => {
       return updated;
     });
     try { if (typeof DB !== 'undefined') DB.set('dtn_products', S.products); } catch(e) {}
-    // Đẩy CHỈ những sản phẩm vừa hoà giải lên cloud (không đẩy cả mảng — tốn write quota)
-    // để thiết bị khác cũng thấy số tồn đã đúng, không phải chờ tới lần save() kế tiếp
-    if (reconciled.length > 0 && _db && _cfg?.enabled) {
-      pushCollection('dtn_products', reconciled).catch(e => console.warn('[CLOUD] push reconciled stock error:', e));
-    }
+    // Firebase-first: KHÔNG push lên cloud từ applyLedgerToStock
+    // applyLedger chỉ còn dùng để seed _stockTx trong bootSync — không tính stock delta
+    // Stock trên Firebase đã đúng (do thiết bị tạo giao dịch push) → không cần push lại
   }
   function applyCloudData(colName, cloudDocs, skipRender) {
     if (!window._S) return;
@@ -643,27 +641,22 @@ const CLOUD = (() => {
         } catch(e) {}
       }
     } else if (stateKey === 'settings') {
-      // QUAN TRỌNG: chỉ áp cloud nếu cloud THỰC SỰ mới hơn local (so _updated).
-      // Trước đây code áp cloud vô điều kiện → sửa cài đặt offline rồi mở lại
-      // app sẽ bị cloud (dữ liệu cũ) ghi đè mất, và bản cũ đó còn bị push
-      // ngược lên cloud xoá luôn thay đổi trên mọi thiết bị.
+      // Firebase-first: settings từ cloud luôn thắng (realtime listener)
+      // Khi user sửa settings → save() push lên cloud ngay lập tức
+      // → listener nhận về chính bản vừa push → S.settings = cloud version
+      // Không còn conflict vì S luôn được khởi tạo từ Firebase trong bootSync
       if (cloudDocs.length > 0) {
         const cloudDoc = cloudDocs[0];
-        const localTs = safeTs(S.settings && S.settings._updated || '');
-        const cloudTs = safeTs(cloudDoc._updated || '');
-        if (!localTs || cloudTs > localTs) {
-          const merged = { ...S.settings, ...cloudDoc };
-          delete merged.id;
-          merged._updated = cloudTs;
-          const before = JSON.stringify(S.settings);
-          S.settings = merged;
-          if (JSON.stringify(S.settings) !== before) changed = true;
-        }
-        // else: local mới hơn hoặc bằng → giữ local, save() sẽ push lại cloud sau
+        const merged = { ...cloudDoc };
+        delete merged.id;
+        const before = JSON.stringify(S.settings);
+        S.settings = merged;
+        if (JSON.stringify(S.settings) !== before) changed = true;
       }
     } else if (stateKey === 'products') {
       const before = JSON.stringify(S.products);
-      const { products: mergedProducts, reroutes } = mergeProducts(S.products, cloudDocs);
+      // Firebase-first: base rỗng → cloud thắng tuyệt đối, không merge với local stale
+      const { products: mergedProducts, reroutes } = mergeProducts([], cloudDocs);
       S.products = mergedProducts;
       if (JSON.stringify(S.products) !== before) changed = true;
       _seedLastPushed(stateKey, S.products);
@@ -712,16 +705,16 @@ const CLOUD = (() => {
         if (typeof CLOUD !== 'undefined' && CLOUD._pushDeletedRecord) CLOUD._pushDeletedRecord('dtn_products', deletedLosers);
       }
     } else {
+      // Firebase-first: realtime listener → replace trực tiếp bằng cloud snapshot
+      // cloudDocs = toàn bộ collection (Firestore onSnapshot gửi full snapshot)
+      // Lọc _deleted → ghi thẳng vào S. KHÔNG gọi applyLedgerToStock vì:
+      // - products.stock đã đúng từ Firebase (được set bởi thiết bị tạo giao dịch)
+      // - applyLedger chỉ cần khi local stock cũ chưa phản ánh giao dịch offline
+      // - Trong Firebase-first, mọi stock change đều đi qua Firebase trước → không cần
       const before = JSON.stringify(S[stateKey]);
-      S[stateKey] = mergeAppendOnly(S[stateKey], cloudDocs);
+      S[stateKey] = cloudDocs.filter(r => r && !r._deleted);
       if (JSON.stringify(S[stateKey]) !== before) changed = true;
       _seedLastPushed(stateKey, S[stateKey]);
-      // Hoà giải tồn kho cho giao dịch thực sự mới (xem applyLedgerToStock).
-      // applyLedgerToStock tự bỏ qua giao dịch đã có trong _stockTx của SP
-      // nên gọi với TOÀN BỘ cloudDocs (không chỉ phần mới) vẫn an toàn.
-      if (stateKey === 'sales' || stateKey === 'imports' || stateKey === 'returns') {
-        applyLedgerToStock(stateKey, cloudDocs.filter(r => r && !r._deleted));
-      }
     }
 
     if (changed) {
@@ -800,7 +793,10 @@ const CLOUD = (() => {
   function normalizeDoc(data) {
     if (!data) return data;
     const d = { ...data };
+    // Normalize mọi Firestore Timestamp field → ISO string
     if (d._updated) d._updated = normalizeTs(d._updated);
+    if (d.createdAt) d.createdAt = normalizeTs(d.createdAt);
+    if (d._backedUpAt) d._backedUpAt = normalizeTs(d._backedUpAt);
     return d;
   }
 
@@ -827,13 +823,10 @@ const CLOUD = (() => {
         const batch = _db.batch();
         chunk.forEach(r => {
           if (!r || !r.id) return;
-          // QUAN TRỌNG: giữ _updated gốc của record. Nếu ghi đè bằng SERVER_TS
-          // thì mọi record (kể cả dữ liệu CŨ chưa đổi) đều nhận timestamp mới,
-          // khiến thiết bị có dữ liệu cũ ghi đè dữ liệu mới của thiết bị khác
-          // → đây chính là nguyên nhân mất tồn kho sản phẩm.
-          // safeTs() phía đọc đã chặn clock lệch về tương lai.
-          // merge:true → chỉ cập nhật field thay đổi, không xoá field khác
-          batch.set(ref.doc(String(r.id)), { ...r, _updated: r._updated || SERVER_TS }, { merge: true });
+          // Firebase-first: luôn dùng serverTimestamp() — đồng hồ thiết bị có thể lệch
+          // gây record cũ ghi đè record mới. serverTimestamp() = đồng hồ Firestore server.
+          // merge:true → chỉ cập nhật field thay đổi, không xoá field khác.
+          batch.set(ref.doc(String(r.id)), { ...r, _updated: SERVER_TS }, { merge: true });
         });
         await batch.commit();
       }
@@ -892,6 +885,7 @@ const CLOUD = (() => {
     'dtn_shipping':     'shipping',
     'dtn_returns':      'returns',
     'dtn_paymentlogs':  'paymentlogs',
+    'dtn_cashflows':    'cashflows',   // FIX: thiếu → offline cashflow bị mất sau refresh
     'dtn_settings':     'settings',
     'dtn_staff_accounts': null, // đọc từ localStorage riêng
   };
@@ -967,12 +961,27 @@ const CLOUD = (() => {
   //  BOOT SYNC — pull cloud và merge vào local khi khởi động
   // ═══════════════════════════════════════════════════════════
   async function bootSync(S_state) {
-    if (!_db || !_online || !_cfg.enabled) { _bootDone = true; return false; }
+    // Firebase-first: nếu không có Firebase → fallback local (offline mode)
+    if (!_db || !_online || !_cfg.enabled) {
+      // Offline hoặc chưa cấu hình: nạp từ localStorage làm fallback
+      if (typeof DB !== 'undefined') {
+        const _S = window._S || S_state;
+        _S.products    = DB.get('dtn_products',    []);
+        _S.imports     = DB.get('dtn_imports',     []);
+        _S.sales       = DB.get('dtn_sales',       []);
+        _S.shipping    = DB.get('dtn_shipping',    []);
+        _S.settings    = DB.get('dtn_settings',    _S.settings || {});
+        _S.returns     = DB.get('dtn_returns',     []);
+        _S.paymentlogs = DB.get('dtn_paymentlogs', []);
+        _S.cashflows   = DB.get('dtn_cashflows',   []);
+      }
+      _bootDone = true;
+      return false;
+    }
     _syncStatus = 'syncing'; notifyStatus();
     try {
       const pullCol = async (name) => {
         const snap = await col(name).get();
-        // normalizeDoc: chuyển Firestore Timestamp → ISO string cho _updated
         return snap.docs.map(d => normalizeDoc(d.data()));
       };
       const [products, imports, sales, returns, paymentlogs, shipping, settingsArr, staffArr, adminCredArr, cashflowsArr] = await Promise.all([
@@ -982,71 +991,104 @@ const CLOUD = (() => {
         pullCol('dtn_cashflows'),
       ]);
 
-      // Merge từng collection vào state hiện tại (không overwrite)
-      if (products.length)    applyCloudData('dtn_products',        products,    true);
+      // ── Firebase-first: GHI ĐÈ trực tiếp vào S từ cloud ──────────────────
+      // Không merge với local. Firebase là nguồn sự thật duy nhất.
+      // _deleted records bị lọc ra luôn — chỉ giữ data còn sống.
+      const _S = window._S || S_state;
 
-      // ── Seed _stockTx TRƯỚC khi apply imports/sales/returns ──────────────
-      // Sau khi merge products từ cloud, một số sản phẩm có thể có _stockTx thiếu
-      // (cloud chưa có hoặc bị trim). Nếu apply imports/sales/returns ngay lúc này,
-      // applyLedgerToStock() sẽ coi giao dịch cũ là "mới" → cộng/trừ đè lên stock
-      // hiện có → tồn kho sai (tăng gấp đôi hoặc về 0).
-      // Giải pháp: seed _stockTx từ sales/imports/returns đã có trong local state
-      // TRƯỚC khi apply cloud records — giao dịch cũ sẽ bị bỏ qua đúng cách.
-      {
-        const _S2 = window._S || S_state;
-        let preSeedTouched = false;
-        _S2.products = (_S2.products || []).map(p => {
-          const ids = [];
-          (_S2.sales    || []).forEach(s => { if (s.productId === p.id && s.id) ids.push(s.id); });
-          (_S2.imports  || []).forEach(i => { if (i.productId === p.id && i.id) ids.push(i.id); });
-          (_S2.returns  || []).forEach(r => { if (r.productId === p.id && r.id) ids.push(r.id); });
-          const fullTx = unionStockTx(p._stockTx, ids);
-          if (fullTx.length === (p._stockTx || []).length) return p;
-          preSeedTouched = true;
-          return { ...p, _stockTx: fullTx };
-        });
-        if (preSeedTouched) {
-          try { if (typeof DB !== 'undefined') DB.set('dtn_products', _S2.products); } catch(e) {}
+      // Products: filter _deleted, xử lý deduplicate trùng tên
+      if (products.length) {
+        const { products: mergedProds, reroutes } = mergeProducts([], products); // base rỗng → cloud thắng tuyệt đối
+        _S.products = mergedProds;
+        // Xử lý reroute nếu có SP trùng tên trên cloud
+        if (reroutes.length > 0) {
+          const _mergeNow = new Date().toISOString();
+          const winnerIdOf = {}; reroutes.forEach(r => { winnerIdOf[r.loserId] = r.winnerId; });
+          const nameById   = {}; reroutes.forEach(r => { nameById[r.loserId] = r.winnerName; });
+          ['imports','sales','returns'].forEach(k => {
+            const arr = k === 'imports' ? imports : k === 'sales' ? sales : returns;
+            arr.forEach(r => { if (winnerIdOf[r.productId]) { r.productId = winnerIdOf[r.productId]; r.productName = nameById[r.productId] || r.productName; r._updated = _mergeNow; } });
+          });
+          const deletedLosers = reroutes.map(r => ({ id: r.loserId, _deleted: true, _updated: _mergeNow }));
+          pushCollection('dtn_products', deletedLosers).catch(() => {});
         }
       }
 
-      if (imports.length)     applyCloudData('dtn_imports',         imports,     true);
-      if (sales.length)       applyCloudData('dtn_sales',           sales,       true);
-      if (returns.length)     applyCloudData('dtn_returns',         returns,     true);
-      if (paymentlogs.length) applyCloudData('dtn_paymentlogs',     paymentlogs, true);
-      if (shipping.length)    applyCloudData('dtn_shipping',        shipping,    true);
-      if (settingsArr.length) applyCloudData('dtn_settings',        settingsArr, true);
-      if (staffArr.length)    applyCloudData('dtn_staff_accounts',  staffArr,    true);
-      if (adminCredArr.length) applyCloudData('dtn_admin_cred',     adminCredArr, true);
-      if (cashflowsArr.length) applyCloudData('dtn_cashflows',      cashflowsArr, true);
+      // Transactions: filter _deleted → ghi thẳng vào S
+      _S.imports     = imports.filter(r => r && !r._deleted);
+      _S.sales       = sales.filter(r => r && !r._deleted);
+      _S.returns     = returns.filter(r => r && !r._deleted);
+      _S.paymentlogs = paymentlogs.filter(r => r && !r._deleted);
+      _S.shipping    = shipping.filter(r => r && !r._deleted);
+      _S.cashflows   = cashflowsArr.filter(r => r && !r._deleted);
 
-      // ── Re-seed _stockTx sau khi đã merge ĐỦ sales/imports/returns từ cloud ──
-      // QUAN TRỌNG: applyCloudData('dtn_products') có thể merge vào product một bản
-      // cloud không có _stockTx (hoặc _stockTx thiếu), khiến applyLedgerToStock
-      // (được gọi khi apply imports/sales/returns bên trên) coi toàn bộ giao dịch cũ
-      // là "mới" và cộng/trừ ĐÈ THÊM lên stock hiện có → tồn kho tăng gấp đôi hoặc về 0.
-      // Giải pháp: sau khi tất cả collections đã merge xong, chạy lại seed _stockTx
-      // cho mọi sản phẩm dựa trên TOÀN BỘ sales/imports/returns đã có trong state.
-      // Sau đó ghi lên cloud để các thiết bị khác nhận _stockTx đầy đủ.
-      {
-        const _S = window._S || S_state;
-        let reseedTouched = false;
-        _S.products = (_S.products || []).map(p => {
-          const ids = [];
-          (_S.sales    || []).forEach(s => { if (s.productId === p.id && s.id) ids.push(s.id); });
-          (_S.imports  || []).forEach(i => { if (i.productId === p.id && i.id) ids.push(i.id); });
-          (_S.returns  || []).forEach(r => { if (r.productId === p.id && r.id) ids.push(r.id); });
-          const fullTx = unionStockTx(p._stockTx, ids);
-          if (fullTx.length === (p._stockTx || []).length) return p; // không đổi
-          reseedTouched = true;
-          return { ...p, _stockTx: fullTx };
-        });
-        if (reseedTouched) {
-          try { if (typeof DB !== 'undefined') DB.set('dtn_products', _S.products); } catch(e) {}
-          // Đẩy lên cloud để thiết bị khác cũng nhận _stockTx đầy đủ
-          pushCollection('dtn_products', _S.products).catch(e => console.warn('[CLOUD] re-seed _stockTx push error:', e));
-        }
+      // Settings
+      if (settingsArr.length > 0) {
+        const s = { ..._S.settings, ...settingsArr[0] };
+        delete s.id; delete s._updated;
+        _S.settings = s;
       }
+
+      // Auth: staff accounts + admin cred (vẫn qua localStorage — AUTH quản lý)
+      if (staffArr.length > 0) {
+        try {
+          const map = {};
+          staffArr.forEach(s => { if (s && s.id && !s._deleted) map[s.id] = s; });
+          localStorage.setItem('dtn_staff_accounts', JSON.stringify(Object.values(map)));
+        } catch(e) {}
+      }
+      if (adminCredArr.length > 0) {
+        try {
+          const cloudCred = adminCredArr.find(d => d.id === 'admin_cred');
+          if (cloudCred) {
+            const localRaw = localStorage.getItem('dtn_admin_cred');
+            const localCred = localRaw ? JSON.parse(localRaw) : null;
+            const cloudTs = cloudCred._updated || '';
+            const localTs = (localCred && localCred._updated) || '';
+            if (!localTs || cloudTs > localTs) {
+              const { id, _updated, ...credData } = cloudCred;
+              localStorage.setItem('dtn_admin_cred', JSON.stringify({ ...credData, _updated: cloudTs }));
+            }
+          }
+        } catch(e) {}
+      }
+
+      // ── Seed _stockTx từ transactions vừa pull về ─────────────
+      // Đảm bảo product.stock và _stockTx khớp với cloud transactions.
+      // Nếu cloud product có _stockTx đầy đủ → không tính lại.
+      // Nếu thiếu (cloud cũ, chưa có _stockTx) → seed từ transactions.
+      _S.products = (_S.products || []).map(p => {
+        const ids = [];
+        (_S.sales    || []).forEach(s => { if (s.productId === p.id && s.id) ids.push(s.id); });
+        (_S.imports  || []).forEach(i => { if (i.productId === p.id && i.id) ids.push(i.id); });
+        (_S.returns  || []).forEach(r => { if (r.productId === p.id && r.id) ids.push(r.id); });
+        const fullTx = unionStockTx(p._stockTx, ids);
+        if (fullTx.length === (p._stockTx || []).length) return p;
+        return { ...p, _stockTx: fullTx };
+      });
+
+      // ── Cache xuống localStorage để dùng offline ──────────────
+      try {
+        if (typeof DB !== 'undefined') {
+          DB.set('dtn_products',    _S.products);
+          DB.set('dtn_imports',     _S.imports);
+          DB.set('dtn_sales',       _S.sales);
+          DB.set('dtn_returns',     _S.returns);
+          DB.set('dtn_paymentlogs', _S.paymentlogs);
+          DB.set('dtn_shipping',    _S.shipping);
+          DB.set('dtn_cashflows',   _S.cashflows);
+          DB.set('dtn_settings',    _S.settings);
+        }
+      } catch(e) {}
+
+      // Seed _lastPushed để save() không đẩy ngược lại cloud những gì vừa pull
+      _seedLastPushed('products',    _S.products);
+      _seedLastPushed('imports',     _S.imports);
+      _seedLastPushed('sales',       _S.sales);
+      _seedLastPushed('returns',     _S.returns);
+      _seedLastPushed('paymentlogs', _S.paymentlogs);
+      _seedLastPushed('shipping',    _S.shipping);
+      _seedLastPushed('cashflows',   _S.cashflows);
 
       _syncStatus = 'ok'; _lastSync = ts();
       _bootDone = true;
@@ -1054,6 +1096,18 @@ const CLOUD = (() => {
       return true;
     } catch(e) {
       console.warn('[CLOUD] bootSync error:', e);
+      // Lỗi Firebase → fallback local để app không trắng trang
+      if (typeof DB !== 'undefined') {
+        const _S = window._S || S_state;
+        _S.products    = DB.get('dtn_products',    []);
+        _S.imports     = DB.get('dtn_imports',     []);
+        _S.sales       = DB.get('dtn_sales',       []);
+        _S.shipping    = DB.get('dtn_shipping',    []);
+        _S.settings    = DB.get('dtn_settings',    _S.settings || {});
+        _S.returns     = DB.get('dtn_returns',     []);
+        _S.paymentlogs = DB.get('dtn_paymentlogs', []);
+        _S.cashflows   = DB.get('dtn_cashflows',   []);
+      }
       _syncStatus = 'error';
       _bootDone = true;
       notifyStatus();
@@ -1637,7 +1691,7 @@ function showLoginScreen() {
         <div style="text-align:center;margin-bottom:32px">
           <div style="width:64px;height:64px;background:linear-gradient(135deg,var(--accent),var(--accent2));border-radius:16px;display:flex;align-items:center;justify-content:center;font-size:32px;margin:0 auto 16px;box-shadow:0 4px 16px rgba(201,168,76,0.3)">💎</div>
           <div style="font-family:Georgia,serif;font-size:22px;font-weight:700;color:var(--text)">Đá Tự Nhiên Linh Vũ</div>
-          <div style="font-size:13px;color:var(--text2);margin-top:4px">Hệ thống quản lý v7.9.5</div>
+          <div style="font-size:13px;color:var(--text2);margin-top:4px">Hệ thống quản lý v8.0.1</div>
         </div>
         <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:28px">
           ${lockWarn}
@@ -2198,68 +2252,64 @@ async function bootApp() {
   const root = document.getElementById('app');
   if (root) root.innerHTML = '';
 
-  // ── Boot sync: pull cloud trước, merge vào local, rồi mới render ──
-  window._S = S; // cần cho applyCloudData
-  const cloudCfg = CLOUD.getCfg();
-  if (cloudCfg.enabled) {
-    // Hiển thị loading nhẹ
-    if (root) root.innerHTML = `<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg,#0f1117)">
-      <div style="text-align:center;color:#9a9590">
-        <div style="font-size:32px;margin-bottom:12px">🔄</div>
-        <div style="font-size:14px">Đang đồng bộ dữ liệu từ cloud...</div>
-        <div style="font-size:12px;margin-top:6px;color:#5c5850">Vui lòng chờ</div>
-      </div>
-    </div>`;
-    // Boot sync data + AI key song song
-    await Promise.all([
-      CLOUD.bootSync(S),
-      // Pull AI config (Gemini/Claude key) từ cloud để đồng bộ về thiết bị này
-      (typeof AICHAT !== 'undefined' && AICHAT.syncCfgFromCloud)
-        ? AICHAT.syncCfgFromCloud().catch(() => {})
-        : Promise.resolve(),
-    ]);
-    if (root) root.innerHTML = ''; // xoá loading
-  }
+  // Firebase-first: reset S về rỗng trước mỗi lần boot (tránh state thừa từ session cũ)
+  S.products = []; S.imports = []; S.sales = []; S.shipping = [];
+  S.returns = []; S.paymentlogs = []; S.cashflows = [];
+  S.settings = { ...SEED.settings };
 
-  // FIX: Sau bootSync, reload state từ DB để đảm bảo in-memory S
-  // khớp 100% với localStorage (nguồn sự thật sau khi merge cloud).
-  // Tránh trường hợp S còn giữ version cũ từ trước khi bootSync cập nhật LS.
-  reloadStateFromDB();
+  // ── Pull Firebase → ghi thẳng vào S → cache xuống local ──
+  window._S = S; // cần cho applyCloudData (realtime listener dùng sau này)
+  const cloudCfg = CLOUD.getCfg();
+  if (root) root.innerHTML = `<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg,#0f1117)">
+    <div style="text-align:center;color:#9a9590">
+      <div style="font-size:32px;margin-bottom:12px">🔄</div>
+      <div style="font-size:14px">${cloudCfg.enabled ? 'Đang tải dữ liệu từ Firebase...' : 'Đang tải dữ liệu...'}</div>
+      <div style="font-size:12px;margin-top:6px;color:#5c5850">Vui lòng chờ</div>
+    </div>
+  </div>`;
+  await Promise.all([
+    CLOUD.bootSync(S),
+    (typeof AICHAT !== 'undefined' && AICHAT.syncCfgFromCloud)
+      ? AICHAT.syncCfgFromCloud().catch(() => {})
+      : Promise.resolve(),
+  ]);
+  if (root) root.innerHTML = '';
 
   // ── Migrate SKU cho sản phẩm cũ chưa có mã ──────────────────
   // Chạy sau bootSync để có đủ data cloud trước khi generate
   migrateLegacySKU();
 
   render();
+  // Khởi động listener ngay sau render — không delay 1500ms nữa
+  // Delay cũ gây window mù: data từ thiết bị khác push trong 1500ms sau bootSync bị miss
+  if (cloudCfg.enabled) {
+    // Dọn heartbeat/listener của lần đăng nhập trước
+    if (_hbIv) clearInterval(_hbIv);
+    if (_visibilityHandler) document.removeEventListener('visibilitychange', _visibilityHandler);
+    CLOUD.startListeners();
+  }
   setTimeout(() => {
     if (typeof AICHAT !== 'undefined') AICHAT.init();
-    // Bắt đầu realtime listener sau khi render xong
     if (cloudCfg.enabled) {
-      setTimeout(() => {
-        CLOUD.startListeners();
-        // Dọn heartbeat/listener của lần đăng nhập trước (nếu có) — tránh
-        // chồng chất interval/listener khi đăng xuất rồi đăng nhập lại
-        if (_hbIv) clearInterval(_hbIv);
-        if (_visibilityHandler) document.removeEventListener('visibilitychange', _visibilityHandler);
-        // Heartbeat nhẹ: chỉ flush queue tồn đọng — onSnapshot đã xử lý realtime
-        // Không bootSync lại (tránh đọc Firestore ~8 collection mỗi 30s = 240 reads/phút)
-        _hbIv = setInterval(() => {
-          if (!document.hidden && AUTH.currentUser() && navigator.onLine) {
-            try { CLOUD.flushPending(); } catch(e) {}
-          }
-        }, 60000);
-        // Khi app quay lại foreground: restart listener + chỉ flush queue offline
-        _visibilityHandler = () => {
-          if (!document.hidden && AUTH.currentUser() && cloudCfg.enabled) {
-            CLOUD.stopListeners();
-            CLOUD.startListeners();
-            setTimeout(() => { try { CLOUD.flushPending(); } catch(e) {} }, 300);
-          }
-        };
-        document.addEventListener('visibilitychange', _visibilityHandler);
-      }, 500);
+      // Heartbeat: flush queue offline mỗi 60s
+      if (_hbIv) clearInterval(_hbIv);
+      _hbIv = setInterval(() => {
+        if (!document.hidden && AUTH.currentUser() && navigator.onLine) {
+          try { CLOUD.flushPending(); } catch(e) {}
+        }
+      }, 60000);
+      // Foreground: restart listener + flush
+      if (_visibilityHandler) document.removeEventListener('visibilitychange', _visibilityHandler);
+      _visibilityHandler = () => {
+        if (!document.hidden && AUTH.currentUser() && cloudCfg.enabled) {
+          CLOUD.stopListeners();
+          CLOUD.startListeners();
+          setTimeout(() => { try { CLOUD.flushPending(); } catch(e) {} }, 100);
+        }
+      };
+      document.addEventListener('visibilitychange', _visibilityHandler);
     }
-  }, 1000);
+  }, 100);
 
   startAutoLogoutTimer();
 }
@@ -2666,14 +2716,17 @@ function markRestoredAsFresh() {
 const S = {
   page: 'dashboard',
   sidebarOpen: false,
-  products:  DB.get('dtn_products',  SEED.products),
-  imports:   DB.get('dtn_imports',   SEED.imports),
-  sales:     DB.get('dtn_sales',     SEED.sales),
-  shipping:  DB.get('dtn_shipping',  SEED.shipping),
-  settings:  DB.get('dtn_settings',  SEED.settings),
-  returns:     DB.get('dtn_returns',     []),
-  paymentlogs: DB.get('dtn_paymentlogs', []),
-  cashflows:   DB.get('dtn_cashflows',   []),
+  // Firebase-first: S khởi tạo RỖNG — dữ liệu nạp từ Firebase trong bootApp().
+  // localStorage chỉ là cache offline, KHÔNG dùng làm initial state.
+  // Fallback về local chỉ khi Firebase mất mạng hoặc chưa cấu hình.
+  products:    [],
+  imports:     [],
+  sales:       [],
+  shipping:    [],
+  settings:    {...SEED.settings},
+  returns:     [],
+  paymentlogs: [],
+  cashflows:   [],
   stockAlerts: (() => { try { const v = localStorage.getItem('dtn_stockAlerts'); return v ? JSON.parse(v) : []; } catch(e) { return []; } })(),
   modal: null,
   confirm: null,
@@ -2681,29 +2734,8 @@ const S = {
   _toastTimer: null
 };
 
-// ── Migrate một lần: seed _stockTx từ lịch sử sales/imports/returns hiện có ──
-// QUAN TRỌNG: phải chạy TRƯỚC lần bootSync/listener đầu tiên. Nếu không, mọi
-// giao dịch cũ (đã nằm trong stock từ trước) sẽ bị applyLedgerToStock() coi
-// là "giao dịch mới" và cộng/trừ ĐÈ THÊM lên stock hiện có → sai lệch tồn kho
-// ngay lần đồng bộ đầu tiên sau khi cập nhật code này.
-(function seedStockTxOnce() {
-  let touched = false;
-  S.products = (S.products || []).map(p => {
-    // Thu thập id giao dịch hiện tại của sản phẩm này
-    const ids = [];
-    (S.sales || []).forEach(s => { if (s.productId === p.id && s.id) ids.push(s.id); });
-    (S.imports || []).forEach(i => { if (i.productId === p.id && i.id) ids.push(i.id); });
-    (S.returns || []).forEach(r => { if (r.productId === p.id && r.id) ids.push(r.id); });
-    // Bỏ qua nếu _stockTx đã có đủ id (kể cả mảng rỗng khi không có giao dịch nào)
-    // FIX: không dùng Array.isArray() làm điều kiện dừng vì _stockTx = [] (rỗng) có
-    // thể là chưa seed thật sự — phải kiểm tra xem có id giao dịch nào còn thiếu không.
-    if (Array.isArray(p._stockTx) && ids.every(id => p._stockTx.includes(id))) return p;
-    const fullTx = CLOUD.unionStockTx(p._stockTx, ids);
-    touched = true;
-    return { ...p, _stockTx: fullTx };
-  });
-  if (touched) { try { DB.set('dtn_products', S.products); } catch(e) {} }
-})();
+// seedStockTxOnce đã bỏ: Firebase-first — S khởi tạo rỗng, không có local data để seed.
+// _stockTx được seed trong bootSync sau khi pull Firebase về.
 
 // ── Theo dõi _updated đã push lần trước cho mỗi id, để chỉ push
 //    bản ghi THỰC SỰ thay đổi — tránh ghi đè lại toàn bộ mảng lên
@@ -5395,13 +5427,15 @@ function pgImports() {
                       const newM2 = (vt.stockM2 || 0) - i.qty;
                       return { ...vt, stockM2: newM2, stockPieces: ppm2 > 0 ? Math.round(newM2 * ppm2) : (vt.stockPieces || 0) - Math.round(i.qty * (ppm2 || 0)) };
                     });
-                    // Xoá txId khỏi _stockTx để applyLedgerToStock không áp lại khi sync cloud
-                    const newStockTx = (p._stockTx || []).filter(txId => txId !== i.id);
-                    return { ...p, stock: newStock, variants: newVariants, _stockTx: newStockTx, _updated: new Date().toISOString() };
+                    // GIỮ i.id trong _stockTx — tombstone để không double-apply nếu cần
+                    return { ...p, stock: newStock, variants: newVariants, _updated: new Date().toISOString() };
                   });
                 }
+                // softDelete TRƯỚC save(products): đảm bảo import._deleted lên Firebase
+                // trước khi product (stock mới) lên → listener không bị nhầm lẫn thứ tự
+                softDelete('imports', i.id, () => {});
                 save('products');
-                softDelete('imports', i.id, () => {}); toast('Đã xoá phiếu nhập · Kho đã trừ lại ' + fmtQty(i.qty) + ' ' + i.unit, 'info'); rebuild();
+                toast('Đã xoá phiếu nhập · Kho đã trừ lại ' + fmtQty(i.qty) + ' ' + i.unit, 'info'); rebuild();
               } };
               render();
             }
@@ -6977,6 +7011,12 @@ return h('tr', {},
                       S.confirm = {
                         msg: confirmMsg,
                         onYes: () => {
+                          // FIX race condition: soft-delete đơn bán LÊN CLOUD TRƯỚC
+                          // để khi cloud listener nhận lại snapshot dtn_sales, sale này
+                          // đã có _deleted=true → applyLedgerToStock bỏ qua → không trừ kho thêm.
+                          // Sau đó mới save product (với stock đã hoàn + _stockTx vẫn GIỮ s.id).
+                          softDelete('sales', s.id, () => {});
+
                           // 1. Hoàn kho: hoàn SL còn lại trong đơn + SL phiếu trả liên kết (để bù trừ bước 2)
                           // Bước 2 sẽ trừ lại phần đã cộng khi tạo phiếu trả → net = hoàn đúng qty gốc bán
                           const totalReturnQty = linkedReturns.reduce((a, r) => a + (r.returnQty || 0), 0);
@@ -6991,9 +7031,12 @@ return h('tr', {},
                                 const newM2=(vt.stockM2||0)+qtyToRestore;
                                 return {...vt, stockM2:newM2, stockPieces:ppm2>0?Math.round(newM2*ppm2):(vt.stockPieces||0)+Math.round(qtyToRestore*(ppm2||0))};
                               });
-                              // Xoá txId đơn bán khỏi _stockTx để applyLedgerToStock không áp lại khi sync cloud
-                              const newStockTx = (p._stockTx || []).filter(txId => txId !== s.id);
-                              return {...p, stock:newStock, variants:newVariants, _stockTx:newStockTx, _updated: new Date().toISOString()};
+                              // FIX: GIỮ s.id trong _stockTx (không xoá ra) — đây là tombstone
+                              // ngăn applyLedgerToStock trừ lại nếu thiết bị khác hoặc cloud
+                              // listener nhận sale này trước khi nhận product đã hoàn kho.
+                              // _stockTx chứa id đã-xử-lý, sale đã deleted nên không bao giờ
+                              // bị applyLedger áp lại (filter !_deleted) → an toàn giữ lại.
+                              return {...p, stock:newStock, variants:newVariants, _updated: new Date().toISOString()};
                             });
                           }
 
@@ -7003,9 +7046,8 @@ return h('tr', {},
                               S.products = S.products.map(p => {
                                 if (p.id !== r.productId) return p;
                                 const newStock = (parseFloat(p.stock)||0) - (parseFloat(r.returnQty)||0);
-                                // Xoá txId phiếu trả khỏi _stockTx
-                                const newStockTx = (p._stockTx || []).filter(txId => txId !== r.id);
-                                return {...p, stock: newStock, _stockTx: newStockTx, _updated: new Date().toISOString()};
+                                // FIX: GIỮ r.id trong _stockTx — tombstone ngăn double-apply
+                                return {...p, stock: newStock, _updated: new Date().toISOString()};
                               });
                             });
                             // Soft-delete phiếu trả liên kết
@@ -7023,9 +7065,8 @@ return h('tr', {},
                             setTimeout(() => { S.paymentlogs = (S.paymentlogs||[]).filter(l=>!l._deleted); DB.set('dtn_paymentlogs', S.paymentlogs); }, 600);
                           }
 
-                          // 4. Soft-delete đơn bán
+                          // 4. Save product (softDelete đã chạy ở bước đầu)
                           save('products');
-                          softDelete('sales', s.id, () => {});
 
                           const msg = linkedReturns.length > 0
                             ? `Đã xoá đơn + ${linkedReturns.length} phiếu trả hàng liên kết`
@@ -11167,6 +11208,89 @@ function pgSync() {
             render();
           } }, '⬇️ Kéo từ cloud về');
 
+          // Nút tính lại tồn kho từ cloud — dùng khi tồn kho bị lệch giữa 2 thiết bị
+          // Cách hoạt động: pull cloud → lấy TẤT CẢ imports/sales/returns từ cloud
+          // → tính lại stock từ đầu (base=0, cộng nhập, trừ bán, cộng trả)
+          // → ghi đè stock local → push ngược lên cloud để các thiết bị khác nhận
+          // Dùng khi: máy tính thể hiện stock khác điện thoại sau khi xoá đơn nhiều lần
+          const btnFixStock = h('button', { className: 'btn btn-sm', style: { background: 'rgba(224,92,92,0.18)', color: 'var(--red)', borderColor: 'rgba(224,92,92,0.4)', fontWeight: 700 }, onClick: async () => {
+            if (!cloudCfg.enabled) { toast('Chưa bật Firebase sync!', 'error'); return; }
+            S.confirm = {
+              msg: '🔧 Tính lại tồn kho từ cloud?\n\nThao tác này sẽ:\n• Pull toàn bộ phiếu nhập + đơn bán + trả hàng từ cloud\n• Tính lại stock từ đầu cho tất cả sản phẩm\n• Ghi đè tồn kho local và đẩy lên cloud\n\n⚠️ Dùng khi tồn kho bị lệch giữa máy tính và điện thoại.',
+              onYes: async () => {
+                toast('⏳ Đang tính lại tồn kho...', 'info');
+                try {
+                  // 1. Pull toàn bộ data từ cloud
+                  const cloudData = await CLOUD.pullAll();
+                  if (!cloudData) { toast('❌ Không kéo được dữ liệu từ cloud!', 'error'); return; }
+
+                  // 2. Lấy danh sách imports, sales, returns sạch (không _deleted)
+                  const cloudImports = (cloudData.products ? cloudData.products : []);
+                  // Re-pull riêng để rõ ràng
+                  const allImports  = (cloudData.imports  || []).filter(r => !r._deleted);
+                  const allSales    = (cloudData.sales    || []).filter(r => !r._deleted);
+                  const allReturns  = (cloudData.returns  || []).filter(r => !r._deleted);
+                  const allProducts = (cloudData.products || []).filter(r => !r._deleted);
+
+                  if (allProducts.length === 0) { toast('❌ Không có sản phẩm nào trên cloud!', 'error'); return; }
+
+                  // 3. Với mỗi sản phẩm: tính stock = sum(imports) - sum(sales) + sum(returns)
+                  const now = new Date().toISOString();
+                  const fixedProducts = allProducts.map(p => {
+                    const pImports = allImports.filter(r => r.productId === p.id);
+                    const pSales   = allSales.filter(r => r.productId === p.id);
+                    const pReturns = allReturns.filter(r => r.productId === p.id);
+
+                    const totalIn  = pImports.reduce((a, r) => a + (parseFloat(r.qty) || 0), 0);
+                    const totalOut = pSales.reduce((a, r) => a + (parseFloat(r.qty) || 0), 0);
+                    const totalRet = pReturns.reduce((a, r) => a + (parseFloat(r.returnQty) || 0), 0);
+                    const newStock = Math.max(0, totalIn - totalOut + totalRet);
+
+                    // Seed _stockTx đầy đủ để các thiết bị khác không double-apply
+                    const allTxIds = [
+                      ...pImports.map(r => r.id),
+                      ...pSales.map(r => r.id),
+                      ...pReturns.map(r => r.id),
+                    ].filter(Boolean);
+
+                    // Tính lại variant stock (m²) nếu có variantId
+                    const newVariants = (p.variants || []).map(vt => {
+                      const vtSales   = pSales.filter(r => r.variantId === vt.id);
+                      const vtImports = pImports.filter(r => r.variantId === vt.id);
+                      const vtIn  = vtImports.reduce((a, r) => a + (parseFloat(r.qty) || 0), 0);
+                      const vtOut = vtSales.reduce((a, r) => a + (parseFloat(r.qty) || 0), 0);
+                      const newM2 = Math.max(0, vtIn - vtOut);
+                      const ppm2 = (vt.tileW > 0 && vt.tileH > 0) ? 10000 / (vt.tileW * vt.tileH) : 0;
+                      return { ...vt, stockM2: newM2, stockPieces: ppm2 > 0 ? Math.round(newM2 * ppm2) : vt.stockPieces };
+                    });
+
+                    return { ...p, stock: newStock, variants: newVariants, _stockTx: allTxIds, _updated: now };
+                  });
+
+                  // 4. Merge lại toàn bộ cloud data vào local S (không mất đơn nào)
+                  S.products    = fixedProducts;
+                  S.imports     = S.imports.concat(allImports.filter(r => !S.imports.find(l => l.id === r.id)));
+                  S.sales       = S.sales.concat(allSales.filter(r => !S.sales.find(l => l.id === r.id)));
+                  S.returns     = S.returns.concat(allReturns.filter(r => !S.returns.find(l => l.id === r.id)));
+
+                  // 5. Lưu local
+                  ['products','imports','sales','returns'].forEach(k => save(k));
+
+                  // 6. Đẩy products đã sửa lên cloud để thiết bị khác nhận
+                  CLOUD.push('dtn_products', fixedProducts);
+
+                  const count = fixedProducts.length;
+                  toast(`✅ Đã tính lại tồn kho cho ${count} sản phẩm từ cloud!`, 'success');
+                  render();
+                } catch(e) {
+                  console.error('[FIX STOCK]', e);
+                  toast('❌ Lỗi: ' + (e.message || e), 'error');
+                }
+              }
+            };
+            render();
+          } }, '🔧 Sửa tồn kho từ cloud');
+
           const guideDiv = h('div', { style: { background: 'var(--bg3)', borderRadius: 'var(--r2)', padding: '10px 14px', fontSize: 12, color: 'var(--text2)', lineHeight: 1.7, marginTop: 12, borderLeft: '3px solid var(--blue)' } },
             h('b', { style: { color: 'var(--blue)' } }, '💡 Hướng dẫn lấy thông tin Firebase:'), h('br'),
             '1. Vào ', h('b', {}, 'console.firebase.google.com'), ' → Tạo project mới (miễn phí)', h('br'),
@@ -11194,7 +11318,7 @@ function pgSync() {
               shopIdInp
             ),
             toggleDiv,
-            h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } }, btnTest, btnSave, cloudCfg.enabled && btnSyncNow, cloudCfg.enabled && btnPull),
+            h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } }, btnTest, btnSave, cloudCfg.enabled && btnSyncNow, cloudCfg.enabled && btnPull, cloudCfg.enabled && btnFixStock),
             statusDiv,
             guideDiv
           );
@@ -11848,8 +11972,10 @@ function pgReturns() {
                       S.confirm = {
                         msg: `Xoá phiếu trả hàng của "${r.customer}" (${fmtQty(r.returnQty)} ${r.unit} ${r.productName})?\n\n⚠️ Hàng sẽ bị lấy lại ra khỏi kho và doanh thu đơn gốc sẽ được khôi phục.`,
                         onYes: () => {
-                          // Hoàn tác: trừ lại hàng khỏi kho (vì khi tạo phiếu trả đã cộng vào kho)
-                          S.products = S.products.map(p => p.id === r.productId ? { ...p, stock: (parseFloat(p.stock)||0) - (parseFloat(r.returnQty)||0), _updated: new Date().toISOString() } : p);
+                          // Hoàn tác: trừ lại hàng khỏi kho (giữ r.id trong _stockTx làm tombstone)
+                          S.products = S.products.map(p => p.id === r.productId
+                            ? { ...p, stock: (parseFloat(p.stock)||0) - (parseFloat(r.returnQty)||0), _updated: new Date().toISOString() }
+                            : p);
                           // Hoàn tác: cộng lại doanh thu đơn gốc nếu có
                           if (r.saleId) {
                             S.sales = S.sales.map(s => {
@@ -11858,12 +11984,13 @@ function pgReturns() {
                               const newVatAmt   = Math.round(newSubTotal * s.vatRate / 100);
                               const newTotal    = newSubTotal + newVatAmt;
                               const newQty      = s.qty + r.returnQty;
-                              // Cập nhật lại status: nếu đã thu đủ thì done, ngược lại debt
                               const newStatus   = s.paid >= newTotal ? 'done' : 'debt';
                               return { ...s, qty: newQty, subTotal: newSubTotal, vatAmt: newVatAmt, total: newTotal, status: newStatus, _updated: new Date().toISOString() };
                             });
                           }
-                          softDelete('returns', r.id, () => { save('products'); save('sales'); });
+                          // softDelete TRƯỚC save: return._deleted lên Firebase trước
+                          softDelete('returns', r.id, () => {});
+                          save('products'); save('sales');
                           toast('Đã xoá phiếu trả hàng, kho và đơn gốc được khôi phục', 'info');
                           rebuild();
                         }
