@@ -3232,6 +3232,78 @@ function mkInput(type, placeholder, value, onInput) {
   }
   return el;
 }
+// ── mkAutocomplete: input với dropdown gợi ý (NCC / khách hàng) ──
+function mkAutocomplete(placeholder, initValue, getSuggestions, onChange) {
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'position:relative;width:100%';
+
+  const inp = document.createElement('input');
+  inp.type = 'text';
+  inp.className = 'form-input';
+  inp.placeholder = placeholder;
+  inp.value = initValue || '';
+  inp.autocomplete = 'off';
+
+  const dropdown = document.createElement('div');
+  dropdown.style.cssText = 'position:absolute;left:0;right:0;top:calc(100% + 4px);background:var(--bg3);border:1px solid var(--accent);border-radius:var(--r2);z-index:9999;max-height:220px;overflow-y:auto;display:none;box-shadow:0 8px 24px rgba(0,0,0,0.5)';
+
+  let activeIdx = -1;
+
+  function showDropdown(items) {
+    dropdown.innerHTML = '';
+    activeIdx = -1;
+    if (!items.length) { dropdown.style.display = 'none'; return; }
+    items.forEach((text, i) => {
+      const item = document.createElement('div');
+      item.style.cssText = 'padding:10px 14px;font-size:13px;cursor:pointer;color:var(--text);border-bottom:1px solid var(--border);transition:background .12s';
+      item.textContent = text;
+      item.onmouseenter = () => { setActive(i); };
+      item.onmouseleave = () => { item.style.background = ''; };
+      item.onmousedown = e => {
+        e.preventDefault();
+        inp.value = text;
+        onChange && onChange(text);
+        dropdown.style.display = 'none';
+      };
+      dropdown.appendChild(item);
+    });
+    dropdown.style.display = 'block';
+  }
+
+  function setActive(i) {
+    const kids = dropdown.querySelectorAll('div');
+    kids.forEach((k, idx) => { k.style.background = idx === i ? 'var(--accent-dim)' : ''; });
+    activeIdx = i;
+  }
+
+  function rebuild(q) {
+    const sugs = getSuggestions(q);
+    showDropdown(sugs);
+  }
+
+  inp.addEventListener('input', e => { onChange && onChange(e.target.value); rebuild(e.target.value); });
+  inp.addEventListener('focus', () => { rebuild(inp.value); });
+  inp.addEventListener('blur', () => { setTimeout(() => { dropdown.style.display = 'none'; }, 150); });
+  inp.addEventListener('keydown', e => {
+    const kids = dropdown.querySelectorAll('div');
+    if (e.key === 'ArrowDown') { e.preventDefault(); setActive(Math.min(activeIdx + 1, kids.length - 1)); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setActive(Math.max(activeIdx - 1, 0)); }
+    else if (e.key === 'Enter' && activeIdx >= 0 && kids[activeIdx]) {
+      e.preventDefault();
+      inp.value = kids[activeIdx].textContent;
+      onChange && onChange(inp.value);
+      dropdown.style.display = 'none';
+    } else if (e.key === 'Escape') { dropdown.style.display = 'none'; }
+  });
+
+  wrap.appendChild(inp);
+  wrap.appendChild(dropdown);
+  // Expose .value for reading
+  Object.defineProperty(wrap, 'value', { get: () => inp.value, set: v => { inp.value = v; } });
+  wrap._inp = inp;
+  return wrap;
+}
+
 function mkSelect(options, current, onChange) {
   const el = document.createElement('select');
   el.className = 'form-input';
@@ -5668,7 +5740,13 @@ function openImport(existing, rebuild, prefillProduct) {
 
   // ── Shared fields (áp dụng cho toàn phiếu) ───────────────────
   const inpDate     = mkInput('date', '', e.date || today(), v => {});
-  const inpSupplier = mkInput('text', 'Tên nhà cung cấp...', e.supplier || '', v => {});
+  // Autocomplete nhà cung cấp — lấy danh sách NCC đã nhập trước
+  const inpSupplier = mkAutocomplete('🏭 Tên nhà cung cấp...', e.supplier || '',
+    q => {
+      const all = [...new Set((S.imports || []).map(i => i.supplier).filter(Boolean))].sort();
+      return q ? all.filter(s => s.toLowerCase().includes(q.toLowerCase())) : all;
+    },
+    () => {});
 
   // ── Phí vận chuyển nhập hàng (chung toàn phiếu) ──────────────
   const SHIP_UNITS = ['chuyến','tấn','cái','thùng','kg','m²','tấm'];
@@ -7069,7 +7147,12 @@ function openSale(rebuild, preselectedProduct) {
 
   // ── Shared fields ─────────────────────────────────────────────
   const inpDate  = mkInput('date','',today(),v=>{});
-  const inpCust  = mkInput('text','Tên khách hàng','',v=>{});
+  const inpCust  = mkAutocomplete('👤 Tên khách hàng', '',
+    q => {
+      const all = [...new Set((S.sales || []).map(s => s.customer).filter(Boolean))].sort();
+      return q ? all.filter(c => c.toLowerCase().includes(q.toLowerCase())) : all;
+    },
+    () => {});
   const inpPhone = mkInput('tel','0909...','',v=>{});
   const inpAddr  = mkInput('text','Địa chỉ giao hàng...','',v=>{});
   const inpNote  = mkInput('text','Ghi chú...','',v=>{});
@@ -7365,7 +7448,66 @@ function openSale(rebuild, preselectedProduct) {
   itemsHdr.innerHTML='📋 Danh sách mặt hàng <span style="font-size:10px;font-weight:400;color:var(--text3)">(có thể thêm nhiều sản phẩm cùng lúc)</span>';
   itemsWrap.appendChild(itemsHdr);
 
-  // Banner xác nhận khi mở từ catalogue — đặt TRƯỚC itemsContainer (sau khi itemsWrap đã có hdr)
+  // ── Ô tìm kiếm sản phẩm nhanh ─────────────────────────────────
+  const quickSearchWrap = document.createElement('div');
+  quickSearchWrap.style.cssText = 'position:relative;margin-bottom:10px';
+  const quickSearchInp = document.createElement('input');
+  quickSearchInp.type = 'text';
+  quickSearchInp.className = 'form-input';
+  quickSearchInp.placeholder = '⚡ Tìm nhanh sản phẩm để thêm vào đơn... (gõ tên, SKU)';
+  quickSearchInp.autocomplete = 'off';
+  quickSearchInp.style.cssText = 'width:100%;background:rgba(201,168,76,.07);border-color:rgba(201,168,76,.35)';
+  const quickDrop = document.createElement('div');
+  quickDrop.style.cssText = 'position:absolute;left:0;right:0;top:calc(100% + 4px);background:var(--bg3);border:1px solid var(--accent);border-radius:var(--r2);z-index:9999;max-height:260px;overflow-y:auto;display:none;box-shadow:0 8px 28px rgba(0,0,0,0.55)';
+  function quickBuildDrop(q) {
+    quickDrop.innerHTML = '';
+    if (!q) { quickDrop.style.display = 'none'; return; }
+    const matches = products.filter(p =>
+      p.name.toLowerCase().includes(q.toLowerCase()) ||
+      (p.sku && p.sku.toLowerCase().includes(q.toLowerCase()))
+    ).slice(0, 12);
+    if (!matches.length) { quickDrop.style.display = 'none'; return; }
+    matches.forEach(p => {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:9px 13px;cursor:pointer;border-bottom:1px solid var(--border);transition:background .12s';
+      row.onmouseenter = () => { row.style.background = 'var(--accent-dim)'; };
+      row.onmouseleave = () => { row.style.background = ''; };
+      const stock = parseFloat(p.stock) || 0;
+      const stockCls = stock > 0 ? (stock < 10 ? 'low' : 'ok') : 'out';
+      const stockColor = stock > 0 ? (stock < 10 ? 'var(--amber)' : 'var(--green)') : 'var(--red)';
+      row.innerHTML =
+        (p.image ? `<img src="${escHtml(p.image)}" style="width:36px;height:36px;object-fit:cover;border-radius:6px;flex-shrink:0;border:1px solid var(--border2)">` : `<div style="width:36px;height:36px;background:var(--bg4);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0">💎</div>`) +
+        `<div style="flex:1;min-width:0">
+          <div style="font-size:13px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escHtml(p.name)}${p.sku ? ` <span style="font-size:10px;color:var(--text3)">[${escHtml(p.sku)}]</span>` : ''}</div>
+          <div style="font-size:11px;color:var(--accent);margin-top:2px">${fmt(p.sellPrice)}đ/${escHtml(p.unit||'')} · <span style="color:${stockColor}">Tồn: ${fmtQty(stock)} ${escHtml(p.unit||'')}</span></div>
+        </div>
+        <div style="font-size:11px;color:var(--accent);font-weight:700;white-space:nowrap">+ Thêm</div>`;
+      row.onmousedown = e => {
+        e.preventDefault();
+        // Tìm dòng hàng cuối còn trống hoặc thêm dòng mới
+        const emptyIdx = saleItems.findIndex(it => !it.productId);
+        if (emptyIdx >= 0) {
+          saleItems[emptyIdx].productId = p.id;
+          saleItems[emptyIdx].price = p.sellPrice || '';
+        } else {
+          saleItems.push({ id: uid(), productId: p.id, variantId: '', qty: '', price: p.sellPrice || '', vatRate: defaultVat });
+        }
+        rebuildItems(); updateSum();
+        quickSearchInp.value = '';
+        quickDrop.style.display = 'none';
+        quickSearchInp.focus();
+      };
+      quickDrop.appendChild(row);
+    });
+    quickDrop.style.display = 'block';
+  }
+  quickSearchInp.addEventListener('input', e => quickBuildDrop(e.target.value));
+  quickSearchInp.addEventListener('focus', e => { if (e.target.value) quickBuildDrop(e.target.value); });
+  quickSearchInp.addEventListener('blur', () => { setTimeout(() => { quickDrop.style.display = 'none'; }, 180); });
+  quickSearchInp.addEventListener('keydown', e => { if (e.key === 'Escape') { quickDrop.style.display = 'none'; quickSearchInp.value = ''; } });
+  quickSearchWrap.appendChild(quickSearchInp);
+  quickSearchWrap.appendChild(quickDrop);
+  itemsWrap.appendChild(quickSearchWrap);
   if (preselectedProduct) {
     const banner = document.createElement('div');
     banner.style.cssText='display:flex;align-items:center;gap:10px;padding:10px 14px;background:rgba(201,168,76,.12);border:1px solid rgba(201,168,76,.35);border-radius:var(--r2);margin-bottom:8px;font-size:12px;color:var(--accent)';
