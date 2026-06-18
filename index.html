@@ -207,6 +207,36 @@ textarea.form-input{resize:vertical;min-height:72px}
   body{background:#fff;color:#111}
 }
 @media(max-width:860px){.q3col{grid-template-columns:1fr!important}}
+/* ── Profit page ── */
+.profit-kpi{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:22px}
+@media(max-width:860px){.profit-kpi{grid-template-columns:repeat(2,1fr)}}
+.profit-kpi-card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:16px 18px}
+.profit-kpi-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--text3);margin-bottom:7px}
+.profit-kpi-val{font-size:22px;font-weight:700;font-family:Georgia,serif}
+.profit-kpi-sub{font-size:11px;color:var(--text2);margin-top:5px}
+.profit-row{display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr 1fr;gap:0;align-items:center}
+.profit-tbl-wrap{border-radius:var(--r);border:1px solid var(--border);overflow:hidden}
+.profit-tbl{width:100%;border-collapse:collapse;font-size:12px;min-width:700px}
+.profit-tbl th{padding:9px 12px;background:var(--bg3);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--text3);text-align:right;white-space:nowrap}
+.profit-tbl th:first-child{text-align:left}
+.profit-tbl td{padding:10px 12px;border-top:1px solid var(--border);text-align:right;vertical-align:middle}
+.profit-tbl td:first-child{text-align:left}
+.profit-tbl tr:hover td{background:rgba(255,255,255,.02)}
+.profit-tbl .profit-pos{color:var(--green);font-weight:700}
+.profit-tbl .profit-neg{color:var(--red);font-weight:700}
+.profit-tbl .profit-zero{color:var(--text3)}
+.profit-group-hdr{background:var(--bg3);font-size:11px;font-weight:700;color:var(--accent);letter-spacing:.5px;cursor:pointer;user-select:none}
+.profit-group-hdr:hover td{background:var(--accent-dim)!important}
+/* ── ShipTrack page ── */
+.ship-kpi{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:22px}
+@media(max-width:860px){.ship-kpi{grid-template-columns:repeat(2,1fr)}}
+.ship-badge-in{background:rgba(76,175,125,.15);color:var(--green);border:1px solid rgba(76,175,125,.3);padding:3px 9px;border-radius:99px;font-size:11px;font-weight:700;white-space:nowrap}
+.ship-badge-out{background:rgba(91,143,232,.15);color:var(--blue);border:1px solid rgba(91,143,232,.3);padding:3px 9px;border-radius:99px;font-size:11px;font-weight:700;white-space:nowrap}
+.ship-tbl-wrap{border-radius:var(--r);border:1px solid var(--border);overflow:hidden}
+.ship-tbl{width:100%;border-collapse:collapse;font-size:12px;min-width:620px}
+.ship-tbl th{padding:9px 12px;background:var(--bg3);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--text3);white-space:nowrap}
+.ship-tbl td{padding:10px 12px;border-top:1px solid var(--border);vertical-align:middle}
+.ship-tbl tr:hover td{background:rgba(255,255,255,.02)}
 </style>
 </head>
 <body>
@@ -3376,6 +3406,8 @@ const ALL_PAGES = [
   {id:'sales',    label:'Bán hàng',    icon:'🧾', adminOnly: false,  staffVisible: true},
   {id:'returns',  label:'Trả hàng',    icon:'🔄', adminOnly: true,  staffVisible: false},
   {id:'cashflow', label:'Thu / Chi',   icon:'💵', adminOnly: true,  staffVisible: false},
+  {id:'profit',   label:'Lợi Nhuận',  icon:'📈', adminOnly: true,  staffVisible: false},
+  {id:'shiptrack',label:'Vận Chuyển', icon:'🚛', adminOnly: true,  staffVisible: false},
   {id:'debt',     label:'Công nợ',     icon:'💳', adminOnly: true,  staffVisible: true},
   {id:'invoice',  label:'Hoá đơn',     icon:'📄', adminOnly: true,  staffVisible: true},
   {id:'quotation',label:'Báo Giá',     icon:'💰', adminOnly: false,  staffVisible: true},
@@ -3482,6 +3514,8 @@ function buildApp() {
     bienban: pgBienBan,
     hopdong: pgHopDong,
     cashflow: pgCashflow,
+    profit: pgProfit,
+    shiptrack: pgShipTrack,
     staffreport: pgStaffReport,
     vatrpt: pgVatReport,
     search: pgSearch,
@@ -12998,6 +13032,472 @@ function pgSearch() {
   return wrap;
 }
 
+
+
+
+// ═══════════════════════════════════════════════════════════════
+//  TRANG LỢI NHUẬN — Chỉ xem, không chỉnh sửa
+//  Lợi nhuận thực = DT thuần − COGS − VC tự chịu (mỗi đơn)
+// ═══════════════════════════════════════════════════════════════
+function pgProfit() {
+  const wrap = h('div', {});
+  if (!pgProfit._period) pgProfit._period = 'month';
+  if (!pgProfit._selDate) pgProfit._selDate = localDateStr(new Date());
+  if (!pgProfit._group)  pgProfit._group  = 'day';   // 'order'|'day'|'month'|'year'
+  if (!pgProfit._expand) pgProfit._expand = new Set();
+
+  const period  = pgProfit._period;
+  const selDate = new Date(pgProfit._selDate);
+
+  const { sales, imports, products, cashflows, returns: rets } = S;
+
+  // ── Lọc theo kỳ ──────────────────────────────────────────────
+  function matchPeriod(dateStr) {
+    if (!dateStr) return false;
+    const d = new Date(dateStr);
+    if (period === 'day')   return dateStr.slice(0,10) === pgProfit._selDate.slice(0,10);
+    if (period === 'month') return d.getFullYear() === selDate.getFullYear() && d.getMonth() === selDate.getMonth();
+    if (period === 'year')  return d.getFullYear() === selDate.getFullYear();
+    return true;
+  }
+
+  const filteredSales = (sales || []).filter(s => matchPeriod(s.date));
+
+  // ── Tính lợi nhuận cho từng đơn bán ─────────────────────────
+  function cogsForSale(s) {
+    const sQty = parseFloat(s.qty) || 0;
+    const saleVatRate = s.vatRate || 0;
+    const candidates = [...(imports || [])].filter(i => i.productId === s.productId && i.date <= s.date).sort((a,b)=>b.date.localeCompare(a.date));
+    const imp = s.variantId ? (candidates.find(i=>i.variantId===s.variantId)||candidates[0]) : candidates[0];
+    if (!imp) {
+      const buyPrice = (products||[]).find(p=>p.id===s.productId)?.buyPrice || 0;
+      return buyPrice * sQty;
+    }
+    const unitPriceNet = imp.unitPrice || 0;
+    const impVatRate   = imp.vatRate   || 0;
+    const costPerUnit  = (saleVatRate===0 && impVatRate>0) ? unitPriceNet*(1+impVatRate/100) : unitPriceNet;
+    const goodsCost    = costPerUnit * sQty;
+    const impShipFee    = imp.shipFee    || 0;
+    const impShipVatR   = imp.shipVatRate || 0;
+    const impShipFeeNet = impShipVatR>0 ? impShipFee/(1+impShipVatR/100) : impShipFee;
+    const impQty = parseFloat(imp.qty)||1;
+    return goodsCost + (impQty>0 ? impShipFeeNet/impQty : 0)*sQty;
+  }
+
+  function profitForSale(s) {
+    const revenue = s.subTotal != null ? s.subTotal : Math.max(0,(s.total||0)-(s.shipFee||0)-(s.vatAmt||0));
+    const cogs    = cogsForSale(s);
+    const vcStore = (!s.shipForCustomer && s.shipFee) ? (() => {
+      const net = (s.shipVatRate||0)>0 ? (s.shipFee/(1+(s.shipVatRate||0)/100)) : s.shipFee;
+      return net;
+    })() : 0;
+    return revenue - cogs - vcStore;
+  }
+
+  const profitData = filteredSales.map(s => ({
+    ...s,
+    _revenue: s.subTotal != null ? s.subTotal : Math.max(0,(s.total||0)-(s.shipFee||0)-(s.vatAmt||0)),
+    _cogs:    cogsForSale(s),
+    _vcStore: (!s.shipForCustomer && s.shipFee) ? ((s.shipVatRate||0)>0?(s.shipFee/(1+(s.shipVatRate||0)/100)):s.shipFee) : 0,
+    _profit:  profitForSale(s),
+  }));
+
+  const totalRevenue = profitData.reduce((a,s)=>a+s._revenue,0);
+  const totalCogs    = profitData.reduce((a,s)=>a+s._cogs,0);
+  const totalVc      = profitData.reduce((a,s)=>a+s._vcStore,0);
+  const totalProfit  = profitData.reduce((a,s)=>a+s._profit,0);
+  const margin       = totalRevenue>0 ? (totalProfit/totalRevenue*100).toFixed(1) : '0.0';
+
+  // ── Period navigation ─────────────────────────────────────────
+  function navPeriod(dir) {
+    const d = new Date(pgProfit._selDate);
+    if (period==='day')   d.setDate(d.getDate()+dir);
+    if (period==='month') d.setMonth(d.getMonth()+dir);
+    if (period==='year')  d.setFullYear(d.getFullYear()+dir);
+    pgProfit._selDate = localDateStr(d);
+    render();
+  }
+  function periodLabel() {
+    if (period==='day')   return 'Ngày ' + selDate.toLocaleDateString('vi-VN');
+    if (period==='month') return 'Tháng ' + (selDate.getMonth()+1) + '/' + selDate.getFullYear();
+    if (period==='year')  return 'Năm ' + selDate.getFullYear();
+    return '';
+  }
+
+  // ── Header ────────────────────────────────────────────────────
+  wrap.appendChild(h('div', {className:'page-header'},
+    h('div', {},
+      h('div', {className:'page-title'}, '📈 Lợi Nhuận'),
+      h('div', {className:'page-sub'}, 'Lợi nhuận thực sau khi trừ hết chi phí · Chỉ xem')
+    ),
+    h('div', {style:{display:'flex',alignItems:'center',gap:6,background:'rgba(76,175,125,.1)',border:'1px solid rgba(76,175,125,.25)',borderRadius:'var(--r2)',padding:'6px 14px',fontSize:12,color:'var(--green)',fontWeight:700}}, '🔒 Chỉ xem — không chỉnh sửa')
+  ));
+
+  // ── Period bar ────────────────────────────────────────────────
+  wrap.appendChild(h('div', {style:{display:'flex',alignItems:'center',gap:8,marginBottom:18,flexWrap:'wrap'}},
+    h('div', {style:{display:'flex',gap:4}},
+      ...['day','month','year'].map(p=>h('button',{
+        className:'btn btn-sm'+(period===p?' btn-primary':''),
+        onClick:()=>{pgProfit._period=p;render();}
+      }, p==='day'?'📅 Ngày':p==='month'?'📆 Tháng':'🗓️ Năm'))
+    ),
+    h('div', {style:{display:'flex',alignItems:'center',gap:6,background:'var(--bg3)',borderRadius:'var(--r2)',padding:'4px 10px',border:'1px solid var(--border2)'}},
+      h('button',{className:'btn btn-ghost btn-sm',style:{padding:'2px 8px'},onClick:()=>navPeriod(-1)},'◀'),
+      h('span',{style:{fontWeight:700,fontSize:13,color:'var(--accent)',minWidth:140,textAlign:'center'}},periodLabel()),
+      h('button',{className:'btn btn-ghost btn-sm',style:{padding:'2px 8px'},onClick:()=>navPeriod(1)},'▶'),
+      h('button',{className:'btn btn-ghost btn-sm',style:{fontSize:11,color:'var(--text3)'},onClick:()=>{pgProfit._selDate=localDateStr(new Date());render();}},'Hôm nay')
+    )
+  ));
+
+  // ── KPI cards ─────────────────────────────────────────────────
+  const kpiDiv = document.createElement('div');
+  kpiDiv.className='profit-kpi';
+  [
+    {label:'Doanh Thu Thuần',val:fmt(totalRevenue)+'đ',sub:filteredSales.length+' đơn hàng',color:'var(--blue)'},
+    {label:'Giá Vốn (COGS)',val:fmt(totalCogs)+'đ',sub:'Chi phí hàng bán',color:'var(--amber)'},
+    {label:'VC Tự Chịu',val:fmt(totalVc)+'đ',sub:'Phí VC cửa hàng',color:'var(--text2)'},
+    {label:'Lợi Nhuận Thực',val:fmt(Math.round(totalProfit))+'đ',sub:'Biên LN: '+margin+'%',color:totalProfit>=0?'var(--green)':'var(--red)'},
+  ].forEach(k=>{
+    const c=document.createElement('div'); c.className='profit-kpi-card';
+    c.innerHTML=`<div class="profit-kpi-label">${k.label}</div><div class="profit-kpi-val" style="color:${k.color}">${k.val}</div><div class="profit-kpi-sub">${k.sub}</div>`;
+    kpiDiv.appendChild(c);
+  });
+  wrap.appendChild(kpiDiv);
+
+  // ── Group selector ────────────────────────────────────────────
+  const grp = pgProfit._group;
+  wrap.appendChild(h('div', {style:{display:'flex',alignItems:'center',gap:8,marginBottom:14,flexWrap:'wrap'}},
+    h('span', {style:{fontSize:12,color:'var(--text2)',fontWeight:600}},'Xem theo:'),
+    ...['order','day','month','year'].map(g=>h('button',{
+      className:'btn btn-sm'+(grp===g?' btn-primary':''),
+      onClick:()=>{pgProfit._group=g;pgProfit._expand=new Set();render();}
+    }, g==='order'?'🧾 Từng đơn':g==='day'?'📅 Ngày':g==='month'?'📆 Tháng':'🗓️ Năm'))
+  ));
+
+  // ── Table ─────────────────────────────────────────────────────
+  const tblWrap = document.createElement('div');
+  tblWrap.className='profit-tbl-wrap';
+  tblWrap.style.overflowX='auto';
+  const tbl = document.createElement('table');
+  tbl.className='profit-tbl';
+
+  // Header
+  tbl.innerHTML=`<thead><tr>
+    <th style="text-align:left">${grp==='order'?'Đơn hàng':'Kỳ'}</th>
+    <th>${grp==='order'?'Ngày':''}</th>
+    <th>Doanh Thu</th>
+    <th>Giá Vốn</th>
+    <th>VC Tự Chịu</th>
+    <th>Lợi Nhuận</th>
+    <th>Biên LN</th>
+  </tr></thead>`;
+  const tbody=document.createElement('tbody');
+
+  function profitClass(v){return v>0?'profit-pos':v<0?'profit-neg':'profit-zero';}
+
+  if (grp==='order') {
+    const sorted=[...profitData].sort((a,b)=>b.date.localeCompare(a.date));
+    if (!sorted.length) {
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td colspan="7" style="text-align:center;padding:40px;color:var(--text3)">Không có đơn hàng trong kỳ này</td>`;
+      tbody.appendChild(tr);
+    }
+    sorted.forEach(s=>{
+      const margin=s._revenue>0?(s._profit/s._revenue*100).toFixed(1):'—';
+      const tr=document.createElement('tr');
+      tr.innerHTML=`
+        <td><div style="font-weight:600;font-size:12px">${escHtml(s.customer||'—')}</div><div style="font-size:11px;color:var(--text3)">${escHtml(s.productName||'')}</div></td>
+        <td style="white-space:nowrap;color:var(--text2)">${fmtD(s.date)}</td>
+        <td>${fmt(Math.round(s._revenue))}đ</td>
+        <td style="color:var(--amber)">${fmt(Math.round(s._cogs))}đ</td>
+        <td style="color:var(--text2)">${s._vcStore>0?fmt(Math.round(s._vcStore))+'đ':'—'}</td>
+        <td class="${profitClass(s._profit)}">${fmt(Math.round(s._profit))}đ</td>
+        <td class="${profitClass(s._profit)}">${margin!=='—'?margin+'%':'—'}</td>`;
+      tbody.appendChild(tr);
+    });
+  } else {
+    // Group by day/month/year
+    function groupKey(dateStr){
+      if(!dateStr)return'';
+      const d=new Date(dateStr);
+      if(grp==='day')   return dateStr.slice(0,10);
+      if(grp==='month') return dateStr.slice(0,7);
+      if(grp==='year')  return String(d.getFullYear());
+    }
+    function groupLabel(k){
+      if(grp==='day'){
+        const d=new Date(k);
+        return d.toLocaleDateString('vi-VN',{weekday:'short',day:'2-digit',month:'2-digit',year:'numeric'});
+      }
+      if(grp==='month'){const[y,m]=k.split('-');return'Tháng '+parseInt(m)+'/'+y;}
+      return'Năm '+k;
+    }
+    // Build groups
+    const groups={};
+    profitData.forEach(s=>{
+      const k=groupKey(s.date);
+      if(!groups[k]) groups[k]={revenue:0,cogs:0,vc:0,profit:0,items:[]};
+      groups[k].revenue+=s._revenue;
+      groups[k].cogs+=s._cogs;
+      groups[k].vc+=s._vcStore;
+      groups[k].profit+=s._profit;
+      groups[k].items.push(s);
+    });
+    const keys=Object.keys(groups).sort((a,b)=>b.localeCompare(a));
+    if(!keys.length){
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td colspan="7" style="text-align:center;padding:40px;color:var(--text3)">Không có dữ liệu trong kỳ này</td>`;
+      tbody.appendChild(tr);
+    }
+    keys.forEach(k=>{
+      const g=groups[k];
+      const mg=g.revenue>0?(g.profit/g.revenue*100).toFixed(1):'—';
+      const expanded=pgProfit._expand.has(k);
+      const hdrTr=document.createElement('tr');
+      hdrTr.className='profit-group-hdr';
+      hdrTr.innerHTML=`
+        <td colspan="2" style="font-weight:700;font-size:12px">${expanded?'▼':'▶'} ${groupLabel(k)} <span style="font-size:10px;font-weight:400;color:var(--text3)">(${g.items.length} đơn)</span></td>
+        <td>${fmt(Math.round(g.revenue))}đ</td>
+        <td style="color:var(--amber)">${fmt(Math.round(g.cogs))}đ</td>
+        <td style="color:var(--text2)">${g.vc>0?fmt(Math.round(g.vc))+'đ':'—'}</td>
+        <td class="${profitClass(g.profit)}">${fmt(Math.round(g.profit))}đ</td>
+        <td class="${profitClass(g.profit)}">${mg!=='—'?mg+'%':'—'}</td>`;
+      hdrTr.onclick=()=>{
+        if(pgProfit._expand.has(k)) pgProfit._expand.delete(k); else pgProfit._expand.add(k);
+        render();
+      };
+      tbody.appendChild(hdrTr);
+      if(expanded){
+        [...g.items].sort((a,b)=>b.date.localeCompare(a.date)).forEach(s=>{
+          const sm=s._revenue>0?(s._profit/s._revenue*100).toFixed(1):'—';
+          const tr=document.createElement('tr');
+          tr.style.background='rgba(255,255,255,.012)';
+          tr.innerHTML=`
+            <td style="padding-left:28px"><div style="font-size:12px;font-weight:600">${escHtml(s.customer||'—')}</div><div style="font-size:10px;color:var(--text3)">${escHtml(s.productName||'')}</div></td>
+            <td style="color:var(--text2);font-size:11px;white-space:nowrap">${fmtD(s.date)}</td>
+            <td style="font-size:11px">${fmt(Math.round(s._revenue))}đ</td>
+            <td style="color:var(--amber);font-size:11px">${fmt(Math.round(s._cogs))}đ</td>
+            <td style="color:var(--text2);font-size:11px">${s._vcStore>0?fmt(Math.round(s._vcStore))+'đ':'—'}</td>
+            <td class="${profitClass(s._profit)}" style="font-size:11px">${fmt(Math.round(s._profit))}đ</td>
+            <td class="${profitClass(s._profit)}" style="font-size:11px">${sm!=='—'?sm+'%':'—'}</td>`;
+          tbody.appendChild(tr);
+        });
+      }
+    });
+  }
+
+  // Tổng cộng
+  if(profitData.length){
+    const tftr=document.createElement('tr');
+    tftr.style.cssText='background:var(--bg3);font-weight:700;border-top:2px solid var(--accent)';
+    tftr.innerHTML=`
+      <td colspan="2" style="font-size:12px;color:var(--accent)">📊 TỔNG KỲ</td>
+      <td style="font-size:12px">${fmt(Math.round(totalRevenue))}đ</td>
+      <td style="color:var(--amber);font-size:12px">${fmt(Math.round(totalCogs))}đ</td>
+      <td style="color:var(--text2);font-size:12px">${totalVc>0?fmt(Math.round(totalVc))+'đ':'—'}</td>
+      <td class="${totalProfit>=0?'profit-pos':'profit-neg'}" style="font-size:13px">${fmt(Math.round(totalProfit))}đ</td>
+      <td class="${totalProfit>=0?'profit-pos':'profit-neg'}" style="font-size:12px">${margin}%</td>`;
+    tbody.appendChild(tftr);
+  }
+
+  tbl.appendChild(tbody);
+  tblWrap.appendChild(tbl);
+  wrap.appendChild(tblWrap);
+
+  // Chú thích
+  wrap.appendChild(h('div', {style:{marginTop:14,padding:'10px 14px',background:'var(--bg3)',borderRadius:'var(--r2)',border:'1px solid var(--border)',fontSize:11,color:'var(--text3)',lineHeight:1.8}},
+    '💡 <b style="color:var(--text2)">Công thức:</b> Lợi nhuận thực = Doanh thu thuần − Giá vốn hàng bán (COGS) − Phí VC cửa hàng tự chịu | COGS = Giá nhập × SL + phân bổ VC nhập | VC tự chịu: phí vận chuyển giao hàng do cửa hàng tự trả (không tính vào hoá đơn khách)'
+  ));
+
+  return wrap;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TRANG VẬN CHUYỂN — Theo dõi chi tiết, chỉ xem
+//  Tổng hợp từ: imports (VC vào) + sales (VC ra)
+// ═══════════════════════════════════════════════════════════════
+function pgShipTrack() {
+  const wrap = h('div', {});
+  if (!pgShipTrack._period) pgShipTrack._period = 'month';
+  if (!pgShipTrack._selDate) pgShipTrack._selDate = localDateStr(new Date());
+  if (!pgShipTrack._dir) pgShipTrack._dir = 'all'; // 'all'|'in'|'out'
+
+  const period  = pgShipTrack._period;
+  const selDate = new Date(pgShipTrack._selDate);
+  const dir     = pgShipTrack._dir;
+
+  const { sales, imports } = S;
+
+  function matchPeriod(dateStr){
+    if(!dateStr)return false;
+    const d=new Date(dateStr);
+    if(period==='day')   return dateStr.slice(0,10)===pgShipTrack._selDate.slice(0,10);
+    if(period==='month') return d.getFullYear()===selDate.getFullYear()&&d.getMonth()===selDate.getMonth();
+    if(period==='year')  return d.getFullYear()===selDate.getFullYear();
+    return true;
+  }
+
+  // ── Build danh sách chuyến vận chuyển ─────────────────────────
+  // VC VÀO: từ phiếu nhập có shipFee > 0
+  const shipIn = (imports||[]).filter(i=>matchPeriod(i.date)&&(i.shipFee||0)>0).map(i=>({
+    id: i.id, date: i.date, type:'in',
+    party: i.supplier||'—',
+    product: i.productName||'—',
+    qty: i.qty, unit: i.unit||'',
+    fee: i.shipFee||0,
+    vatRate: i.shipVatRate||0,
+    feeNet: (i.shipVatRate||0)>0 ? Math.round((i.shipFee||0)/(1+(i.shipVatRate||0)/100)) : (i.shipFee||0),
+    note: i.note||'',
+    status: i.status||'done',
+  }));
+
+  // VC RA: từ phiếu bán có shipFee > 0
+  const shipOut = (sales||[]).filter(s=>matchPeriod(s.date)&&(s.shipFee||0)>0).map(s=>({
+    id: s.id, date: s.date, type:'out',
+    party: s.customer||'—',
+    product: s.productName||'—',
+    qty: s.qty, unit: s.unit||'',
+    fee: s.shipFee||0,
+    vatRate: s.shipVatRate||0,
+    feeNet: (s.shipVatRate||0)>0 ? Math.round((s.shipFee||0)/(1+(s.shipVatRate||0)/100)) : (s.shipFee||0),
+    forCust: !!s.shipForCustomer,
+    note: s.note||'',
+    status: s.status||'done',
+  }));
+
+  let rows = [...shipIn, ...shipOut].sort((a,b)=>b.date.localeCompare(a.date));
+  if(dir==='in')  rows=rows.filter(r=>r.type==='in');
+  if(dir==='out') rows=rows.filter(r=>r.type==='out');
+
+  const totIn    = shipIn.reduce((a,r)=>a+r.fee,0);
+  const totOut   = shipOut.reduce((a,r)=>a+r.fee,0);
+  const totInNet  = shipIn.reduce((a,r)=>a+r.feeNet,0);
+  const totOutStoreNet = shipOut.filter(r=>!r.forCust).reduce((a,r)=>a+r.feeNet,0);
+  const totOutCustNet  = shipOut.filter(r=>r.forCust).reduce((a,r)=>a+r.feeNet,0);
+
+  // Period nav
+  function navPeriod(d2){
+    const d=new Date(pgShipTrack._selDate);
+    if(period==='day')   d.setDate(d.getDate()+d2);
+    if(period==='month') d.setMonth(d.getMonth()+d2);
+    if(period==='year')  d.setFullYear(d.getFullYear()+d2);
+    pgShipTrack._selDate=localDateStr(d);render();
+  }
+  function periodLabel(){
+    if(period==='day')   return 'Ngày '+selDate.toLocaleDateString('vi-VN');
+    if(period==='month') return 'Tháng '+(selDate.getMonth()+1)+'/'+selDate.getFullYear();
+    if(period==='year')  return 'Năm '+selDate.getFullYear();
+    return '';
+  }
+
+  // Header
+  wrap.appendChild(h('div', {className:'page-header'},
+    h('div', {},
+      h('div', {className:'page-title'}, '🚛 Vận Chuyển'),
+      h('div', {className:'page-sub'}, 'Theo dõi vận chuyển hàng đến và hàng đi · Chỉ xem')
+    ),
+    h('div', {style:{display:'flex',alignItems:'center',gap:6,background:'rgba(76,175,125,.1)',border:'1px solid rgba(76,175,125,.25)',borderRadius:'var(--r2)',padding:'6px 14px',fontSize:12,color:'var(--green)',fontWeight:700}}, '🔒 Chỉ xem')
+  ));
+
+  // Period bar
+  wrap.appendChild(h('div', {style:{display:'flex',alignItems:'center',gap:8,marginBottom:18,flexWrap:'wrap'}},
+    h('div', {style:{display:'flex',gap:4}},
+      ...['day','month','year'].map(p=>h('button',{
+        className:'btn btn-sm'+(period===p?' btn-primary':''),
+        onClick:()=>{pgShipTrack._period=p;render();}
+      },p==='day'?'📅 Ngày':p==='month'?'📆 Tháng':'🗓️ Năm'))
+    ),
+    h('div', {style:{display:'flex',alignItems:'center',gap:6,background:'var(--bg3)',borderRadius:'var(--r2)',padding:'4px 10px',border:'1px solid var(--border2)'}},
+      h('button',{className:'btn btn-ghost btn-sm',style:{padding:'2px 8px'},onClick:()=>navPeriod(-1)},'◀'),
+      h('span',{style:{fontWeight:700,fontSize:13,color:'var(--accent)',minWidth:140,textAlign:'center'}},periodLabel()),
+      h('button',{className:'btn btn-ghost btn-sm',style:{padding:'2px 8px'},onClick:()=>navPeriod(1)},'▶'),
+      h('button',{className:'btn btn-ghost btn-sm',style:{fontSize:11,color:'var(--text3)'},onClick:()=>{pgShipTrack._selDate=localDateStr(new Date());render();}},'Hôm nay')
+    )
+  ));
+
+  // KPI
+  const kpiDiv=document.createElement('div'); kpiDiv.className='ship-kpi';
+  [
+    {label:'VC Hàng Đến',val:fmt(totIn)+'đ',sub:shipIn.length+' chuyến nhập',color:'var(--green)',icon:'📥'},
+    {label:'VC Hàng Đi',val:fmt(totOut)+'đ',sub:shipOut.length+' chuyến bán',color:'var(--blue)',icon:'📤'},
+    {label:'VC CH Tự Chịu',val:fmt(totOutStoreNet)+'đ',sub:'Trừ vào lợi nhuận',color:'var(--amber)',icon:'🏠'},
+    {label:'VC Tính Cho Khách',val:fmt(totOutCustNet)+'đ',sub:'Khách trả VC',color:'var(--text)',icon:'👤'},
+  ].forEach(k=>{
+    const c=document.createElement('div'); c.className='profit-kpi-card';
+    c.innerHTML=`<div class="profit-kpi-label">${k.icon} ${k.label}</div><div class="profit-kpi-val" style="color:${k.color}">${k.val}</div><div class="profit-kpi-sub">${k.sub}</div>`;
+    kpiDiv.appendChild(c);
+  });
+  wrap.appendChild(kpiDiv);
+
+  // Filter tabs
+  wrap.appendChild(h('div', {style:{display:'flex',gap:8,marginBottom:14,flexWrap:'wrap'}},
+    h('span',{style:{fontSize:12,color:'var(--text2)',fontWeight:600,alignSelf:'center'}},'Lọc:'),
+    ...([['all','🚛 Tất cả'],['in','📥 Hàng đến'],['out','📤 Hàng đi']]).map(([v,l])=>h('button',{
+      className:'btn btn-sm'+(dir===v?' btn-primary':''),
+      onClick:()=>{pgShipTrack._dir=v;render();}
+    },l))
+  ));
+
+  // Table
+  const tblWrap=document.createElement('div'); tblWrap.className='ship-tbl-wrap'; tblWrap.style.overflowX='auto';
+  const tbl=document.createElement('table'); tbl.className='ship-tbl';
+  tbl.innerHTML=`<thead><tr>
+    <th>Loại</th>
+    <th>Ngày</th>
+    <th>Đối Tác</th>
+    <th>Sản Phẩm</th>
+    <th>Số Lượng</th>
+    <th>Phí VC (gộp VAT)</th>
+    <th>Phí VC (thuần)</th>
+    <th>Ghi Chú</th>
+  </tr></thead>`;
+  const tbody=document.createElement('tbody');
+
+  if(!rows.length){
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td colspan="8" style="text-align:center;padding:48px;color:var(--text3)">Không có dữ liệu vận chuyển trong kỳ này</td>`;
+    tbody.appendChild(tr);
+  } else {
+    rows.forEach(r=>{
+      const tr=document.createElement('tr');
+      const badge=r.type==='in'
+        ? `<span class="ship-badge-in">📥 Hàng Đến</span>`
+        : (r.forCust
+          ? `<span class="ship-badge-out">📤 Giao KH</span>`
+          : `<span class="ship-badge-out" style="color:var(--amber);border-color:rgba(232,165,58,.3);background:rgba(232,165,58,.12)">📤 CH Tự Chịu</span>`);
+      tr.innerHTML=`
+        <td>${badge}</td>
+        <td style="white-space:nowrap;color:var(--text2);font-size:12px">${fmtD(r.date)}</td>
+        <td style="font-weight:600;font-size:12px">${escHtml(r.party)}</td>
+        <td style="font-size:11px;color:var(--text2)">${escHtml(r.product)}</td>
+        <td style="font-size:12px;text-align:right">${fmtQty(r.qty)} ${escHtml(r.unit)}</td>
+        <td style="text-align:right;font-weight:600">${fmt(r.fee)}đ${r.vatRate?` <span style="font-size:10px;color:var(--blue)">(VAT ${r.vatRate}%)</span>`:''}</td>
+        <td style="text-align:right;color:var(--text2)">${fmt(r.feeNet)}đ</td>
+        <td style="font-size:11px;color:var(--text3);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(r.note||'—')}</td>`;
+      tbody.appendChild(tr);
+    });
+    // Totals row
+    const tftr=document.createElement('tr');
+    tftr.style.cssText='background:var(--bg3);font-weight:700;border-top:2px solid var(--accent)';
+    const filteredFee=rows.reduce((a,r)=>a+r.fee,0);
+    const filteredNet=rows.reduce((a,r)=>a+r.feeNet,0);
+    tftr.innerHTML=`
+      <td colspan="5" style="font-size:12px;color:var(--accent)">📊 TỔNG (${rows.length} chuyến)</td>
+      <td style="text-align:right;font-size:12px">${fmt(filteredFee)}đ</td>
+      <td style="text-align:right;font-size:12px;color:var(--text2)">${fmt(filteredNet)}đ</td>
+      <td></td>`;
+    tbody.appendChild(tftr);
+  }
+  tbl.appendChild(tbody);
+  tblWrap.appendChild(tbl);
+  wrap.appendChild(tblWrap);
+
+  wrap.appendChild(h('div', {style:{marginTop:14,padding:'10px 14px',background:'var(--bg3)',borderRadius:'var(--r2)',border:'1px solid var(--border)',fontSize:11,color:'var(--text3)',lineHeight:1.8}},
+    '💡 <b style="color:var(--text2)">Hàng Đến:</b> VC nhập hàng từ nhà cung cấp | <b style="color:var(--text2)">Hàng Đi (Giao KH):</b> Khách trả phí, in lên hoá đơn | <b style="color:var(--text2)">Hàng Đi (CH Tự Chịu):</b> Cửa hàng chịu phí, trừ vào lợi nhuận | Dữ liệu lấy từ phiếu Nhập hàng & Bán hàng'
+  ));
+
+  return wrap;
+}
 
 // ═══════════════════════════════════════════════════════════════
 //  AI CHATBOX — Báo giá thông minh + Xuất PDF
