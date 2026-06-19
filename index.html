@@ -301,25 +301,29 @@ const CLOUD = (() => {
   let _flushing = false;
   let _bootDone = false; // đã hoàn thành boot sync chưa
 
-  // ── Queue persistence: lưu vào sessionStorage để sống qua refresh ──
+  // ── Queue persistence: lưu vào localStorage để sống qua cả việc đóng
+  // tab/app (không chỉ refresh) — sessionStorage bị xoá ngay khi đóng tab,
+  // khiến 1 thay đổi đang chờ push lên Firebase có thể bị mất vĩnh viễn nếu
+  // user tắt app trước khi push xong (xem thêm fix tombstone cùng lý do).
   const QUEUE_SS_KEY = 'dtn_sync_queue';
   function _loadQueue() {
     try {
-      const v = sessionStorage.getItem(QUEUE_SS_KEY);
+      const v = localStorage.getItem(QUEUE_SS_KEY);
       return v ? JSON.parse(v) : [];
     } catch(e) { return []; }
   }
   function _saveQueue(q) {
     try {
-      // Chỉ lưu colName + ts (không lưu data lớn — data sẽ đọc lại từ S khi flush)
+      // Chỉ lưu colName + ts (không lưu data lớn — data sẽ đọc lại từ cache
+      // DB cục bộ khi flush, xem hydrateQueueItem)
       const slim = q.map(item => ({ colName: item.colName, ts: item.ts }));
-      sessionStorage.setItem(QUEUE_SS_KEY, JSON.stringify(slim));
+      localStorage.setItem(QUEUE_SS_KEY, JSON.stringify(slim));
     } catch(e) {}
   }
   function _clearQueue() {
-    try { sessionStorage.removeItem(QUEUE_SS_KEY); } catch(e) {}
+    try { localStorage.removeItem(QUEUE_SS_KEY); } catch(e) {}
   }
-  let _syncQueue = _loadQueue(); // khôi phục queue từ lần trước nếu tab vừa refresh
+  let _syncQueue = _loadQueue(); // khôi phục queue còn tồn đọng từ lần trước (refresh HOẶC mở lại app)
 
   // ── Load / save config ──────────────────────────────────────
   const DEFAULT_CFG = {
@@ -998,8 +1002,13 @@ const CLOUD = (() => {
   function hydrateQueueItem(item) {
     // Nếu item đã có data (enqueue trong session hiện tại) → dùng ngay
     if (item.data) return item;
-    // Item từ sessionStorage (sau refresh) → hydrate từ state hiện tại
-    const S = window._S;
+    // Item khôi phục từ localStorage (sau khi đóng tab/app hoặc refresh) →
+    // hydrate từ cache DB cục bộ (localStorage), KHÔNG dùng window._S.
+    // Lý do: bootApp() reset S về rỗng RỒI mới gọi bootSync() — nếu hydrate
+    // từ S ngay lúc đó sẽ ra mảng rỗng, push() rỗng coi như không làm gì,
+    // và thay đổi cục bộ chưa kịp lên cloud sẽ bị mất khi bootSync ghi đè
+    // từ cloud. DB cache thì luôn phản ánh đúng state đã lưu gần nhất vì
+    // save() luôn gọi DB.set() bất kể push cloud có thành công hay không.
     const stateKey = _COL_TO_STATE[item.colName];
     if (stateKey === null) {
       // staff_accounts: đọc từ localStorage
@@ -1008,10 +1017,13 @@ const CLOUD = (() => {
         return { ...item, data: v ? JSON.parse(v) : [] };
       } catch(e) { return { ...item, data: [] }; }
     }
-    if (stateKey === 'settings' && S) {
-      return { ...item, data: [{ id: 'settings', ...S.settings }] };
+    if (typeof DB === 'undefined') return null;
+    if (stateKey === 'settings') {
+      const s = DB.get('dtn_settings', null);
+      return s ? { ...item, data: [{ id: 'settings', ...s }] } : null;
     }
-    if (S && S[stateKey]) return { ...item, data: S[stateKey] };
+    const arr = DB.get(item.colName, null);
+    if (arr && arr.length) return { ...item, data: arr };
     return null; // không hydrate được → bỏ qua
   }
 
@@ -1602,7 +1614,7 @@ const AUTH = (() => {
       clearTimeout(_autoLogoutWarningTimer);
       // Dừng realtime listeners và xóa sync queue pending khi đăng xuất
       if (window.CLOUD) { try { window.CLOUD.stopListeners(); } catch(e) {} }
-      try { sessionStorage.removeItem('dtn_sync_queue'); } catch(e) {}
+      try { localStorage.removeItem('dtn_sync_queue'); } catch(e) {}
       // Dọn heartbeat interval + visibilitychange listener của session vừa đăng xuất
       // (nếu không, đăng nhập lại sẽ tạo bản mới trong khi bản cũ vẫn còn sống)
       try {
@@ -2363,6 +2375,15 @@ async function bootApp() {
   _raf = false;
   const root = document.getElementById('app');
   if (root) root.innerHTML = '';
+
+  // FIX: đẩy lên cloud mọi thay đổi cục bộ còn tồn đọng trong hàng đợi
+  // (ví dụ phiếu bán hàng vừa lưu lúc mạng yếu, tab/app bị đóng trước khi
+  // push xong) TRƯỚC khi reset S và pull từ cloud — nếu không, bước reset +
+  // ghi đè từ cloud ngay dưới đây sẽ làm thay đổi đó biến mất vĩnh viễn vì
+  // cloud chưa từng nhận được nó.
+  if (navigator.onLine && typeof CLOUD !== 'undefined' && CLOUD.getCfg().enabled) {
+    try { await CLOUD.flushPending(); } catch(e) {}
+  }
 
   // Firebase-first: reset S về rỗng trước mỗi lần boot (tránh state thừa từ session cũ)
   S.products = []; S.imports = []; S.sales = []; S.shipping = [];
@@ -4572,13 +4593,6 @@ function statCard(label, val, sub, color) {
     h('div', { className: 'stat-change' }, sub)
   );
 }
-function pBox(label, color, sign, val, bold) {
-  return h('div', { style: { textAlign: 'center', padding: '10px', background: 'var(--bg3)', borderRadius: 'var(--r2)' } },
-    h('div', { style: { fontSize: 10, color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: .8, marginBottom: 6 } }, label),
-    h('div', { style: { fontSize: 15, fontWeight: bold ? 700 : 600, color } }, sign + fmt(Math.abs(val)) + 'đ')
-  );
-}
-
 // ── INVENTORY ─────────────────────────────────────────────────
 function pgInventory() {
   const TYPES = ['Granite','Marble','Onyx','Basalt','Quartzite','Travertine','Slate','Serpentine','Khác'];
@@ -5457,13 +5471,6 @@ function openProduct(prod, rebuild) {
 }
 
 // ── IMPORTS ───────────────────────────────────────────────────
-function openImportWithProduct(prod, rebuild) {
-  // Mở form nhập hàng với sản phẩm đã được chọn sẵn
-  const fakeItem = { id: 'tmp', productId: prod.id, variantId: '', qty: '', price: prod.buyPrice || '', vatRate: 0, _vtSelId: '' };
-  const existing = null;
-  openImport(existing, rebuild, prod);
-}
-
 function pgImports() {
   const wrap = h('div', {});
   let search = '';
@@ -9235,9 +9242,9 @@ function pgQuotation() {
             </div>`;
             summaryHTML += `</div>`;
 
-            const custLine = customerName ? `<div style="background:#faf7f0;border-radius:6px;padding:10px 14px;margin-bottom:18px;font-size:13px;border-left:3px solid #d4b84a;"><b>Kính gửi:</b> ${customerName}${customerPhone ? ' &nbsp;|&nbsp; <b>SĐT:</b> ' + customerPhone : ''}</div>` : '';
+            const custLine = customerName ? `<div style="background:#faf7f0;border-radius:6px;padding:10px 14px;margin-bottom:18px;font-size:13px;border-left:3px solid #d4b84a;"><b>Kính gửi:</b> ${escHtml(customerName)}${customerPhone ? ' &nbsp;|&nbsp; <b>SĐT:</b> ' + escHtml(customerPhone) : ''}</div>` : '';
             const noteLines = customerNote ? customerNote.split('\n').filter(l => l.trim()) : [];
-            const noteStr = noteLines.length > 0 ? '<div style="margin-top:16px;font-size:12px;color:#555;border:1px solid #e8e0cc;border-radius:6px;padding:12px 16px;background:#fffdf7;"><div style="font-weight:700;color:#8b6914;margin-bottom:8px;font-size:12px;text-transform:uppercase;letter-spacing:.5px;">📝 Điều khoản &amp; Ghi chú</div>' + noteLines.map((line, i) => '<div style="display:flex;gap:8px;margin-bottom:5px;"><span style="color:#d4b84a;flex-shrink:0;font-weight:700;">' + (i+1) + '.</span><span>' + line + '</span></div>').join('') + '</div>' : '';
+            const noteStr = noteLines.length > 0 ? '<div style="margin-top:16px;font-size:12px;color:#555;border:1px solid #e8e0cc;border-radius:6px;padding:12px 16px;background:#fffdf7;"><div style="font-weight:700;color:#8b6914;margin-bottom:8px;font-size:12px;text-transform:uppercase;letter-spacing:.5px;">📝 Điều khoản &amp; Ghi chú</div>' + noteLines.map((line, i) => '<div style="display:flex;gap:8px;margin-bottom:5px;"><span style="color:#d4b84a;flex-shrink:0;font-weight:700;">' + (i+1) + '.</span><span>' + escHtml(line) + '</span></div>').join('') + '</div>' : '';
             return `<!DOCTYPE html><html><head><meta charset="UTF-8">
 <title>Báo Giá — ${S.settings.shopName || 'Đá Tự Nhiên'}</title>
 <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:ital,wght@0,400;0,600;0,700;1,400&display=swap" rel="stylesheet">
@@ -9737,7 +9744,7 @@ ${autoprint ? '<scr'+'ipt>document.title=" ";var _t=document.title;window.addEve
           h('button', { className: 'btn btn-sm', onClick: async () => {
             const { calcs: cc, totalCost: tC, totalRevenue: tR, totalBuyBase: tBB, totalBuyVat: tBV, totalShipBase: tSB, totalShipVat: tSV, totalSellBase: tSeB, totalSellVat: tSeV, totalVatPayable: tVP, totalProfitB: tPB, totalProfitA: tPA } = calcTotal();
             const _pdfHtml = (() => {
-            const custLine = customerName ? `<div style="margin-bottom:12px;font-size:13px;color:#555;"><b>Khách hàng:</b> ${customerName}${customerPhone ? ' &nbsp;|&nbsp; <b>SĐT:</b> ' + customerPhone : ''}${customerNote ? ' &nbsp;|&nbsp; ' + customerNote : ''}</div>` : '';
+            const custLine = customerName ? `<div style="margin-bottom:12px;font-size:13px;color:#555;"><b>Khách hàng:</b> ${escHtml(customerName)}${customerPhone ? ' &nbsp;|&nbsp; <b>SĐT:</b> ' + escHtml(customerPhone) : ''}${customerNote ? ' &nbsp;|&nbsp; ' + escHtml(customerNote) : ''}</div>` : '';
             const itemRows = items.map((it, i) => {
               const c = cc[i];
               return `<tr>
@@ -10446,7 +10453,7 @@ function pgHopDong() {
     return { calcs, tongHang, vatAmt, tongTT, tamUng, conLai };
   }
 
-  function fmtVND(n) { return n > 0 ? new Intl.NumberFormat('vi-VN').format(Math.round(n)) : '0'; }
+  function fmtVND(n) { return new Intl.NumberFormat('vi-VN').format(Math.round(n) || 0); }
   function hdInp(type, ph, val, onChange, extraStyle) {
     const el = document.createElement('input');
     el.type = type || 'text'; el.className = 'form-input';
