@@ -3633,7 +3633,7 @@ function buildApp() {
       }, '🚪 Đăng xuất'),
       DB.isLocal() ? '✅ Dữ liệu đã lưu tự động' : '⚠️ Lưu tạm (phiên làm việc)',
       h('br'),
-      'v7.9.5 · Đá Tự Nhiên Linh Vũ © 2026'
+      'v7.9.9 · Đá Tự Nhiên Linh Vũ © 2026'
     )
   );
 
@@ -11757,9 +11757,13 @@ function pgRecovery() {
               createdAt: nowIso,
               _updated: nowIso,
               _stockTx: [],
-              _recovered: true // đánh dấu để biết đây là bản khôi phục
+              _recovered: true, // đánh dấu để biết đây là bản khôi phục
+              // FIX: phải gửi rõ _deleted:false — push dùng merge:true nên field
+              // không có mặt sẽ KHÔNG xoá được _deleted:true cũ còn sót trên cloud
+              // (sản phẩm này đã bị xoá trước đó). Thiếu field này khiến sản phẩm
+              // "sống lại" tạm thời rồi bị cloud merge ghi đè về deleted ở lần sync sau.
+              _deleted: false
             };
-            // Kiểm tra xem productId đó đã bị _deleted trên cloud chưa — nếu có thì push lại với _deleted:false
             S.products = [...S.products, newProd];
             count++;
           });
@@ -11971,7 +11975,11 @@ function pgRecovery() {
                 image: '', qrCode: '', variants: [], multiVariant: false,
                 thickness: 0, length: 0, width: 0,
                 createdAt: nowIso2, _updated: nowIso2, _stockTx: [],
-                _recovered: true
+                _recovered: true,
+                // FIX: như trên — bắt buộc gửi _deleted:false để merge:true xoá
+                // được cờ _deleted:true cũ trên cloud, tránh sản phẩm bị khôi phục
+                // rồi tự biến mất lại sau khi đồng bộ/đăng nhập lại.
+                _deleted: false
               };
               S.products = [...S.products, restoredProd];
               save('products');
