@@ -388,6 +388,47 @@ const CLOUD = (() => {
   const ts = () => new Date().toISOString();
 
   // ═══════════════════════════════════════════════════════════
+  //  INCREMENTAL SYNC CURSOR — giảm số lượt đọc Firestore
+  //
+  //  Mỗi collection lưu mốc "_updated mới nhất đã thấy" (cursor) trong
+  //  localStorage. Lần sync sau chỉ hỏi Firebase "có gì đổi từ mốc này
+  //  tới giờ" (where _updated > cursor) thay vì đọc lại TOÀN BỘ collection.
+  //  Kết quả cuối cùng (dữ liệu hiển thị) không đổi — chỉ đổi cách lấy.
+  //
+  //  An toàn dữ liệu:
+  //  - Nếu chưa có cursor, hoặc cache local rỗng (nghi ngờ mất cache) →
+  //    tự động fallback về pull full, không dùng cursor mù quáng.
+  //  - Cứ mỗi 7 ngày tự làm 1 lần full-pull thật để "rửa" lại toàn bộ,
+  //    phòng trường hợp lệch dữ liệu tích tụ do bất kỳ lý do gì.
+  // ═══════════════════════════════════════════════════════════
+  const CURSOR_PREFIX = 'dtn_sync_cursor_';
+  const FULL_RESYNC_KEY = 'dtn_last_full_resync';
+  const FULL_RESYNC_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 7 ngày
+  function _getCursor(colName) {
+    try { return localStorage.getItem(CURSOR_PREFIX + colName) || ''; } catch(e) { return ''; }
+  }
+  function _setCursor(colName, iso) {
+    if (!iso) return;
+    try { localStorage.setItem(CURSOR_PREFIX + colName, iso); } catch(e) {}
+  }
+  function _tsToFirestoreTimestamp(iso) {
+    try {
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return null;
+      return firebase.firestore.Timestamp.fromDate(d);
+    } catch(e) { return null; }
+  }
+  function _shouldForceFullResync() {
+    try {
+      const last = parseInt(localStorage.getItem(FULL_RESYNC_KEY) || '0', 10);
+      return !last || (Date.now() - last) > FULL_RESYNC_INTERVAL_MS;
+    } catch(e) { return true; }
+  }
+  function _markFullResyncDone() {
+    try { localStorage.setItem(FULL_RESYNC_KEY, String(Date.now())); } catch(e) {}
+  }
+
+  // ═══════════════════════════════════════════════════════════
   //  MERGE LOGIC — xử lý xung đột
   // ═══════════════════════════════════════════════════════════
 
@@ -655,8 +696,11 @@ const CLOUD = (() => {
       }
     } else if (stateKey === 'products') {
       const before = JSON.stringify(S.products);
-      // Firebase-first: base rỗng → cloud thắng tuyệt đối, không merge với local stale
-      const { products: mergedProducts, reroutes } = mergeProducts([], cloudDocs);
+      // Listener giờ chỉ gửi phần THAY ĐỔI (where _updated > cursor) để đỡ tốn
+      // đọc Firestore mỗi lần listener khởi động lại — nên GHÉP vào S.products
+      // hiện có (mergeProducts đã hỗ trợ sẵn tham số "local" cho đúng việc này),
+      // không dùng base rỗng nữa vì cloudDocs không còn là toàn bộ collection.
+      const { products: mergedProducts, reroutes } = mergeProducts(S.products, cloudDocs);
       S.products = mergedProducts;
       if (JSON.stringify(S.products) !== before) changed = true;
       _seedLastPushed(stateKey, S.products);
@@ -705,14 +749,17 @@ const CLOUD = (() => {
         if (typeof CLOUD !== 'undefined' && CLOUD._pushDeletedRecord) CLOUD._pushDeletedRecord('dtn_products', deletedLosers);
       }
     } else {
-      // Firebase-first: realtime listener → replace trực tiếp bằng cloud snapshot
-      // cloudDocs = toàn bộ collection (Firestore onSnapshot gửi full snapshot)
-      // Lọc _deleted → ghi thẳng vào S. KHÔNG gọi applyLedgerToStock vì:
+      // Listener giờ chỉ gửi phần THAY ĐỔI (where _updated > cursor) để đỡ tốn
+      // đọc Firestore mỗi lần listener khởi động lại — nên GHÉP theo id vào
+      // S[stateKey] hiện có bằng mergeAppendOnly (hàm có sẵn trong file, xử lý
+      // đúng tombstone/timestamp, trước đây chưa được gọi tới), không replace
+      // toàn bộ nữa vì cloudDocs không còn là toàn bộ collection.
+      // KHÔNG gọi applyLedgerToStock vì:
       // - products.stock đã đúng từ Firebase (được set bởi thiết bị tạo giao dịch)
       // - applyLedger chỉ cần khi local stock cũ chưa phản ánh giao dịch offline
       // - Trong Firebase-first, mọi stock change đều đi qua Firebase trước → không cần
       const before = JSON.stringify(S[stateKey]);
-      S[stateKey] = cloudDocs.filter(r => r && !r._deleted);
+      S[stateKey] = mergeAppendOnly(S[stateKey], cloudDocs);
       if (JSON.stringify(S[stateKey]) !== before) changed = true;
       _seedLastPushed(stateKey, S[stateKey]);
     }
@@ -757,7 +804,14 @@ const CLOUD = (() => {
     const collections = ['dtn_sales','dtn_imports','dtn_returns','dtn_paymentlogs','dtn_products','dtn_shipping','dtn_settings','dtn_staff_accounts','dtn_admin_cred','dtn_cashflows'];
     collections.forEach(colName => {
       try {
-        const ref = col(colName);
+        // Dùng cursor để listener chỉ "nghe" từ mốc _updated đã biết, thay vì
+        // đọc lại TOÀN BỘ collection mỗi lần khởi động — việc này đặc biệt hay
+        // xảy ra khi tab/app được focus lại nhiều lần/ngày (mỗi lần huỷ-tạo-lại
+        // listener vốn tốn đúng bằng 1 lần đọc full collection).
+        const cursor = _getCursor(colName);
+        const cursorTs = cursor ? _tsToFirestoreTimestamp(cursor) : null;
+        let ref = col(colName);
+        if (cursorTs) ref = ref.where('_updated', '>', cursorTs);
         const unsub = ref.onSnapshot({ includeMetadataChanges: false }, (snap) => {
           if (!_bootDone) return;
           // Chỉ xử lý thay đổi từ server (không phải local pending writes)
@@ -766,6 +820,11 @@ const CLOUD = (() => {
           // normalizeDoc: Firestore Timestamp → ISO string
           const docs = snap.docs.map(d => normalizeDoc(d.data()));
           applyCloudData(colName, docs, false);
+          // Đẩy cursor lên theo _updated mới nhất vừa thấy — lần listener sau
+          // (nếu bị huỷ-tạo-lại) sẽ tiếp tục từ đây, không đọc lại từ đầu.
+          let maxTs = _getCursor(colName) || '';
+          docs.forEach(d => { if (d && d._updated && d._updated > maxTs) maxTs = d._updated; });
+          if (maxTs) _setCursor(colName, maxTs);
           _lastSync = ts(); notifyStatus();
         }, (err) => {
           console.warn('[CLOUD] listener error:', colName, err.message);
@@ -798,6 +857,52 @@ const CLOUD = (() => {
     if (d.createdAt) d.createdAt = normalizeTs(d.createdAt);
     if (d._backedUpAt) d._backedUpAt = normalizeTs(d._backedUpAt);
     return d;
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  //  PULL TĂNG DẦN — chỉ đọc document thay đổi từ lần sync trước
+  //
+  //  Thay vì col(name).get() đọc TOÀN BỘ collection mỗi lần (tốn reads),
+  //  hàm này dùng cursor (_updated mới nhất đã thấy) để chỉ đọc phần
+  //  THAY ĐỔI, rồi ghép vào cache local đã có (DB.get) theo id.
+  //  Cloud luôn thắng cho các id trùng — không đổi kết quả cuối cùng so
+  //  với pull full, chỉ đổi số lượng document phải đọc từ Firestore.
+  //
+  //  forceFull=true (hoặc baseline rỗng) → bỏ qua cursor, đọc full như cũ.
+  // ═══════════════════════════════════════════════════════════
+  async function pullColIncremental(name, forceFull) {
+    const baseline = (typeof DB !== 'undefined') ? (DB.get(name, []) || []) : [];
+    // Cache local rỗng mà vẫn còn cursor cũ → khả năng cache bị mất, không
+    // tin cursor nữa, quay về đọc full để tự "chữa lành".
+    const useFull = !!forceFull || baseline.length === 0;
+    const cursor = useFull ? '' : _getCursor(name);
+
+    let query = col(name);
+    if (cursor) {
+      const cursorTs = _tsToFirestoreTimestamp(cursor);
+      if (cursorTs) query = query.where('_updated', '>', cursorTs);
+    }
+    const snap = await query.get();
+    const changed = snap.docs.map(d => normalizeDoc(d.data()));
+
+    if (!cursor) {
+      // Pull full (lần đầu / force / cache rỗng) → kết quả chính là toàn bộ
+      let maxTs = '';
+      changed.forEach(r => { if (r && r._updated && r._updated > maxTs) maxTs = r._updated; });
+      _setCursor(name, maxTs || new Date().toISOString());
+      return changed;
+    }
+
+    // Có cursor → ghép phần thay đổi vào baseline theo id (cloud luôn thắng)
+    const map = {};
+    baseline.forEach(r => { if (r && r.id) map[r.id] = r; });
+    changed.forEach(r => { if (r && r.id) map[r.id] = r; });
+
+    let maxTs = cursor;
+    changed.forEach(r => { if (r && r._updated && r._updated > maxTs) maxTs = r._updated; });
+    _setCursor(name, maxTs);
+
+    return Object.values(map);
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -980,25 +1085,30 @@ const CLOUD = (() => {
     }
     _syncStatus = 'syncing'; notifyStatus();
     try {
-      const pullCol = async (name) => {
-        const snap = await col(name).get();
-        return snap.docs.map(d => normalizeDoc(d.data()));
-      };
+      // An toàn dữ liệu: cứ mỗi 7 ngày bắt buộc 1 lần full-pull thật (bỏ qua
+      // cursor) để tự "rửa" lại toàn bộ, phòng lệch dữ liệu tích tụ vì bất kỳ
+      // lý do gì (quota localStorage, lỗi cache...). Các lần còn lại trong
+      // tuần dùng incremental (chỉ đọc phần _updated mới hơn cursor) để đỡ
+      // tốn lượt đọc Firestore mỗi lần mở app.
+      const forceFull = _shouldForceFullResync();
       const [products, imports, sales, returns, paymentlogs, shipping, settingsArr, staffArr, adminCredArr, cashflowsArr] = await Promise.all([
-        pullCol('dtn_products'), pullCol('dtn_imports'),  pullCol('dtn_sales'),
-        pullCol('dtn_returns'),  pullCol('dtn_paymentlogs'), pullCol('dtn_shipping'),
-        pullCol('dtn_settings'), pullCol('dtn_staff_accounts'), pullCol('dtn_admin_cred'),
-        pullCol('dtn_cashflows'),
+        pullColIncremental('dtn_products', forceFull),    pullColIncremental('dtn_imports', forceFull),     pullColIncremental('dtn_sales', forceFull),
+        pullColIncremental('dtn_returns', forceFull),     pullColIncremental('dtn_paymentlogs', forceFull), pullColIncremental('dtn_shipping', forceFull),
+        pullColIncremental('dtn_settings', forceFull),    pullColIncremental('dtn_staff_accounts', forceFull), pullColIncremental('dtn_admin_cred', forceFull),
+        pullColIncremental('dtn_cashflows', forceFull),
       ]);
+      if (forceFull) _markFullResyncDone();
 
       // ── Firebase-first: GHI ĐÈ trực tiếp vào S từ cloud ──────────────────
-      // Không merge với local. Firebase là nguồn sự thật duy nhất.
+      // products/imports/sales/... ở trên đã là dữ liệu "cloud thật" đầy đủ
+      // (pullColIncremental tự ghép cache cũ + phần vừa đổi) — không phải
+      // local chưa xác nhận, nên ghi đè trực tiếp vẫn đúng như cũ.
       // _deleted records bị lọc ra luôn — chỉ giữ data còn sống.
       const _S = window._S || S_state;
 
       // Products: filter _deleted, xử lý deduplicate trùng tên
       if (products.length) {
-        const { products: mergedProds, reroutes } = mergeProducts([], products); // base rỗng → cloud thắng tuyệt đối
+        const { products: mergedProds, reroutes } = mergeProducts([], products); // base rỗng → products đã đại diện full cloud rồi
         _S.products = mergedProds;
         // Xử lý reroute nếu có SP trùng tên trên cloud
         if (reroutes.length > 0) {
@@ -2157,6 +2267,8 @@ function openPdfMobile(htmlContent, filename) {
 // flush/restart listener Firestore trùng lặp nhiều lần mỗi khi đổi tab.
 let _hbIv = null;
 let _visibilityHandler = null;
+let _hiddenAt = 0; // thời điểm tab/app bị ẩn — dùng để quyết định có cần restart listener không
+const LISTENER_RESTART_THRESHOLD_MS = 3 * 60 * 1000; // chỉ restart nếu ẩn lâu hơn 3 phút
 
 // ═══════════════════════════════════════════════════════════════
 //  MIGRATE SKU — tự động gắn mã SKU cho sản phẩm cũ chưa có mã
@@ -2298,12 +2410,26 @@ async function bootApp() {
           try { CLOUD.flushPending(); } catch(e) {}
         }
       }, 60000);
-      // Foreground: restart listener + flush
+      // Foreground: chỉ restart listener khi cần, không phải mỗi lần đổi tab
       if (_visibilityHandler) document.removeEventListener('visibilitychange', _visibilityHandler);
       _visibilityHandler = () => {
-        if (!document.hidden && AUTH.currentUser() && cloudCfg.enabled) {
-          CLOUD.stopListeners();
-          CLOUD.startListeners();
+        if (document.hidden) {
+          _hiddenAt = Date.now();
+          return;
+        }
+        if (AUTH.currentUser() && cloudCfg.enabled) {
+          const hiddenMs = _hiddenAt ? (Date.now() - _hiddenAt) : 0;
+          const listenerDead = !CLOUD.getStatus().realtime;
+          // Chỉ huỷ-tạo-lại listener khi ẩn đủ lâu (phòng kết nối bị treo khi
+          // máy ngủ/app chạy ngầm lâu) hoặc listener đã chết hẳn — tránh việc
+          // restart vô tội vạ mỗi lần chuyển tab/app qua lại trong vài giây,
+          // vì mỗi lần restart trước đây tốn đúng 1 lượt đọc lại toàn bộ
+          // collection. Listener mới (nếu có restart) vẫn dùng cursor nên dù
+          // restart cũng không đọc lại từ đầu — đây là lớp phòng vệ thêm.
+          if (hiddenMs > LISTENER_RESTART_THRESHOLD_MS || listenerDead) {
+            CLOUD.stopListeners();
+            CLOUD.startListeners();
+          }
           setTimeout(() => { try { CLOUD.flushPending(); } catch(e) {} }, 100);
         }
       };
