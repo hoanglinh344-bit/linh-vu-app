@@ -871,9 +871,12 @@ const CLOUD = (() => {
   //  forceFull=true (hoặc baseline rỗng) → bỏ qua cursor, đọc full như cũ.
   // ═══════════════════════════════════════════════════════════
   async function pullColIncremental(name, forceFull) {
-    const baseline = (typeof DB !== 'undefined') ? (DB.get(name, []) || []) : [];
-    // Cache local rỗng mà vẫn còn cursor cũ → khả năng cache bị mất, không
-    // tin cursor nữa, quay về đọc full để tự "chữa lành".
+    const baselineRaw = (typeof DB !== 'undefined') ? DB.get(name, []) : [];
+    // QUAN TRỌNG: một số collection (dtn_settings, dtn_admin_cred) lưu cache
+    // local dưới dạng OBJECT đơn (không phải array) — nếu coi đó là baseline
+    // array sẽ crash ở baseline.forEach. Coi baseline không-phải-array = rỗng
+    // → tự động fallback full pull, không bao giờ crash bootSync.
+    const baseline = Array.isArray(baselineRaw) ? baselineRaw : [];
     const useFull = !!forceFull || baseline.length === 0;
     const cursor = useFull ? '' : _getCursor(name);
 
@@ -1065,7 +1068,7 @@ const CLOUD = (() => {
   // ═══════════════════════════════════════════════════════════
   //  BOOT SYNC — pull cloud và merge vào local khi khởi động
   // ═══════════════════════════════════════════════════════════
-  async function bootSync(S_state) {
+  async function bootSync(S_state, forceFullArg) {
     // Firebase-first: nếu không có Firebase → fallback local (offline mode)
     if (!_db || !_online || !_cfg.enabled) {
       // Offline hoặc chưa cấu hình: nạp từ localStorage làm fallback
@@ -1090,7 +1093,10 @@ const CLOUD = (() => {
       // lý do gì (quota localStorage, lỗi cache...). Các lần còn lại trong
       // tuần dùng incremental (chỉ đọc phần _updated mới hơn cursor) để đỡ
       // tốn lượt đọc Firestore mỗi lần mở app.
-      const forceFull = _shouldForceFullResync();
+      // forceFullArg=true (ví dụ nút "Kéo từ cloud về" khi nghi ngờ dữ liệu
+      // lệch) → BẮT BUỘC pull thật 100%, không tin vào cursor/cache hiện có
+      // (vì chính cursor/cache đó có thể là thứ đang bị nghi ngờ có vấn đề).
+      const forceFull = !!forceFullArg || _shouldForceFullResync();
       const [products, imports, sales, returns, paymentlogs, shipping, settingsArr, staffArr, adminCredArr, cashflowsArr] = await Promise.all([
         pullColIncremental('dtn_products', forceFull),    pullColIncremental('dtn_imports', forceFull),     pullColIncremental('dtn_sales', forceFull),
         pullColIncremental('dtn_returns', forceFull),     pullColIncremental('dtn_paymentlogs', forceFull), pullColIncremental('dtn_shipping', forceFull),
@@ -11326,7 +11332,9 @@ function pgSync() {
               // Dùng bootSync → applyCloudData: merge đúng theo _updated + tôn trọng _deleted,
               // KHÔNG ghi đè như trước (code cũ S.products = result.products làm mất dữ liệu
               // local chưa sync và hồi sinh sản phẩm đã xóa)
-              const ok = await CLOUD.bootSync(S);
+              // forceFull=true: nút này dùng để CHỮA khi nghi ngờ dữ liệu lệch — phải bỏ qua
+              // cursor/cache hiện có (vì chính nó có thể là thứ đang có vấn đề), pull thật 100%.
+              const ok = await CLOUD.bootSync(S, true);
               if (!ok) { toast('❌ Không kéo được dữ liệu từ cloud!', 'error'); return; }
               toast('✅ Đã kéo & merge dữ liệu từ Firebase!', 'success');
               render();
