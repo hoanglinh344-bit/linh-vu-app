@@ -3477,6 +3477,271 @@ function exportExcel(sheetChoice) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  EXCEL IMPORT / KHÔI PHỤC — đọc lại file do exportExcel() tạo
+//  (hoặc file cùng cấu trúc 3 sheet: Kho hàng / Bán hàng / Nhập hàng)
+//  rồi MERGE AN TOÀN vào dữ liệu hiện có (không ghi đè dữ liệu đã có,
+//  không tạo trùng đơn/phiếu), sau đó push phần mới/đổi lên Firebase.
+// ═══════════════════════════════════════════════════════════════
+
+// Chuẩn hoá tên để so khớp: bỏ dấu, bỏ hoa/thường, gọn khoảng trắng
+function _normVi(s) {
+  return (s == null ? '' : s.toString())
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd').replace(/Đ/g, 'D')
+    .toLowerCase().trim().replace(/\s+/g, ' ');
+}
+
+// Chuyển ngày từ Excel (chuỗi dd/mm/yyyy, chuỗi yyyy-mm-dd, Date, hoặc số serial) → 'yyyy-mm-dd'
+function _excelToISO(v) {
+  if (v === null || v === undefined || v === '') return '';
+  if (v instanceof Date && !isNaN(v.getTime())) {
+    const off = v.getTimezoneOffset();
+    return new Date(v.getTime() - off * 60000).toISOString().slice(0, 10);
+  }
+  const s = v.toString().trim();
+  let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) return m[3] + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0'); // dd/mm/yyyy → yyyy-mm-dd
+  m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) return m[1] + '-' + m[2].padStart(2, '0') + '-' + m[3].padStart(2, '0');
+  if (/^\d+(\.\d+)?$/.test(s)) {
+    const n = parseFloat(s);
+    const d = new Date(Math.round((n - 25569) * 86400 * 1000));
+    if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+  }
+  return '';
+}
+
+// Map tên-cột-header → chỉ số cột, để đọc theo TÊN cột (không lệ thuộc thứ tự/số cột,
+// vì các bản Excel cũ/mới có thể thiếu/thừa vài cột như "Mã SKU")
+function _headerMap(row) {
+  const map = {};
+  (row || []).forEach((c, i) => {
+    const k = (c == null ? '' : c.toString()).trim();
+    if (k) map[k] = i;
+  });
+  return map;
+}
+function _cell(row, map, key, dflt) {
+  const i = map[key];
+  const v = (i !== undefined) ? row[i] : undefined;
+  return (v === undefined || v === null || v === '') ? dflt : v;
+}
+function _findHeaderRowIdx(rows, mustHaveKey) {
+  for (let i = 0; i < rows.length; i++) {
+    if ((rows[i] || []).some(c => (c == null ? '' : c.toString()).trim() === mustHaveKey)) return i;
+  }
+  return -1;
+}
+
+// Đọc file Excel (.xlsx) → dữ liệu thô { products, sales, imports }
+function parseExcelBackup(arrayBuffer) {
+  const wb = XLSX.read(arrayBuffer, { type: 'array' });
+  const sheetRows = frag => {
+    const n = wb.SheetNames.find(nm => nm.includes(frag));
+    return n ? XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: true, defval: '' }) : [];
+  };
+
+  const out = { products: [], sales: [], imports: [] };
+
+  // ── KHO HÀNG ──
+  const invRows = sheetRows('Kho hàng');
+  const invHIdx = _findHeaderRowIdx(invRows, 'Tên sản phẩm');
+  if (invHIdx >= 0) {
+    const map = _headerMap(invRows[invHIdx]);
+    for (let i = invHIdx + 1; i < invRows.length; i++) {
+      const row = invRows[i];
+      const name = (_cell(row, map, 'Tên sản phẩm', '') || '').toString().trim();
+      if (!name || name.startsWith('TỔNG')) continue;
+      out.products.push({
+        name,
+        sku: (_cell(row, map, 'Mã SKU', '') || '').toString().trim(),
+        type: (_cell(row, map, 'Loại đá', '') || '').toString().trim(),
+        origin: (_cell(row, map, 'Xuất xứ', '') || '').toString().trim(),
+        unit: (_cell(row, map, 'Đơn vị', '') || '').toString().trim(),
+        buyPrice: parseFloat(_cell(row, map, 'Giá nhập (đ)', 0)) || 0,
+        sellPrice: parseFloat(_cell(row, map, 'Giá bán (đ)', 0)) || 0,
+        stock: parseFloat(_cell(row, map, 'Tồn kho', 0)) || 0,
+        description: (_cell(row, map, 'Mô tả', '') || '').toString().trim()
+      });
+    }
+  }
+
+  // ── BÁN HÀNG ──
+  const saleRows = sheetRows('Bán hàng');
+  const saleHIdx = _findHeaderRowIdx(saleRows, 'Khách hàng');
+  if (saleHIdx >= 0) {
+    const map = _headerMap(saleRows[saleHIdx]);
+    for (let i = saleHIdx + 1; i < saleRows.length; i++) {
+      const row = saleRows[i];
+      const rawDate = _cell(row, map, 'Ngày', '');
+      if ((rawDate || '').toString().startsWith('TỔNG')) continue;
+      const productName = (_cell(row, map, 'Sản phẩm', '') || '').toString().trim();
+      const iso = _excelToISO(rawDate);
+      if (!productName || !iso) continue;
+      out.sales.push({
+        date: iso,
+        customer: (_cell(row, map, 'Khách hàng', '') || '').toString().trim(),
+        phone: (_cell(row, map, 'SĐT', '') || '').toString().trim(),
+        productName,
+        qty: parseFloat(_cell(row, map, 'SL', 0)) || 0,
+        unit: (_cell(row, map, 'Đơn vị', '') || '').toString().trim(),
+        unitPrice: parseFloat(_cell(row, map, 'Đơn giá (đ)', 0)) || 0,
+        vatRate: parseFloat(_cell(row, map, 'VAT %', 0)) || 0,
+        subTotal: parseFloat(_cell(row, map, 'Doanh thu thuần (đ)', 0)) || 0,
+        vatAmt: parseFloat(_cell(row, map, 'VAT (đ)', 0)) || 0,
+        total: parseFloat(_cell(row, map, 'Tổng tiền (đ)', 0)) || 0,
+        paid: parseFloat(_cell(row, map, 'Đã thu (đ)', 0)) || 0,
+        statusText: (_cell(row, map, 'Trạng thái', '') || '').toString().trim(),
+        note: (_cell(row, map, 'Ghi chú', '') || '').toString().trim()
+      });
+    }
+  }
+
+  // ── NHẬP HÀNG ──
+  const impRows = sheetRows('Nhập hàng');
+  const impHIdx = _findHeaderRowIdx(impRows, 'Nhà cung cấp');
+  if (impHIdx >= 0) {
+    const map = _headerMap(impRows[impHIdx]);
+    for (let i = impHIdx + 1; i < impRows.length; i++) {
+      const row = impRows[i];
+      const rawDate = _cell(row, map, 'Ngày nhập', '');
+      if ((rawDate || '').toString().startsWith('TỔNG')) continue;
+      const productName = (_cell(row, map, 'Sản phẩm', '') || '').toString().trim();
+      const iso = _excelToISO(rawDate);
+      if (!productName || !iso) continue;
+      out.imports.push({
+        date: iso,
+        supplier: (_cell(row, map, 'Nhà cung cấp', '') || '').toString().trim(),
+        productName,
+        qty: parseFloat(_cell(row, map, 'SL', 0)) || 0,
+        unit: (_cell(row, map, 'Đơn vị', '') || '').toString().trim(),
+        unitPrice: parseFloat(_cell(row, map, 'Đơn giá (đ)', 0)) || 0,
+        vatRate: parseFloat(_cell(row, map, 'VAT %', 0)) || 0,
+        total: parseFloat(_cell(row, map, 'Tổng tiền (đ)', 0)) || 0,
+        paid: parseFloat(_cell(row, map, 'Đã trả (đ)', 0)) || 0,
+        shipFee: parseFloat(_cell(row, map, 'Phí VC (đ)', 0)) || 0,
+        statusText: (_cell(row, map, 'Trạng thái', '') || '').toString().trim(),
+        note: (_cell(row, map, 'Ghi chú', '') || '').toString().trim()
+      });
+    }
+  }
+
+  return out;
+}
+
+// Áp dữ liệu đã parse vào state. commit=false → chỉ tính số liệu xem trước (không sửa S).
+// commit=true → ghi thật vào S và push lên Firebase qua save().
+function applyExcelRestore(parsed, commit) {
+  const now = new Date().toISOString();
+  const stats = { prodNew: 0, prodUpdated: 0, saleNew: 0, saleSkip: 0, impNew: 0, impSkip: 0 };
+
+  const products = commit ? S.products : JSON.parse(JSON.stringify(S.products || []));
+  const sales    = commit ? S.sales    : JSON.parse(JSON.stringify(S.sales    || []));
+  const imports  = commit ? S.imports  : JSON.parse(JSON.stringify(S.imports  || []));
+
+  const nameIndex = new Map();
+  products.forEach(p => nameIndex.set(_normVi(p.name), p));
+
+  // 1) KHO HÀNG — CHỈ điền vào trường còn trống/0 của sản phẩm đã có
+  //    (không bao giờ ghi đè giá trị đang khác 0/khác rỗng) — an toàn cho khôi phục.
+  //    Sản phẩm không tìm thấy theo tên → coi là sản phẩm đã bị mất, tạo lại mới.
+  parsed.products.forEach(ep => {
+    const key = _normVi(ep.name);
+    const existing = nameIndex.get(key);
+    if (existing) {
+      let changed = false;
+      const fill = (field, val) => { if (val && !existing[field]) { existing[field] = val; changed = true; } };
+      fill('type', ep.type); fill('origin', ep.origin); fill('unit', ep.unit);
+      fill('buyPrice', ep.buyPrice); fill('sellPrice', ep.sellPrice);
+      fill('description', ep.description); fill('sku', ep.sku);
+      if (!existing.stock && ep.stock) { existing.stock = ep.stock; changed = true; }
+      if (changed) { existing._updated = now; stats.prodUpdated++; }
+    } else {
+      const np = {
+        id: 'p' + uid(), name: ep.name,
+        sku: ep.sku || generateSKU(ep.name, products),
+        type: ep.type || '', origin: ep.origin || '', unit: ep.unit || 'm²',
+        buyPrice: ep.buyPrice || 0, sellPrice: ep.sellPrice || 0, stock: ep.stock || 0,
+        description: ep.description || '', variants: [],
+        createdAt: now, _updated: now, _stockTx: [], _recoveredFromExcel: true
+      };
+      products.push(np); nameIndex.set(key, np); stats.prodNew++;
+    }
+  });
+
+  // Tìm/sinh productId cho 1 dòng bán/nhập (một số SP trong đơn bán/phiếu nhập
+  // có thể không còn nằm trong sheet Kho hàng do đã bị xoá/gộp trước đó)
+  function resolveProduct(name, unit, priceGuess) {
+    const key = _normVi(name);
+    let p = nameIndex.get(key);
+    if (!p) {
+      p = {
+        id: 'p' + uid(), name, sku: generateSKU(name, products),
+        type: '', origin: '', unit: unit || 'm²', buyPrice: 0, sellPrice: priceGuess || 0,
+        stock: 0, description: '', variants: [], createdAt: now, _updated: now, _stockTx: [],
+        _recoveredFromExcel: true
+      };
+      products.push(p); nameIndex.set(key, p); stats.prodNew++;
+    }
+    return p;
+  }
+
+  // 2) BÁN HÀNG — bỏ qua nếu trùng (ngày + khách + sản phẩm + SL + đơn giá)
+  const saleKeyOf = s => [s.date, _normVi(s.customer), _normVi(s.productName),
+    Math.round((parseFloat(s.qty) || 0) * 100), Math.round(parseFloat(s.unitPrice) || 0)].join('|');
+  const existingSaleKeys = new Set(sales.map(saleKeyOf));
+  const newSales = [];
+  parsed.sales.forEach(es => {
+    const k = saleKeyOf(es);
+    if (existingSaleKeys.has(k)) { stats.saleSkip++; return; }
+    const prod = resolveProduct(es.productName, es.unit, es.unitPrice);
+    newSales.push({
+      id: 's' + uid(), orderId: 'recov' + uid(), date: es.date,
+      customer: es.customer, phone: es.phone, address: '',
+      productId: prod.id, productName: prod.name,
+      qty: es.qty, unit: es.unit || prod.unit, unitPrice: es.unitPrice, vatRate: es.vatRate,
+      subTotal: es.subTotal, vatAmt: es.vatAmt, total: es.total, paid: es.paid,
+      shipFee: 0, shipForCustomer: false, variantId: null, variantSize: null,
+      status: es.statusText === 'Đã thanh toán' ? 'done' : 'debt',
+      note: (es.note ? es.note + ' — ' : '') + 'Khôi phục từ Excel',
+      createdAt: now, _updated: now, _recoveredFromExcel: true
+    });
+    existingSaleKeys.add(k); stats.saleNew++;
+  });
+
+  // 3) NHẬP HÀNG — tương tự, bỏ qua nếu trùng (ngày + NCC + sản phẩm + SL + đơn giá)
+  const impKeyOf = s => [s.date, _normVi(s.supplier), _normVi(s.productName),
+    Math.round((parseFloat(s.qty) || 0) * 100), Math.round(parseFloat(s.unitPrice) || 0)].join('|');
+  const existingImpKeys = new Set(imports.map(impKeyOf));
+  const newImports = [];
+  parsed.imports.forEach(ei => {
+    const k = impKeyOf(ei);
+    if (existingImpKeys.has(k)) { stats.impSkip++; return; }
+    const prod = resolveProduct(ei.productName, ei.unit, null);
+    newImports.push({
+      id: 'i' + uid(), date: ei.date, supplier: ei.supplier,
+      productId: prod.id, productName: prod.name,
+      qty: ei.qty, unit: ei.unit || prod.unit, unitPrice: ei.unitPrice, vatRate: ei.vatRate,
+      total: ei.total, paid: ei.paid, variantId: null,
+      shipFee: ei.shipFee || 0, shipUnit: '', shipVatRate: 0, shipQty: '', shipUnitPrice: '',
+      status: ei.statusText === 'Đã thanh toán' ? 'paid' : 'debt',
+      note: (ei.note ? ei.note + ' — ' : '') + 'Khôi phục từ Excel',
+      createdAt: now, _updated: now, _recoveredFromExcel: true
+    });
+    existingImpKeys.add(k); stats.impNew++;
+  });
+
+  if (commit) {
+    S.products = products;
+    S.sales = [...newSales, ...sales];
+    S.imports = [...newImports, ...imports];
+    save('products'); save('sales'); save('imports');
+  }
+
+  return stats;
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  DOM HELPERS
 // ═══════════════════════════════════════════════════════════════
 function h(tag, attrs, ...children) {
@@ -11710,6 +11975,43 @@ function pgSync() {
             };
             fileInp.click();
           } }, '📁 Khôi phục từ file JSON'),
+          h('button', { className: 'btn', onClick: () => {
+            const fileInp = document.createElement('input');
+            fileInp.type = 'file'; fileInp.accept = '.xlsx';
+            fileInp.onchange = e => {
+              const file = e.target.files[0]; if (!file) return;
+              const reader = new FileReader();
+              reader.onload = ev => {
+                try {
+                  const parsed = parseExcelBackup(ev.target.result);
+                  if (!parsed.products.length && !parsed.sales.length && !parsed.imports.length) {
+                    toast('❌ Không đọc được dữ liệu — kiểm tra lại đúng file Excel do app xuất ra', 'error');
+                    return;
+                  }
+                  const preview = applyExcelRestore(parsed, false);
+                  S.confirm = {
+                    msg: '📊 Khôi phục từ Excel:\n' +
+                      '• ' + preview.prodNew + ' sản phẩm MỚI sẽ được thêm\n' +
+                      '• ' + preview.prodUpdated + ' sản phẩm sẽ được bổ sung trường còn thiếu (KHÔNG ghi đè dữ liệu đã có)\n' +
+                      '• ' + preview.saleNew + ' đơn bán sẽ khôi phục (bỏ qua ' + preview.saleSkip + ' đơn đã có/trùng)\n' +
+                      '• ' + preview.impNew + ' phiếu nhập sẽ khôi phục (bỏ qua ' + preview.impSkip + ' phiếu đã có/trùng)\n\n' +
+                      'Toàn bộ thay đổi sẽ được đẩy lên Firebase ngay sau khi xác nhận. Tiếp tục?',
+                    onYes: () => {
+                      const result = applyExcelRestore(parsed, true);
+                      toast('✅ Đã khôi phục: +' + result.prodNew + ' SP, +' + result.saleNew + ' đơn bán, +' + result.impNew + ' phiếu nhập — đã đồng bộ lên Firebase!', 'success');
+                      render();
+                    }
+                  };
+                  render();
+                } catch (err) {
+                  console.error(err);
+                  toast('❌ Lỗi đọc file Excel: ' + (err.message || err), 'error');
+                }
+              };
+              reader.readAsArrayBuffer(file);
+            };
+            fileInp.click();
+          } }, '📊 Khôi phục từ file Excel'),
         ),
         h('div', { style: { fontSize: 12, color: 'var(--text2)', marginBottom: 8 } }, 'Hoặc dán JSON trực tiếp:'),
         (() => {
