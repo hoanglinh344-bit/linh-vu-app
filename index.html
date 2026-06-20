@@ -300,6 +300,11 @@ const CLOUD = (() => {
   let _listeners = [];   // unsubscribe functions cho onSnapshot
   let _flushing = false;
   let _bootDone = false; // đã hoàn thành boot sync chưa
+  // AN TOÀN DỮ LIỆU: bật cờ khi phát hiện 1 lần pull-full trả về RỖNG dù
+  // cache cũ đang có dữ liệu — dấu hiệu lỗi mạng/quyền truy cập/token Auth
+  // chưa kịp refresh, KHÔNG phải sự thật "đã bị xoá". Dùng để hiển thị cảnh
+  // báo cho người dùng ở trang Cài đặt (xem getStatus()).
+  let _suspiciousPull = null; // null = chưa từng gặp; object = { name, baselineLen, ts } của lần gần nhất
 
   // ── Queue persistence: lưu vào sessionStorage để sống qua refresh ──
   const QUEUE_SS_KEY = 'dtn_sync_queue';
@@ -376,8 +381,11 @@ const CLOUD = (() => {
   }
   function getStatus() {
     return { enabled: _cfg?.enabled||false, online:_online, syncStatus:_syncStatus,
-             lastSync:_lastSync, queueLen:_syncQueue.length, realtime: _listeners.length > 0 };
+             lastSync:_lastSync, queueLen:_syncQueue.length, realtime: _listeners.length > 0,
+             suspiciousPull: _suspiciousPull, bootDone: _bootDone };
   }
+
+
 
   // ── Đường dẫn collection ────────────────────────────────────
   function col(name) {
@@ -860,6 +868,38 @@ const CLOUD = (() => {
   }
 
   // ═══════════════════════════════════════════════════════════
+  //  AN TOÀN DỮ LIỆU — chặn ghi đè cache khi pull-full về RỖNG bất thường
+  //
+  //  Đây là lớp bảo vệ chính cho lỗi đã gặp: "tồn kho local giảm mạnh trong
+  //  khi Firestore vẫn đầy đủ". Nguyên nhân gốc: pullColIncremental() lúc
+  //  pull TOÀN BỘ (forceFull / cache rỗng / 7 ngày) có thể trả về collection
+  //  rỗng (0 doc) một cách "thành công" (không throw) nếu gặp lỗi quyền truy
+  //  cập theo từng document, token Auth chưa kịp refresh ngay sau đăng nhập,
+  //  hoặc một số lỗi mạng/SDK không chuẩn. Trước đây code TIN ngay kết quả
+  //  này và ghi đè localStorage → mất cache cũ, dù Firestore thật vẫn còn đủ.
+  //
+  //  Quy tắc: nếu cache cũ (baseline) đang có ≥1 bản ghi mà lần pull-full
+  //  này lại trả về 0 bản ghi → coi là BẤT THƯỜNG, không tin, KHÔNG ghi đè.
+  //  Trả lại baseline cũ, không cập nhật cursor (để lần sau tự thử pull-full
+  //  lại), và bật cờ cảnh báo cho người dùng biết qua trang Cài đặt.
+  // ═══════════════════════════════════════════════════════════
+  function _guardAgainstEmptyWipe(name, baseline, changed) {
+    if (changed.length === 0 && baseline.length > 0) {
+      _suspiciousPull = { name, baselineLen: baseline.length, ts: ts() };
+      console.warn('[CLOUD][AN TOÀN] Pull-full "' + name + '" trả về RỖNG dù cache đang có ' +
+        baseline.length + ' bản ghi → ĐÃ HỦY ghi đè, giữ nguyên cache cũ. Có thể do mất mạng/quyền truy cập tạm thời.');
+      try {
+        if (typeof toast === 'function') {
+          toast('⚠️ Đồng bộ "' + name + '" trả về rỗng bất thường (cache đang có ' + baseline.length +
+            ' mục) — đã HỦY ghi đè để bảo vệ dữ liệu. Kiểm tra mạng rồi vào Cài đặt bấm "Kéo từ cloud về" để thử lại.', 'error');
+        }
+      } catch(e) {}
+      return true; // bị chặn
+    }
+    return false;
+  }
+
+  // ═══════════════════════════════════════════════════════════
   //  PULL TĂNG DẦN — chỉ đọc document thay đổi từ lần sync trước
   //
   //  Thay vì col(name).get() đọc TOÀN BỘ collection mỗi lần (tốn reads),
@@ -890,9 +930,16 @@ const CLOUD = (() => {
 
     if (!cursor) {
       // Pull full (lần đầu / force / cache rỗng) → kết quả chính là toàn bộ
+      // AN TOÀN: kiểm tra bất thường TRƯỚC khi tin kết quả này là sự thật.
+      if (_guardAgainstEmptyWipe(name, baseline, changed)) {
+        return baseline; // giữ nguyên cache cũ, không set cursor (thử lại sau)
+      }
       let maxTs = '';
       changed.forEach(r => { if (r && r._updated && r._updated > maxTs) maxTs = r._updated; });
       _setCursor(name, maxTs || new Date().toISOString());
+      // Pull full thành công có dữ liệu (hoặc baseline cũng đang rỗng — hợp lệ)
+      // → gỡ cờ cảnh báo cũ của ĐÚNG collection này nếu có.
+      if (_suspiciousPull && _suspiciousPull.name === name) _suspiciousPull = null;
       return changed;
     }
 
@@ -908,9 +955,29 @@ const CLOUD = (() => {
     return Object.values(map);
   }
 
+
   // ═══════════════════════════════════════════════════════════
   //  PUSH (ghi lên Firestore)
   // ═══════════════════════════════════════════════════════════
+  // ── Dọn dữ liệu trước khi ghi Firestore ─────────────────────
+  // Firestore SDK mặc định TỪ CHỐI (throw lỗi ngay) bất kỳ field nào có
+  // giá trị undefined — và vì 1 batch.set() lỗi sẽ làm RỚT CẢ LÔ (tới 400
+  // record/lần, xem pushCollection), 1 sản phẩm/đơn cũ thiếu 1 field thôi
+  // có thể khiến hàng trăm record khác hoàn toàn hợp lệ cũng không ghi được.
+  // Hàm này dọn sạch undefined (đệ quy object/array lồng nhau) trước khi gửi.
+  function _sanitizeForFirestore(val) {
+    if (val === null || typeof val !== 'object') return val;
+    if (Array.isArray(val)) return val.map(_sanitizeForFirestore);
+    if (val instanceof Date) return val;
+    const out = {};
+    for (const k of Object.keys(val)) {
+      const v = val[k];
+      if (v === undefined) continue; // bỏ hẳn field undefined (không set null thay vào)
+      out[k] = _sanitizeForFirestore(v);
+    }
+    return out;
+  }
+
   async function pushCollection(colName, data) {
     if (!_db) return false;
     try {
@@ -931,10 +998,13 @@ const CLOUD = (() => {
         const batch = _db.batch();
         chunk.forEach(r => {
           if (!r || !r.id) return;
+          // Dọn undefined TRƯỚC, rồi mới gắn _updated (sentinel serverTimestamp()
+          // không phải plain object thường, không cần/không nên đi qua sanitize).
+          const clean = _sanitizeForFirestore(r);
           // Firebase-first: luôn dùng serverTimestamp() — đồng hồ thiết bị có thể lệch
           // gây record cũ ghi đè record mới. serverTimestamp() = đồng hồ Firestore server.
           // merge:true → chỉ cập nhật field thay đổi, không xoá field khác.
-          batch.set(ref.doc(String(r.id)), { ...r, _updated: SERVER_TS }, { merge: true });
+          batch.set(ref.doc(String(r.id)), { ...clean, _updated: SERVER_TS }, { merge: true });
         });
         await batch.commit();
       }
@@ -1035,19 +1105,52 @@ const CLOUD = (() => {
     }
 
     try {
-      await Promise.all(items.map(item => pushCollection(item.colName, item.data)));
+      // AN TOÀN: pushCollection() tự bắt lỗi và trả về true/false, KHÔNG
+      // throw — nên Promise.all ở đây luôn "resolve" dù 1 hay nhiều
+      // collection ghi thất bại thật trên Firestore. Trước đây code coi
+      // Promise.all chạy xong = mọi thứ đã thành công, xoá khỏi hàng đợi
+      // luôn dù chưa hề lên cloud — đây là nguyên nhân khiến 1 số thay đổi
+      // (vd: "Tính lại tồn kho") biến mất sau khi thoát/mở lại app. Phải
+      // đọc đúng kết quả true/false của TỪNG collection.
+      const results = await Promise.all(items.map(async item => ({
+        colName: item.colName, ts: item.ts,
+        ok: await pushCollection(item.colName, item.data),
+      })));
 
-      // ✅ Push thành công: chỉ xóa những item đã push thành công
-      const pushedCols = new Set(items.map(i => i.colName));
+      const failedCols    = new Set(results.filter(r => !r.ok).map(r => r.colName));
+      const succeededCols = new Set(results.filter(r =>  r.ok).map(r => r.colName));
+
+      // Chỉ xoá khỏi hàng đợi những collection ĐÃ XÁC NHẬN ghi thành công.
+      // Collection thất bại được GIỮ LẠI để tự thử lại (không âm thầm mất).
       _syncQueue = _syncQueue.filter(q => {
-        if (!pushedCols.has(q.colName)) return true;   // collection khác: giữ
-        const pushed = items.find(i => i.colName === q.colName);
-        return pushed && q.ts > pushed.ts;             // item mới hơn trong session: giữ
+        if (failedCols.has(q.colName)) return true;       // thất bại: giữ lại
+        if (!succeededCols.has(q.colName)) return true;   // không thuộc lần flush này: giữ
+        const pushed = results.find(r => r.colName === q.colName);
+        return pushed && q.ts > pushed.ts;                // item mới hơn trong session: giữ
       });
       _saveQueue(_syncQueue);
       if (_syncQueue.length === 0) _clearQueue();
 
-      _retryDelay = 5000; // reset backoff
+      if (failedCols.size > 0) {
+        // Có collection ghi thất bại thật — KHÔNG báo "đã xong", báo lỗi rõ
+        // và lên lịch thử lại (exponential backoff), không reset backoff.
+        _syncStatus = 'error'; notifyStatus();
+        try {
+          if (typeof toast === 'function') {
+            toast('❌ Đồng bộ lên Firebase thất bại: ' + [...failedCols].join(', ') +
+              '. Dữ liệu trên máy vẫn an toàn, hệ thống sẽ tự thử lại.', 'error');
+          }
+        } catch(e) {}
+        clearTimeout(_retryTimer);
+        _retryTimer = setTimeout(() => {
+          _flushing = false;
+          _retryDelay = Math.min(_retryDelay * 2, 60000);
+          flushQueue();
+        }, _retryDelay);
+        return;
+      }
+
+      _retryDelay = 5000; // reset backoff — mọi thứ đã xác nhận lên cloud
       _syncStatus = 'ok'; _lastSync = ts(); notifyStatus();
     } catch(e) {
       console.warn('[CLOUD] flushQueue error:', e);
@@ -1367,6 +1470,14 @@ const CLOUD = (() => {
       if (!_cfg?.enabled) return;
       enqueue(colName, Array.isArray(data) ? data : [data]);
     },
+    // Push và CHỜ kết quả thật (true/false) — dùng cho các thao tác mà người
+    // dùng cần biết CHẮC đã lên Firestore hay chưa trước khi báo "thành
+    // công" (ví dụ nút "Tính lại tồn kho"), khác với push() ở trên chỉ xếp
+    // hàng đợi nền và trả về ngay, không chờ xác nhận.
+    async pushAwait(colName, data) {
+      if (!_cfg?.enabled || !_db) return false;
+      return await pushCollection(colName, Array.isArray(data) ? data : [data]);
+    },
     // Push array có chứa _deleted records để đồng bộ xóa sang thiết bị khác
     _pushDeletedRecord(colName, arrayWithDeleted) {
       if (!_db || !_cfg?.enabled) return;
@@ -1389,6 +1500,9 @@ const CLOUD = (() => {
     // Dùng ở các nơi tạo sales/imports/returns để đánh dấu _stockTx
     // (xem applyLedgerToStock) — tránh hoà giải tồn kho đếm trùng giao dịch
     unionStockTx,
+    // Cho phép người dùng ẩn banner cảnh báo "đã chặn ghi đè bất thường"
+    // sau khi đã đọc và xử lý (xem trang Cài đặt)
+    _clearSuspiciousPull() { _suspiciousPull = null; notifyStatus(); },
   };
 })();
 // ═══════════════════════════════════════════════════════════════
@@ -2629,7 +2743,29 @@ const DB = (() => {
     importAll(json) {
       try {
         const obj = JSON.parse(json);
-        KEYS.forEach(k => { if (obj[k]) this.set(k, obj[k]); });
+        // AN TOÀN DỮ LIỆU: mảng RỖNG [] vẫn là truthy trong JS — nếu chỉ
+        // check "if (obj[k])" thì 1 file backup có dtn_products:[] (backup
+        // cũ từ thời chưa nhập SP, hoặc file JSON bị cắt/hỏng một phần) sẽ
+        // XOÁ SẠCH dữ liệu hiện tại mà không có cảnh báo gì. Chỉ import nếu
+        // key tồn tại VÀ (không phải mảng, hoặc là mảng có ít nhất 1 phần tử).
+        // Muốn xoá thật một collection → dùng nút "Xoá toàn bộ dữ liệu" rõ
+        // ràng, không nên xảy ra "ngầm" qua việc phục hồi backup.
+        const skippedEmpty = [];
+        KEYS.forEach(k => {
+          const v = obj[k];
+          if (v === undefined || v === null) return;
+          if (Array.isArray(v) && v.length === 0) { skippedEmpty.push(k); return; }
+          this.set(k, v);
+        });
+        if (skippedEmpty.length > 0) {
+          console.warn('[DB.importAll] Bỏ qua các mục RỖNG trong file backup để tránh xoá nhầm dữ liệu hiện tại:', skippedEmpty.join(', '));
+          try {
+            if (typeof toast === 'function') {
+              toast('⚠️ File backup có ' + skippedEmpty.length + ' mục RỖNG (' + skippedEmpty.join(', ') +
+                ') — đã BỎ QUA các mục này để không xoá nhầm dữ liệu hiện tại. Các mục còn lại đã được khôi phục.', 'error');
+            }
+          } catch(e) {}
+        }
         return true;
       } catch(e) { return false; }
     },
@@ -11198,6 +11334,20 @@ function pgSync() {
     return h('span', { style: { fontSize: 12, color: 'var(--text2)' } }, '☁️ Sẵn sàng');
   };
 
+  // ── Cho biết dữ liệu đang hiển thị là "đã xác nhận thật từ Firebase" hay
+  // "đang tạm dùng cache local, chưa xác nhận lại" — để người dùng không lầm
+  // tưởng cache local = dữ liệu chính thức.
+  const dataConfirmBadge = (status) => {
+    if (!status.enabled) return h('span', { style: { fontSize: 12, color: 'var(--red)', fontWeight: 700 } }, '📴 LOCAL-ONLY — chưa bật Firebase, dữ liệu chỉ nằm trên máy này');
+    if (status.suspiciousPull) return h('span', { style: { fontSize: 12, color: 'var(--red)', fontWeight: 700 } }, '🛑 Bất thường — xem cảnh báo phía trên');
+    if (!status.bootDone) return h('span', { style: { fontSize: 12, color: 'var(--text2)' } }, '⏳ Đang tải dữ liệu...');
+    if (!status.online) return h('span', { style: { fontSize: 12, color: 'var(--amber)', fontWeight: 700 } }, '⏳ Offline — đang dùng cache, chưa xác nhận lại');
+    if (status.syncStatus === 'error') return h('span', { style: { fontSize: 12, color: 'var(--red)', fontWeight: 700 } }, '❌ Lỗi đồng bộ — đang dùng cache cũ');
+    if (status.syncStatus === 'syncing') return h('span', { style: { fontSize: 12, color: 'var(--blue)', fontWeight: 700 } }, '⏳ Đang xác nhận với Firebase...');
+    return h('span', { style: { fontSize: 12, color: 'var(--green)', fontWeight: 700 } }, '✅ Dữ liệu đã xác nhận từ Firebase');
+  };
+
+
   const rebuild = () => {
     const lastSaved  = DB.lastSaved();
     const backupTime = DB.getAutoBackupTime();
@@ -11235,6 +11385,22 @@ function pgSync() {
         } }, '💾 Tải ngay')
       ),
 
+      // ── CẢNH BÁO: phát hiện 1 lần đồng bộ bất thường đã bị chặn ──
+      cloudSt.suspiciousPull ? h('div', { className: 'card', style: { border: '1px solid var(--red)', background: 'rgba(224,92,92,0.08)', marginBottom: 16 } },
+        h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10 } },
+          h('div', {},
+            h('div', { style: { fontWeight: 700, color: 'var(--red)', fontSize: 13 } },
+              '🛑 Đã chặn 1 lần ghi đè dữ liệu bất thường — "' + cloudSt.suspiciousPull.name + '"'),
+            h('div', { style: { fontSize: 12, color: 'var(--text2)', marginTop: 4, lineHeight: 1.6 } },
+              'Lúc ' + fmtTs(cloudSt.suspiciousPull.ts) + ', đồng bộ với Firebase trả về RỖNG dù cache đang có ' +
+              cloudSt.suspiciousPull.baselineLen + ' bản ghi. App đã TỪ CHỐI ghi đè để bảo vệ dữ liệu thật của bạn — ' +
+              'dữ liệu hiện tại vẫn an toàn. Nguyên nhân thường là mất mạng tạm thời hoặc phiên đăng nhập chưa kịp xác thực xong. ',
+              h('b', {}, 'Hãy kiểm tra kết nối mạng rồi bấm nút "⬇️ Kéo từ cloud về" dưới đây để xác nhận lại.'))
+          ),
+          h('button', { className: 'btn btn-sm', onClick: () => { CLOUD._clearSuspiciousPull(); rebuild(); } }, 'Đã hiểu, ẩn đi')
+        )
+      ) : null,
+
       // ── TRẠNG THÁI TỔNG QUAN ──
       h('div', { className: 'stats-grid', style: { gridTemplateColumns: 'repeat(3,1fr)', marginBottom: 20 } },
         (() => {
@@ -11243,7 +11409,8 @@ function pgSync() {
           return h('div', { className: 'stat' },
             h('div', { className: 'stat-label' }, '🔥 Firebase — Nguồn chính'),
             h('div', { className: 'stat-val', style: { fontSize: 15, color: c } }, label),
-            h('div', { className: 'stat-change' }, cloudSt.realtime ? '📡 Realtime ON · ' + cloudBadge(cloudSt) : cloudBadge(cloudSt))
+            h('div', { className: 'stat-change' }, cloudSt.realtime ? '📡 Realtime ON · ' + cloudBadge(cloudSt) : cloudBadge(cloudSt)),
+            h('div', { className: 'stat-change', style: { marginTop: 4 } }, dataConfirmBadge(cloudSt))
           );
         })(),
         (() => {
@@ -11407,14 +11574,33 @@ function pgSync() {
                   S.sales       = S.sales.concat(allSales.filter(r => !S.sales.find(l => l.id === r.id)));
                   S.returns     = S.returns.concat(allReturns.filter(r => !S.returns.find(l => l.id === r.id)));
 
-                  // 5. Lưu local
-                  ['products','imports','sales','returns'].forEach(k => save(k));
+                  // 5. Lưu local cho imports/sales/returns (không có gì quan
+                  // trọng cần chờ xác nhận — đây chỉ là bổ sung record từ
+                  // cloud, không phải số liệu vừa tính lại).
+                  ['imports','sales','returns'].forEach(k => save(k));
+                  try { if (typeof DB !== 'undefined') DB.set('dtn_products', S.products); } catch(e) {}
 
-                  // 6. Đẩy products đã sửa lên cloud để thiết bị khác nhận
-                  CLOUD.push('dtn_products', fixedProducts);
+                  // 6. Đẩy products đã sửa lên cloud — CHỜ XÁC NHẬN THẬT (không
+                  // dùng hàng đợi nền push() như trước) để biết chắc đã ghi
+                  // vào Firestore trước khi báo "thành công" cho người dùng.
+                  // Đây là điểm sửa chính: trước đây push() chỉ xếp hàng đợi
+                  // và trả về ngay, nên nếu lần ghi đó thất bại (mất mạng,
+                  // dữ liệu lỗi...) người dùng vẫn thấy toast "thành công",
+                  // và khi mở lại app, số liệu cũ trên Firestore (chưa hề
+                  // được ghi đè) lại đè ngược về local — y hệt hiện tượng
+                  // "dùng công cụ này xong, mở lại app vẫn về số cũ".
+                  const pushOk = await CLOUD.pushAwait('dtn_products', fixedProducts);
+                  if (!pushOk) {
+                    toast('❌ Đã tính lại tồn kho ở máy này, NHƯNG đẩy lên Firebase THẤT BẠI — số liệu CHƯA lên cloud, các máy khác sẽ chưa thấy thay đổi và lần mở app sau có thể quay lại số cũ. Kiểm tra mạng/đăng nhập rồi bấm lại nút này.', 'error');
+                    render();
+                    return;
+                  }
+                  // Đánh dấu đã đồng bộ — để save()/listener sau này không hiểu
+                  // nhầm các sản phẩm này là "còn thay đổi chưa push".
+                  if (typeof _seedLastPushed === 'function') _seedLastPushed('products', fixedProducts);
 
                   const count = fixedProducts.length;
-                  toast(`✅ Đã tính lại tồn kho cho ${count} sản phẩm từ cloud!`, 'success');
+                  toast(`✅ Đã tính lại tồn kho cho ${count} sản phẩm và XÁC NHẬN đã lưu trên Firebase!`, 'success');
                   render();
                 } catch(e) {
                   console.error('[FIX STOCK]', e);
