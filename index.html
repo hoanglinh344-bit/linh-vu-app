@@ -499,7 +499,21 @@ const CLOUD = (() => {
     const merged = [...new Set([...(a || []), ...(b || [])])];
     return merged.length > STOCK_TX_CAP ? merged.slice(merged.length - STOCK_TX_CAP) : merged;
   }
-  // Sau đó deduplicate theo tên — tránh tình trạng 2 thiết bị tạo cùng SP offline
+  // FIX (#4): cảnh báo SP trùng tên thay vì tự gộp. Throttle 60s để không spam
+  // toast mỗi lần listener nổ. Hướng người dùng tới nút "Gộp SP trùng" thủ công.
+  let _lastDupWarn = 0;
+  function _warnDupNames(dupNames) {
+    try {
+      if (!dupNames || dupNames.length === 0) return;
+      if (Date.now() - _lastDupWarn < 60000) return; // throttle
+      _lastDupWarn = Date.now();
+      if (typeof toast === 'function') {
+        const shown = dupNames.slice(0, 3).join(', ');
+        const more  = dupNames.length > 3 ? ` và ${dupNames.length - 3} tên khác` : '';
+        toast(`⚠️ Có ${dupNames.length} sản phẩm trùng tên (${shown}${more}). Vào Kho Hàng kiểm tra — nếu trùng thật, bấm nút "Gộp SP trùng". App KHÔNG tự gộp để tránh nhầm.`, 'warn');
+      }
+    } catch(e) {}
+  }
   function mergeProducts(local, cloudDocs) {
     const map = {};
     (local || []).forEach(p => { if (p && p.id) map[p.id] = { ...p }; });
@@ -537,51 +551,28 @@ const CLOUD = (() => {
         // local mới hơn → giữ nguyên, sẽ push lên cloud
       }
     });
-    // ── Deduplicate theo tên (normalize: lowercase + trim) ──────
-    // Nếu 2 sản phẩm cùng tên (ví dụ 2 thiết bị tạo cùng SP offline) → giữ 1
-    // bản, CỘNG DỒN stock của bản bị loại vào bản còn lại (giống nút "Gộp SP
-    // trùng" thủ công) — KHÔNG được lặng lẽ vứt bỏ stock của bản thua, vì đó
-    // chính là tồn kho thật của hàng đã nhập. reroutes trả về để caller
-    // (applyCloudData) chuyển phiếu nhập/bán/trả của bản bị loại sang bản còn
-    // lại, nếu không các phiếu đó sẽ bị "treo" vào 1 productId không còn tồn tại.
-    const byName = {};
-    const reroutes = []; // { loserId, winnerId }
-    Object.values(map).forEach(p => {
+    // ── FIX (lỗi #4): KHÔNG còn tự động gộp 2 SP trùng tên ──────────────
+    // Trước đây nếu 2 sản phẩm KHÁC ID nhưng cùng tên, code tự gộp thành 1 +
+    // đẩy tombstone xoá bản thua. Điều này gây MẤT SP khi anh cố ý có 2 mặt
+    // hàng cùng tên (ví dụ cùng "Đá đen" nhập 2 đợt/2 NCC giá khác nhau).
+    // Giờ: GIỮ NGUYÊN cả 2 (chỉ dedup theo id ở vòng lặp trên), KHÔNG gộp,
+    // KHÔNG xoá gì. Thay vào đó trả về danh sách tên trùng (dupNames) để báo
+    // người dùng tự bấm nút "⚠️ Gộp SP trùng" thủ công trên trang Kho Hàng
+    // khi chắc chắn đó là trùng thật. reroutes luôn rỗng → code reroute/
+    // tombstone ở caller (bootSync/applyCloudData) nằm im, không kích hoạt.
+    const alive = Object.values(map).filter(p => !p._deleted);
+    const nameCount = {};
+    alive.forEach(p => {
       const key = (p.name || '').trim().toLowerCase();
       if (!key) return;
-      if (!byName[key]) {
-        byName[key] = p;
-      } else {
-        // Giữ bản mới hơn theo _updated; safeTs() loại bỏ clock skew thiết bị
-        const existTs = safeTs(byName[key]._updated || byName[key].createdAt || '');
-        const newTs   = safeTs(p._updated || p.createdAt || '');
-        const mergedTx = unionStockTx(byName[key]._stockTx, p._stockTx);
-        // _deleted chỉ thắng khi timestamp xóa THỰC SỰ MỚI HƠN (dùng > không >=)
-        if (p._deleted && !byName[key]._deleted) {
-          if (newTs > existTs) byName[key] = { ...p, _stockTx: mergedTx }; // xóa thắng chỉ khi THỰC SỰ mới hơn
-          else byName[key] = { ...byName[key], _stockTx: mergedTx };
-        } else if (!p._deleted && byName[key]._deleted) {
-          // Bản sống thắng khi mới hơn hoặc bằng lệnh xóa — đây là fix bug chính
-          // (trước đây code giữ _deleted, gây mất sản phẩm khi tạo lại cùng tên)
-          if (newTs >= existTs) byName[key] = { ...p, _stockTx: mergedTx };
-          else byName[key] = { ...byName[key], _stockTx: mergedTx };
-        } else if (!p._deleted && !byName[key]._deleted) {
-          // Cả 2 còn sống và cùng tên thật → ĐÂY LÀ 2 SẢN PHẨM TRÙNG, không phải
-          // 1 cái bị xoá — gộp: giữ bản mới hơn làm "winner", cộng dồn stock,
-          // ghi nhận reroute để chuyển phiếu nhập/bán/trả sang winner.id
-          const winner = newTs > existTs ? p : byName[key];
-          const loser  = newTs > existTs ? byName[key] : p;
-          const totalStock = (parseFloat(winner.stock) || 0) + (parseFloat(loser.stock) || 0);
-          if (loser.id !== winner.id) reroutes.push({ loserId: loser.id, winnerId: winner.id, winnerName: winner.name });
-          byName[key] = { ...winner, stock: totalStock, _stockTx: mergedTx };
-        } else if (newTs > existTs) {
-          byName[key] = { ...p, _stockTx: mergedTx };
-        } else {
-          byName[key] = { ...byName[key], _stockTx: mergedTx };
-        }
-      }
+      nameCount[key] = (nameCount[key] || 0) + 1;
     });
-    return { products: Object.values(byName).filter(p => !p._deleted), reroutes };
+    const dupNames = [];
+    alive.forEach(p => {
+      const key = (p.name || '').trim().toLowerCase();
+      if (key && nameCount[key] > 1 && !dupNames.includes(p.name)) dupNames.push(p.name);
+    });
+    return { products: alive, reroutes: [], dupNames };
   }
   // ── Hoà giải tồn kho khi 2 thiết bị cùng bán/nhập/trả 1 SP lúc offline ──
   // Ý tưởng: mỗi sản phẩm giữ _stockTx = tập id giao dịch ĐÃ phản ánh trong
@@ -698,6 +689,7 @@ const CLOUD = (() => {
         const cloudDoc = cloudDocs[0];
         const merged = { ...cloudDoc };
         delete merged.id;
+        delete merged._updated; // FIX: không để rác _updated của cloud lọt vào S.settings
         const before = JSON.stringify(S.settings);
         S.settings = merged;
         if (JSON.stringify(S.settings) !== before) changed = true;
@@ -708,10 +700,12 @@ const CLOUD = (() => {
       // đọc Firestore mỗi lần listener khởi động lại — nên GHÉP vào S.products
       // hiện có (mergeProducts đã hỗ trợ sẵn tham số "local" cho đúng việc này),
       // không dùng base rỗng nữa vì cloudDocs không còn là toàn bộ collection.
-      const { products: mergedProducts, reroutes } = mergeProducts(S.products, cloudDocs);
+      const { products: mergedProducts, reroutes, dupNames } = mergeProducts(S.products, cloudDocs);
       S.products = mergedProducts;
       if (JSON.stringify(S.products) !== before) changed = true;
       _seedLastPushed(stateKey, S.products);
+      // FIX (#4): cảnh báo SP trùng tên thay vì tự gộp. Throttle 60s tránh spam.
+      if (dupNames && dupNames.length > 0) _warnDupNames(dupNames);
       // ── Migrate SKU cho sản phẩm cũ vừa sync về từ cloud ──────
       // Chạy bất đồng bộ nhẹ để không block onSnapshot handler
       if (typeof migrateLegacySKU === 'function') {
@@ -1048,9 +1042,22 @@ const CLOUD = (() => {
   let _retryTimer = null;
 
   function enqueue(colName, data) {
-    // Ghi đè entry cũ cùng colName để không push trùng
+    // FIX (mất dữ liệu offline): GỘP delta theo id thay vì THAY THẾ entry cũ.
+    // Trước đây entry cũ cùng colName bị lọc bỏ → nếu offline sửa SP A rồi sửa
+    // SP B, lần enqueue thứ 2 vứt mất bản ghi A đang chờ. Kết hợp _lastPushed
+    // (đánh dấu đã đẩy ngay khi xếp hàng) → A không bao giờ được phát hiện lại
+    // → mất vĩnh viễn sau bootSync. Giờ gộp: giữ union theo id, bản mới thắng.
+    const incoming = Array.isArray(data) ? data : [data];
+    const prev = _syncQueue.find(q => q.colName === colName);
+    let mergedData = incoming;
+    if (prev && Array.isArray(prev.data)) {
+      const byId = {};
+      prev.data.forEach(r => { if (r && r.id != null) byId[r.id] = r; });
+      incoming.forEach(r => { if (r && r.id != null) byId[r.id] = r; });
+      mergedData = Object.values(byId);
+    }
     _syncQueue = _syncQueue.filter(q => q.colName !== colName);
-    _syncQueue.push({ colName, data, ts: Date.now() });
+    _syncQueue.push({ colName, data: mergedData, ts: Date.now() });
     _saveQueue(_syncQueue); // persist để sống qua refresh
     if (_online) flushQueue();
   }
@@ -1215,15 +1222,18 @@ const CLOUD = (() => {
       // _deleted records bị lọc ra luôn — chỉ giữ data còn sống.
       const _S = window._S || S_state;
 
-      // Products: filter _deleted, xử lý deduplicate trùng tên
+      // Products: filter _deleted. KHÔNG còn tự gộp trùng tên (xem FIX #4).
       if (products.length) {
-        const { products: mergedProds, reroutes } = mergeProducts([], products); // base rỗng → products đã đại diện full cloud rồi
+        const { products: mergedProds, reroutes, dupNames } = mergeProducts([], products); // base rỗng → products đã đại diện full cloud rồi
         _S.products = mergedProds;
-        // Xử lý reroute nếu có SP trùng tên trên cloud
+        // FIX (#4): cảnh báo SP trùng tên thay vì tự gộp (báo sau khi UI sẵn sàng).
+        if (dupNames && dupNames.length > 0) setTimeout(() => _warnDupNames(dupNames), 1500);
+        // reroutes luôn rỗng từ FIX #4 → khối dưới nằm im, giữ lại để tương thích.
         if (reroutes.length > 0) {
           const _mergeNow = new Date().toISOString();
           const winnerIdOf = {}; reroutes.forEach(r => { winnerIdOf[r.loserId] = r.winnerId; });
-          const nameById   = {}; reroutes.forEach(r => { nameById[r.loserId] = r.winnerName; });
+          // FIX: thêm key winnerId để tra được tên sau khi đã đổi productId sang winnerId
+          const nameById   = {}; reroutes.forEach(r => { nameById[r.loserId] = r.winnerName; nameById[r.winnerId] = r.winnerName; });
           ['imports','sales','returns'].forEach(k => {
             const arr = k === 'imports' ? imports : k === 'sales' ? sales : returns;
             arr.forEach(r => { if (winnerIdOf[r.productId]) { r.productId = winnerIdOf[r.productId]; r.productName = nameById[r.productId] || r.productName; r._updated = _mergeNow; } });
@@ -3117,7 +3127,7 @@ function softDelete(arrayKey, id, extraFn) {
 function numFmt(n) { return isNaN(n) ? 0 : Math.round(n); }
 
 function exportExcel(sheetChoice) {
-  const { products, imports, sales, returns, settings } = S;
+  const { products, imports, sales, returns, settings, cashflows } = S;
   const shop = settings.shopName || 'DaTuNhien';
   const dateStr = today();
 
@@ -3127,6 +3137,7 @@ function exportExcel(sheetChoice) {
   const GREEN  = '1a3d2b';
   const RED    = '5c1a1a';
   const PURPLE = '3a1a5c';
+  const TEAL   = '0d4d4d';
 
   // Helper: tạo style header đẹp
   function hStyle(bgHex) {
@@ -3469,8 +3480,153 @@ function exportExcel(sheetChoice) {
     XLSX.utils.book_append_sheet(wb, ws5, '🔄 Trả hàng');
   }
 
+  // ─── 6. SHEET: THU CHI ──────────────────────────────────────
+  if (sheetChoice === 'all' || sheetChoice === 'cashflow') {
+    const cfHeaders = ['Ngày','Loại','Danh mục','Ghi chú','Số tiền (đ)'];
+    const cfList = [...(cashflows || [])].sort((a,b) => (b.date||'').localeCompare(a.date||''));
+    const cfRows = cfList.map(c => [
+      fmtD(c.date), c.type === 'income' ? '💵 Thu' : '💸 Chi', c.category || '', c.note || '', numFmt(c.amount)
+    ]);
+    const totIncome  = (cashflows || []).filter(c => c.type === 'income').reduce((a,c) => a + (c.amount||0), 0);
+    const totExpense = (cashflows || []).filter(c => c.type === 'expense').reduce((a,c) => a + (c.amount||0), 0);
+    const sumStartRow = 4 + cfRows.length + 1; // dòng trống ngăn cách
+    cfRows.push([]); // dòng trống trước phần tổng hợp
+    cfRows.push(['TỔNG THU PHÁT SINH','','','', numFmt(totIncome)]);
+    cfRows.push(['TỔNG CHI PHÁT SINH','','','', numFmt(totExpense)]);
+    cfRows.push(['CHÊNH LỆCH (Thu − Chi)','','','', numFmt(totIncome - totExpense)]);
+
+    const ws6 = XLSX.utils.aoa_to_sheet([]);
+    XLSX.utils.sheet_add_aoa(ws6, [
+      [shop + ' — BÁO CÁO THU CHI PHÁT SINH'],
+      ['Ngày xuất: ' + fmtD(dateStr) + '  |  Tổng ' + cfList.length + ' phiếu'],
+      [],
+      cfHeaders,
+      ...cfRows
+    ]);
+    ws6['A1'] = { v: shop + ' — BÁO CÁO THU CHI PHÁT SINH', t: 's', s: { font: { bold: true, sz: 14, name: 'Arial', color: { rgb: '17a2a2' } } } };
+    ws6['A2'] = { v: 'Ngày xuất: ' + fmtD(dateStr) + '  |  Tổng ' + cfList.length + ' phiếu', t: 's', s: { font: { italic: true, sz: 10, name: 'Arial', color: { rgb: '888888' } } } };
+    cfHeaders.forEach((_, ci) => {
+      const ca = XLSX.utils.encode_cell({ r: 3, c: ci });
+      if (ws6[ca]) ws6[ca].s = hStyle(TEAL);
+    });
+    cfRows.forEach((row, ri) => {
+      row.forEach((_, ci) => {
+        const ca = XLSX.utils.encode_cell({ r: 4 + ri, c: ci });
+        if (!ws6[ca]) return;
+        const isSummary = 4 + ri >= sumStartRow;
+        ws6[ca].s = isSummary
+          ? { font: { bold: true, name: 'Arial', sz: 10 }, fill: { fgColor: { rgb: 'E0F7F7' }, patternType: 'solid' }, alignment: { horizontal: ci === 4 ? 'right' : 'left' } }
+          : dStyle(ci === 4 ? 'right' : 'left');
+      });
+    });
+    ws6['!cols'] = [{wch:12},{wch:10},{wch:24},{wch:32},{wch:16}];
+    ws6['!merges'] = [{ s:{r:0,c:0}, e:{r:0,c:4} }, { s:{r:1,c:0}, e:{r:1,c:4} }];
+    ws6['!ref'] = XLSX.utils.encode_range({ s:{r:0,c:0}, e:{r:4+cfRows.length-1,c:4} });
+    XLSX.utils.book_append_sheet(wb, ws6, '💵 Thu Chi');
+  }
+
+  // ─── 7. SHEET: LỢI NHUẬN ─────────────────────────────────────
+  // Công thức giống đúng trang "Lợi Nhuận" trong app:
+  // Lợi nhuận thực = Doanh thu thuần − Giá vốn hàng bán (COGS) − Phí VC cửa hàng tự chịu
+  if (sheetChoice === 'all' || sheetChoice === 'profit') {
+    function _expCogsForSale(s) {
+      const sQty = parseFloat(s.qty) || 0;
+      const saleVatRate = s.vatRate || 0;
+      const candidates = [...(imports || [])].filter(i => i.productId === s.productId && i.date <= s.date).sort((a,b) => b.date.localeCompare(a.date));
+      const imp = s.variantId ? (candidates.find(i => i.variantId === s.variantId) || candidates[0]) : candidates[0];
+      if (!imp) {
+        const buyPrice = (products || []).find(p => p.id === s.productId)?.buyPrice || 0;
+        return buyPrice * sQty;
+      }
+      const unitPriceNet = imp.unitPrice || 0;
+      const impVatRate   = imp.vatRate   || 0;
+      const costPerUnit  = (saleVatRate === 0 && impVatRate > 0) ? unitPriceNet * (1 + impVatRate/100) : unitPriceNet;
+      const goodsCost    = costPerUnit * sQty;
+      const impShipFee    = imp.shipFee    || 0;
+      const impShipVatR   = imp.shipVatRate || 0;
+      const impShipFeeNet = impShipVatR > 0 ? impShipFee/(1 + impShipVatR/100) : impShipFee;
+      const impQty = parseFloat(imp.qty) || 1;
+      return goodsCost + (impQty > 0 ? impShipFeeNet/impQty : 0) * sQty;
+    }
+    function _expProfitForSale(s) {
+      const revenue = s.subTotal != null ? s.subTotal : Math.max(0, (s.total||0) - (s.shipFee||0) - (s.vatAmt||0));
+      const cogs    = _expCogsForSale(s);
+      const vcStore = (!s.shipForCustomer && s.shipFee) ? ((s.shipVatRate||0) > 0 ? (s.shipFee/(1+(s.shipVatRate||0)/100)) : s.shipFee) : 0;
+      return { revenue, cogs, vcStore, profit: revenue - cogs - vcStore };
+    }
+
+    const plCalc = [...sales].sort((a,b) => (b.date||'').localeCompare(a.date||'')).map(s => ({ s, r: _expProfitForSale(s) }));
+    const plHeaders = ['Ngày','Khách hàng','Sản phẩm','SL','Doanh thu thuần (đ)','Giá vốn (đ)','VC tự chịu (đ)','Lợi nhuận (đ)','Biên LN (%)'];
+    const plRows = plCalc.map(({ s, r }) => {
+      const margin = r.revenue > 0 ? (r.profit/r.revenue*100) : 0;
+      return [fmtD(s.date), s.customer||'', s.productName||'', parseFloat(s.qty)||0,
+        numFmt(r.revenue), numFmt(r.cogs), numFmt(r.vcStore), numFmt(r.profit), margin.toFixed(1)+'%'];
+    });
+    const totRevenueAll = plCalc.reduce((a,{r}) => a + r.revenue, 0);
+    const totCogsAll    = plCalc.reduce((a,{r}) => a + r.cogs, 0);
+    const totVcAll      = plCalc.reduce((a,{r}) => a + r.vcStore, 0);
+    const totProfitAll  = plCalc.reduce((a,{r}) => a + r.profit, 0);
+    const marginAll      = totRevenueAll > 0 ? (totProfitAll/totRevenueAll*100) : 0;
+    plRows.push(['TỔNG CỘNG','','','', numFmt(totRevenueAll), numFmt(totCogsAll), numFmt(totVcAll), numFmt(totProfitAll), marginAll.toFixed(1)+'%']);
+
+    // Ghép thêm Thu/Chi phát sinh để ra lợi nhuận thực tế cuối kỳ (toàn bộ thời gian)
+    const cfIncomeAll  = (cashflows || []).filter(c => c.type === 'income').reduce((a,c) => a + (c.amount||0), 0);
+    const cfExpenseAll = (cashflows || []).filter(c => c.type === 'expense').reduce((a,c) => a + (c.amount||0), 0);
+    const finalProfit  = totProfitAll + cfIncomeAll - cfExpenseAll;
+    const sumRows = [
+      [],
+      ['📊 LỢI NHUẬN THỰC TẾ CUỐI KỲ (đã gộp Thu/Chi phát sinh)'],
+      ['Lợi nhuận gộp từ bán hàng (đ)', numFmt(totProfitAll)],
+      ['+ Thu phát sinh khác (đ)', numFmt(cfIncomeAll)],
+      ['− Chi phát sinh khác (đ)', numFmt(cfExpenseAll)],
+      ['= LỢI NHUẬN THỰC TẾ (đ)', numFmt(finalProfit)],
+    ];
+
+    const ws7 = XLSX.utils.aoa_to_sheet([]);
+    XLSX.utils.sheet_add_aoa(ws7, [
+      [shop + ' — BÁO CÁO LỢI NHUẬN'],
+      ['Ngày xuất: ' + fmtD(dateStr) + '  |  Tổng ' + sales.length + ' đơn bán'],
+      [],
+      plHeaders,
+      ...plRows,
+      ...sumRows
+    ]);
+    ws7['A1'] = { v: shop + ' — BÁO CÁO LỢI NHUẬN', t: 's', s: { font: { bold: true, sz: 14, name: 'Arial', color: { rgb: GREEN } } } };
+    ws7['A2'] = { v: 'Ngày xuất: ' + fmtD(dateStr) + '  |  Tổng ' + sales.length + ' đơn bán', t: 's', s: { font: { italic: true, sz: 10, name: 'Arial', color: { rgb: '888888' } } } };
+    plHeaders.forEach((_, ci) => {
+      const ca = XLSX.utils.encode_cell({ r: 3, c: ci });
+      if (ws7[ca]) ws7[ca].s = hStyle(GREEN);
+    });
+    plRows.forEach((row, ri) => {
+      row.forEach((_, ci) => {
+        const ca = XLSX.utils.encode_cell({ r: 4 + ri, c: ci });
+        if (!ws7[ca]) return;
+        const isLast = ri === plRows.length - 1;
+        ws7[ca].s = isLast
+          ? { font: { bold: true, name: 'Arial', sz: 10 }, fill: { fgColor: { rgb: 'E8F5E9' }, patternType: 'solid' }, alignment: { horizontal: ci >= 3 ? 'right' : 'left' } }
+          : dStyle(ci >= 3 ? 'right' : 'left');
+      });
+    });
+    // Style khối tổng kết Lợi nhuận thực tế
+    const sumBaseRow = 4 + plRows.length;
+    const sumLabelCellRow = sumBaseRow + 1;
+    if (ws7['A' + (sumLabelCellRow + 1)]) {
+      ws7['A' + (sumLabelCellRow + 1)].s = { font: { bold: true, sz: 12, name: 'Arial', color: { rgb: 'FFFFFF' } }, fill: { fgColor: { rgb: GREEN }, patternType: 'solid' } };
+    }
+    for (let ri = sumLabelCellRow + 1; ri <= sumLabelCellRow + 4; ri++) {
+      const a = ws7['A' + (ri + 1)], b = ws7['B' + (ri + 1)];
+      const isFinal = ri === sumLabelCellRow + 4;
+      if (a) a.s = { font: { bold: isFinal, name: 'Arial', sz: isFinal ? 12 : 10, color: { rgb: isFinal ? GREEN : '333333' } } };
+      if (b) b.s = { font: { bold: true, name: 'Arial', sz: isFinal ? 12 : 10, color: { rgb: isFinal ? GREEN : '333333' } }, alignment: { horizontal: 'right' } };
+    }
+    ws7['!cols'] = [{wch:12},{wch:20},{wch:26},{wch:8},{wch:18},{wch:16},{wch:14},{wch:16},{wch:12}];
+    ws7['!merges'] = [{ s:{r:0,c:0}, e:{r:0,c:8} }, { s:{r:1,c:0}, e:{r:1,c:8} }, { s:{r:sumLabelCellRow,c:0}, e:{r:sumLabelCellRow,c:8} }];
+    ws7['!ref'] = XLSX.utils.encode_range({ s:{r:0,c:0}, e:{r:4+plRows.length+sumRows.length-1,c:8} });
+    XLSX.utils.book_append_sheet(wb, ws7, '📈 Lợi Nhuận');
+  }
+
   // ─── Tải file xuống ──────────────────────────────────────────
-  const sheetNames = { all:'ToanBo', inventory:'KhoHang', sales:'BanHang', imports:'NhapHang', debt:'CongNo' };
+  const sheetNames = { all:'ToanBo', inventory:'KhoHang', sales:'BanHang', imports:'NhapHang', debt:'CongNo', cashflow:'ThuChi', profit:'LoiNhuan' };
   const filename = shop.replace(/\s/g,'') + '_' + sheetNames[sheetChoice] + '_' + dateStr.replace(/-/g,'') + '.xlsx';
   XLSX.writeFile(wb, filename);
   toast('✅ Đã xuất Excel: ' + filename, 'success');
@@ -3541,7 +3697,7 @@ function parseExcelBackup(arrayBuffer) {
     return n ? XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: true, defval: '' }) : [];
   };
 
-  const out = { products: [], sales: [], imports: [] };
+  const out = { products: [], sales: [], imports: [], cashflows: [] };
 
   // ── KHO HÀNG ──
   const invRows = sheetRows('Kho hàng');
@@ -3626,6 +3782,30 @@ function parseExcelBackup(arrayBuffer) {
     }
   }
 
+  // ── THU CHI ──
+  const cfRowsRaw = sheetRows('Thu Chi');
+  const cfHIdx = _findHeaderRowIdx(cfRowsRaw, 'Danh mục');
+  if (cfHIdx >= 0) {
+    const map = _headerMap(cfRowsRaw[cfHIdx]);
+    for (let i = cfHIdx + 1; i < cfRowsRaw.length; i++) {
+      const row = cfRowsRaw[i];
+      const rawDate = _cell(row, map, 'Ngày', '');
+      const dateText = (rawDate || '').toString().trim();
+      if (!dateText || dateText.startsWith('TỔNG') || dateText.startsWith('CHÊNH')) continue;
+      const iso = _excelToISO(rawDate);
+      if (!iso) continue;
+      const loaiText = (_cell(row, map, 'Loại', '') || '').toString();
+      const type = loaiText.includes('Thu') ? 'income' : (loaiText.includes('Chi') ? 'expense' : '');
+      if (!type) continue;
+      out.cashflows.push({
+        date: iso, type,
+        category: (_cell(row, map, 'Danh mục', '') || '').toString().trim(),
+        note: (_cell(row, map, 'Ghi chú', '') || '').toString().trim(),
+        amount: parseFloat(_cell(row, map, 'Số tiền (đ)', 0)) || 0
+      });
+    }
+  }
+
   return out;
 }
 
@@ -3633,11 +3813,12 @@ function parseExcelBackup(arrayBuffer) {
 // commit=true → ghi thật vào S và push lên Firebase qua save().
 function applyExcelRestore(parsed, commit) {
   const now = new Date().toISOString();
-  const stats = { prodNew: 0, prodUpdated: 0, saleNew: 0, saleSkip: 0, impNew: 0, impSkip: 0 };
+  const stats = { prodNew: 0, prodUpdated: 0, saleNew: 0, saleSkip: 0, impNew: 0, impSkip: 0, cfNew: 0, cfSkip: 0 };
 
-  const products = commit ? S.products : JSON.parse(JSON.stringify(S.products || []));
-  const sales    = commit ? S.sales    : JSON.parse(JSON.stringify(S.sales    || []));
-  const imports  = commit ? S.imports  : JSON.parse(JSON.stringify(S.imports  || []));
+  const products  = commit ? S.products  : JSON.parse(JSON.stringify(S.products  || []));
+  const sales      = commit ? S.sales      : JSON.parse(JSON.stringify(S.sales      || []));
+  const imports    = commit ? S.imports    : JSON.parse(JSON.stringify(S.imports    || []));
+  const cashflows  = commit ? (S.cashflows || (S.cashflows = [])) : JSON.parse(JSON.stringify(S.cashflows || []));
 
   const nameIndex = new Map();
   products.forEach(p => nameIndex.set(_normVi(p.name), p));
@@ -3731,11 +3912,27 @@ function applyExcelRestore(parsed, commit) {
     existingImpKeys.add(k); stats.impNew++;
   });
 
+  // 4) THU CHI — bỏ qua nếu trùng (ngày + loại + danh mục + ghi chú + số tiền)
+  const cfKeyOf = c => [c.date, c.type, _normVi(c.category), _normVi(c.note), Math.round(parseFloat(c.amount) || 0)].join('|');
+  const existingCfKeys = new Set(cashflows.map(cfKeyOf));
+  const newCashflows = [];
+  (parsed.cashflows || []).forEach(ec => {
+    const k = cfKeyOf(ec);
+    if (existingCfKeys.has(k)) { stats.cfSkip++; return; }
+    newCashflows.push({
+      id: uid(), date: ec.date, type: ec.type, category: ec.category, amount: ec.amount,
+      note: (ec.note ? ec.note + ' — ' : '') + 'Khôi phục từ Excel',
+      createdAt: now, _updated: now, _recoveredFromExcel: true
+    });
+    existingCfKeys.add(k); stats.cfNew++;
+  });
+
   if (commit) {
     S.products = products;
     S.sales = [...newSales, ...sales];
     S.imports = [...newImports, ...imports];
-    save('products'); save('sales'); save('imports');
+    S.cashflows = [...newCashflows, ...cashflows];
+    save('products'); save('sales'); save('imports'); save('cashflows');
   }
 
   return stats;
@@ -11513,6 +11710,8 @@ function pgSettings() {
         h('button', { className: 'btn', onClick: () => exportExcel('sales') }, '🧾 Bán hàng'),
         h('button', { className: 'btn', onClick: () => exportExcel('inventory') }, '💎 Kho hàng'),
         h('button', { className: 'btn', onClick: () => exportExcel('debt') }, '💳 Công nợ'),
+        h('button', { className: 'btn', onClick: () => exportExcel('cashflow') }, '💵 Thu Chi'),
+        h('button', { className: 'btn', onClick: () => exportExcel('profit') }, '📈 Lợi Nhuận'),
       )
     ),
     h('div', { className: 'card', style: { maxWidth: '580px' } },
@@ -11810,7 +12009,10 @@ function pgSync() {
                     const totalIn  = pImports.reduce((a, r) => a + (parseFloat(r.qty) || 0), 0);
                     const totalOut = pSales.reduce((a, r) => a + (parseFloat(r.qty) || 0), 0);
                     const totalRet = pReturns.reduce((a, r) => a + (parseFloat(r.returnQty) || 0), 0);
-                    const newStock = Math.max(0, totalIn - totalOut + totalRet);
+                    // FIX: KHÔNG ép về 0 — cả app "cho phép âm kho" để biết hàng
+                    // đã bán quá tay (oversold). Math.max(0,...) cũ che mất tình
+                    // trạng này, gây sai lệch khi đối chiếu nhập-xuất-tồn.
+                    const newStock = totalIn - totalOut + totalRet;
 
                     // Seed _stockTx đầy đủ để các thiết bị khác không double-apply
                     const allTxIds = [
@@ -11825,7 +12027,7 @@ function pgSync() {
                       const vtImports = pImports.filter(r => r.variantId === vt.id);
                       const vtIn  = vtImports.reduce((a, r) => a + (parseFloat(r.qty) || 0), 0);
                       const vtOut = vtSales.reduce((a, r) => a + (parseFloat(r.qty) || 0), 0);
-                      const newM2 = Math.max(0, vtIn - vtOut);
+                      const newM2 = vtIn - vtOut; // FIX: không ép về 0 — đồng bộ với chính sách cho phép âm kho
                       const ppm2 = (vt.tileW > 0 && vt.tileH > 0) ? 10000 / (vt.tileW * vt.tileH) : 0;
                       return { ...vt, stockM2: newM2, stockPieces: ppm2 > 0 ? Math.round(newM2 * ppm2) : vt.stockPieces };
                     });
@@ -11934,9 +12136,11 @@ function pgSync() {
             h('span', { style: { fontSize: 11, opacity: .8 } }, 'Khôi phục được 100%')
           ),
           ...[
-            { key: 'all',     icon: '📦', label: 'Excel TẤT CẢ', sub: 'Kho + Bán + Nhập + Nợ', primary: true },
+            { key: 'all',     icon: '📦', label: 'Excel TẤT CẢ', sub: 'Kho+Bán+Nhập+Nợ+ThuChi+LợiNhuận', primary: true },
             { key: 'sales',   icon: '🧾', label: 'Excel Bán hàng', sub: 'Tất cả đơn bán' },
             { key: 'imports', icon: '📥', label: 'Excel Nhập hàng', sub: 'Tất cả phiếu nhập' },
+            { key: 'cashflow',icon: '💵', label: 'Excel Thu Chi', sub: 'Phiếu thu/chi phát sinh' },
+            { key: 'profit',  icon: '📈', label: 'Excel Lợi Nhuận', sub: 'Lợi nhuận từng đơn + tổng' },
           ].map(item => h('button', {
             className: 'btn' + (item.primary ? ' btn-primary' : ''),
             style: { flexDirection: 'column', alignItems: 'flex-start', gap: 4, padding: '12px 14px', height: 'auto' },
@@ -11994,11 +12198,12 @@ function pgSync() {
                       '• ' + preview.prodNew + ' sản phẩm MỚI sẽ được thêm\n' +
                       '• ' + preview.prodUpdated + ' sản phẩm sẽ được bổ sung trường còn thiếu (KHÔNG ghi đè dữ liệu đã có)\n' +
                       '• ' + preview.saleNew + ' đơn bán sẽ khôi phục (bỏ qua ' + preview.saleSkip + ' đơn đã có/trùng)\n' +
-                      '• ' + preview.impNew + ' phiếu nhập sẽ khôi phục (bỏ qua ' + preview.impSkip + ' phiếu đã có/trùng)\n\n' +
+                      '• ' + preview.impNew + ' phiếu nhập sẽ khôi phục (bỏ qua ' + preview.impSkip + ' phiếu đã có/trùng)\n' +
+                      '• ' + preview.cfNew + ' phiếu thu/chi sẽ khôi phục (bỏ qua ' + preview.cfSkip + ' phiếu đã có/trùng)\n\n' +
                       'Toàn bộ thay đổi sẽ được đẩy lên Firebase ngay sau khi xác nhận. Tiếp tục?',
                     onYes: () => {
                       const result = applyExcelRestore(parsed, true);
-                      toast('✅ Đã khôi phục: +' + result.prodNew + ' SP, +' + result.saleNew + ' đơn bán, +' + result.impNew + ' phiếu nhập — đã đồng bộ lên Firebase!', 'success');
+                      toast('✅ Đã khôi phục: +' + result.prodNew + ' SP, +' + result.saleNew + ' đơn bán, +' + result.impNew + ' phiếu nhập, +' + result.cfNew + ' thu/chi — đã đồng bộ lên Firebase!', 'success');
                       render();
                     }
                   };
@@ -12253,9 +12458,9 @@ function pgRecovery() {
               createdAt: nowIso,
               _updated: nowIso,
               _stockTx: [],
+              _deleted: false, // FIX: xoá cờ tombstone trên cloud, nếu không SP khôi phục bị lọc lại sau sync
               _recovered: true // đánh dấu để biết đây là bản khôi phục
             };
-            // Kiểm tra xem productId đó đã bị _deleted trên cloud chưa — nếu có thì push lại với _deleted:false
             S.products = [...S.products, newProd];
             count++;
           });
@@ -12467,6 +12672,7 @@ function pgRecovery() {
                 image: '', qrCode: '', variants: [], multiVariant: false,
                 thickness: 0, length: 0, width: 0,
                 createdAt: nowIso2, _updated: nowIso2, _stockTx: [],
+                _deleted: false, // FIX: xoá cờ tombstone trên cloud để SP không bị lọc lại sau sync
                 _recovered: true
               };
               S.products = [...S.products, restoredProd];
