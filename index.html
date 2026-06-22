@@ -6107,7 +6107,13 @@ function openProduct(prod, rebuild) {
     // Kích thước thực lưu sẽ được nén nhỏ lại bên dưới, không phụ thuộc nhiều vào size file gốc.
     if (file.size > 12 * 1024 * 1024) { alert('Ảnh quá lớn! Vui lòng chọn ảnh dưới 12MB.'); return; }
 
-    const useStorage = CLOUD.isOnline() && CLOUD.hasStorage();
+    // ⚠️ STORAGE_FEATURE_ENABLED = false: project hiện đang ở gói Spark (miễn phí),
+    // chưa có bucket Storage thật nào tồn tại. Để false để LUÔN dùng cách nén
+    // base64 lưu thẳng vào Firestore (100% miễn phí, đã test ổn định). Nếu
+    // sau này nâng cấp Blaze + tạo Storage bucket xong xuôi, đổi thành true
+    // (và CLOUD.uploadImageToStorage/_compressImageToBlob đã có sẵn, không cần viết lại).
+    const STORAGE_FEATURE_ENABLED = false;
+    const useStorage = STORAGE_FEATURE_ENABLED && CLOUD.isOnline() && CLOUD.hasStorage();
     imgPickBtn.disabled = true;
     imgPickBtn.innerHTML = useStorage ? '⏳ Đang tải ảnh lên...' : '⏳ Đang xử lý ảnh...';
 
@@ -6139,17 +6145,17 @@ function openProduct(prod, rebuild) {
         });
       });
     } else {
-      // ── Fallback: mất mạng hoặc chưa cấu hình Storage → tạm lưu base64 nén
-      // nhỏ (như cũ) thẳng vào Firestore. Lần sau chọn lại ảnh khi có mạng,
-      // ảnh sẽ tự chuyển sang lưu trên Storage như bình thường.
+      // ── Đường hiện tại (Storage đang tắt / project ở gói Spark miễn phí):
+      // nén ảnh thành base64 nhỏ, lưu thẳng vào Firestore — không cần
+      // Firebase Storage, không tốn phí. Nếu sau này nâng cấp Blaze + bật
+      // STORAGE_FEATURE_ENABLED = true, ảnh mới chọn sẽ tự chuyển qua Storage.
       _compressImageForFirestore(file, function(dataUrl){
         finishUI();
         if (!dataUrl) { alert('Không đọc được ảnh này, vui lòng thử ảnh khác.'); return; }
         f.image = dataUrl;
-        f.imagePath = ''; // base64 fallback, không có path trên Storage
+        f.imagePath = ''; // không dùng Storage nên không có path
         imgFileInput.value = '';
         _renderImgPreview();
-        toast('📡 Không có mạng — ảnh tạm lưu trực tiếp, sẽ chuyển sang Storage ở lần chọn ảnh kế tiếp khi có mạng.', 'info');
       });
     }
   });
