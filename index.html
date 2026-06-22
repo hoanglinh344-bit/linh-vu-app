@@ -306,23 +306,42 @@ const CLOUD = (() => {
   // báo cho người dùng ở trang Cài đặt (xem getStatus()).
   let _suspiciousPull = null; // null = chưa từng gặp; object = { name, baselineLen, ts } của lần gần nhất
 
-  // ── Queue persistence: lưu vào sessionStorage để sống qua refresh ──
-  const QUEUE_SS_KEY = 'dtn_sync_queue';
+  // ── Queue persistence ───────────────────────────────────────
+  // FIX (mất dữ liệu offline tận gốc): lưu CẢ `data` (delta) và dùng
+  // localStorage thay vì sessionStorage.
+  //  - sessionStorage cũ: mất sạch khi đóng tab/app (chỉ sống qua refresh) →
+  //    bản ghi offline chưa kịp push biến mất khi mở lại.
+  //  - chỉ lưu colName cũ: khi mở lại, S được dựng lại từ cloud (THIẾU bản ghi
+  //    offline), hydrate từ S → vẫn mất. BẮT BUỘC lưu data để push độc lập với S.
+  const QUEUE_LS_KEY = 'dtn_sync_queue';
   function _loadQueue() {
     try {
-      const v = sessionStorage.getItem(QUEUE_SS_KEY);
+      let v = localStorage.getItem(QUEUE_LS_KEY);
+      if (!v) {
+        // Di trú 1 lần từ sessionStorage cũ (nếu đang có queue dở từ bản trước)
+        const old = sessionStorage.getItem(QUEUE_LS_KEY);
+        if (old) {
+          v = old;
+          try { localStorage.setItem(QUEUE_LS_KEY, old); sessionStorage.removeItem(QUEUE_LS_KEY); } catch(e) {}
+        }
+      }
       return v ? JSON.parse(v) : [];
     } catch(e) { return []; }
   }
   function _saveQueue(q) {
     try {
-      // Chỉ lưu colName + ts (không lưu data lớn — data sẽ đọc lại từ S khi flush)
-      const slim = q.map(item => ({ colName: item.colName, ts: item.ts }));
-      sessionStorage.setItem(QUEUE_SS_KEY, JSON.stringify(slim));
-    } catch(e) {}
+      localStorage.setItem(QUEUE_LS_KEY, JSON.stringify(q)); // lưu đủ data
+    } catch(e) {
+      // Quota đầy → hạ xuống bản slim (chấp nhận hydrate từ S) để không kẹt queue
+      try {
+        const slim = q.map(item => ({ colName: item.colName, ts: item.ts }));
+        localStorage.setItem(QUEUE_LS_KEY, JSON.stringify(slim));
+      } catch(e2) {}
+    }
   }
   function _clearQueue() {
-    try { sessionStorage.removeItem(QUEUE_SS_KEY); } catch(e) {}
+    try { localStorage.removeItem(QUEUE_LS_KEY); } catch(e) {}
+    try { sessionStorage.removeItem(QUEUE_LS_KEY); } catch(e) {}
   }
   let _syncQueue = _loadQueue(); // khôi phục queue từ lần trước nếu tab vừa refresh
 
@@ -1474,6 +1493,15 @@ const CLOUD = (() => {
     getCfg: () => ({ ..._cfg }),
     saveCfg(cfg) { saveCfg(cfg); stopListeners(); initClient(); },
     getStatus,
+    // CHỈ ĐỌC: đếm số bản ghi đang chờ đẩy lên cloud (chưa xác nhận thành công).
+    // Dùng để cảnh báo người dùng trước khi đổi máy/đổi file — không đụng dữ liệu.
+    getPendingCount() {
+      let records = 0;
+      _syncQueue.forEach(item => {
+        records += Array.isArray(item.data) ? item.data.length : (item.data ? 1 : 0);
+      });
+      return { items: _syncQueue.length, records };
+    },
     onStatus(fn) { _statusListeners.push(fn); },
     // colName: 'dtn_products' | 'dtn_sales' | ...  data: array hoặc single doc
     push(colName, data) {
@@ -2489,6 +2517,28 @@ function migrateLegacySKU() {
   }, 1500);
 }
 
+// ── Cảnh báo dữ liệu chưa đồng bộ khi mở app ────────────────────────
+// CHỈ ĐỌC trạng thái, KHÔNG đụng dữ liệu → không thể gây mất mát. Chạy sau
+// một khoảng chờ (để queue tự đẩy khi online); chỉ cảnh báo nếu dữ liệu THẬT
+// SỰ còn kẹt (offline hoặc lỗi mạng). Mục đích: nhắc người dùng đừng đổi
+// máy/đổi file khi còn bản ghi chưa lên cloud — đúng nguyên nhân mất dữ liệu.
+function warnIfStuckUnsynced() {
+  try {
+    if (typeof CLOUD === 'undefined' || !CLOUD.getCfg().enabled) return;
+    if (typeof CLOUD.getPendingCount !== 'function') return;
+    const pend = CLOUD.getPendingCount();
+    if (!pend || pend.records <= 0) return; // đã đẩy hết → im lặng, không báo nhầm
+    const st = CLOUD.getStatus();
+    const why = !navigator.onLine        ? 'thiết bị đang OFFLINE'
+              : st.syncStatus === 'error' ? 'đồng bộ đang LỖI'
+              :                             'mạng chậm, chưa đẩy xong';
+    toast('⚠️ Còn ' + pend.records + ' thay đổi CHƯA lên cloud (' + why +
+      '). ĐỪNG đổi máy hay đổi file lúc này — hãy bật mạng và chờ biểu tượng đồng bộ báo OK. Nếu không, các thay đổi này có thể bị mất.',
+      'error', 15000);
+    console.warn('[SYNC] Còn bản ghi chưa đồng bộ khi mở app:', pend, st);
+  } catch(e) {}
+}
+
 async function bootApp() {
   _raf = false;
   const root = document.getElementById('app');
@@ -2566,6 +2616,10 @@ async function bootApp() {
       document.addEventListener('visibilitychange', _visibilityHandler);
     }
   }, 100);
+
+  // Sau 12s (để queue kịp tự đẩy nếu online): nếu vẫn còn bản ghi chưa lên
+  // cloud → cảnh báo, tránh người dùng đổi máy/đổi file khi chưa đồng bộ xong.
+  setTimeout(warnIfStuckUnsynced, 12000);
 
   startAutoLogoutTimer();
 }
@@ -11874,7 +11928,16 @@ function pgSync() {
             h('div', { className: 'stat-label' }, '🔥 Firebase — Nguồn chính'),
             h('div', { className: 'stat-val', style: { fontSize: 15, color: c } }, label),
             h('div', { className: 'stat-change' }, cloudSt.realtime ? '📡 Realtime ON · ' + cloudBadge(cloudSt) : cloudBadge(cloudSt)),
-            h('div', { className: 'stat-change', style: { marginTop: 4 } }, dataConfirmBadge(cloudSt))
+            h('div', { className: 'stat-change', style: { marginTop: 4 } }, dataConfirmBadge(cloudSt)),
+            (() => {
+              // Số thay đổi đang chờ đẩy lên cloud (chỉ đọc). >0 = CHƯA an toàn để đổi máy/file.
+              const pend = (typeof CLOUD.getPendingCount === 'function') ? CLOUD.getPendingCount() : { records: 0 };
+              if (!pend || pend.records <= 0) {
+                return h('div', { className: 'stat-change', style: { marginTop: 4, color: 'var(--green)', fontWeight: 700 } }, '✓ Đã đồng bộ — an toàn đổi máy/file');
+              }
+              return h('div', { className: 'stat-change', style: { marginTop: 4, color: 'var(--amber)', fontWeight: 700 } },
+                '⏳ Còn ' + pend.records + ' thay đổi CHƯA lên cloud — đừng đổi máy/file lúc này');
+            })()
           );
         })(),
         (() => {
