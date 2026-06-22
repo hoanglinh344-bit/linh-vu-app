@@ -1005,6 +1005,16 @@ const CLOUD = (() => {
     return out;
   }
 
+  // ── Ước lượng kích thước byte THẬT của 1 document trước khi ghi Firestore ──
+  // JSON.stringify(...).length đếm theo UTF-16 code unit — KHÔNG đúng với
+  // tiếng Việt có dấu (mỗi ký tự dấu chiếm 2-3 byte khi mã hoá UTF-8, là cách
+  // Firestore tính giới hạn 1MB/document thật sự). Dùng TextEncoder để ra
+  // đúng số byte, tránh đánh giá sai (tưởng còn dư khổ nhưng thực ra đã vượt).
+  function _estimateDocBytes(obj) {
+    try { return new TextEncoder().encode(JSON.stringify(obj)).length; }
+    catch(e) { try { return JSON.stringify(obj).length; } catch(e2) { return 0; } }
+  }
+
   async function pushCollection(colName, data) {
     if (!_db) return false;
     try {
@@ -1012,6 +1022,10 @@ const CLOUD = (() => {
       const ref  = col(colName);
 
       if (rows.length === 0) return true;
+
+      // Gom các record bị bỏ qua vì quá khổ (>1MB) dù đã gỡ ảnh — báo cho
+      // người dùng biết SAU khi chạy xong, KHÔNG âm thầm bỏ qua.
+      const _oversizedSkips = [];
 
       // serverTimestamp() — Firestore ghi timestamp theo đồng hồ server,
       // không phụ thuộc đồng hồ thiết bị → conflict resolution chính xác
@@ -1035,8 +1049,34 @@ const CLOUD = (() => {
           // đó ra khỏi lần ghi này (các field còn lại vẫn lên cloud bình thường),
           // người dùng chỉ cần chọn lại ảnh (đã được tự nén) để cập nhật sau.
           if (clean.image && typeof clean.image === 'string' && clean.image.length > 900000) {
-            console.warn('[CLOUD] Ảnh sản phẩm quá khổ (>900KB sau base64), tạm bỏ field image khi đồng bộ:', r.id);
-            clean = { ...clean, image: '' };
+            // FIX (mất ảnh sản phẩm): code cũ gán image:'' rồi merge:true ghi
+            // thẳng lên Firestore → đây là GHI ĐÈ, không phải "bỏ qua field".
+            // merge:true vẫn ghi đè bất kỳ field có mặt trong payload (dù là
+            // rỗng) — nên ảnh ĐÚNG đang có sẵn trên cloud bị xoá thành ''.
+            // Sau đó "Firebase-first" (cloud luôn thắng) khiến lần pull kế
+            // tiếp kéo cái '' đó về, đè luôn ảnh local còn tốt → mất ảnh vĩnh
+            // viễn trên mọi thiết bị, dù toast vẫn báo "Sync thành công".
+            // Sửa đúng: XOÁ HẲN key image khỏi payload (không gửi field này
+            // lên) → merge:true sẽ không động tới field image đã có trên
+            // cloud, giữ nguyên ảnh cũ. Chỉ ảnh hưởng tới sản phẩm hoàn toàn
+            // mới (chưa từng sync) có ảnh gốc quá khổ — case này hiếm vì ảnh
+            // mới chọn đã được tự nén dưới ngưỡng từ trước.
+            console.warn('[CLOUD] Ảnh sản phẩm quá khổ (>900KB sau base64), bỏ field image khỏi lần ghi này (KHÔNG xoá ảnh đã có trên cloud):', r.id);
+            clean = { ...clean };
+            delete clean.image;
+          }
+          // SAFETY NET TỔNG QUÁT: dù đã gỡ ảnh, document vẫn có thể vượt 1MB
+          // vì field khác phình to theo thời gian (mô tả dài, nhiều biến thể,
+          // lịch sử _stockTx tích lũy nhiều năm...). KHÔNG tự đoán xoá field
+          // nào khác (tránh lặp lại đúng lỗi mất ảnh ở trên nhưng với field
+          // khác) — chỉ BỎ HẲN record này khỏi lần ghi (giữ nguyên trên cloud
+          // & local, không sửa không xoá gì), gom lại để báo rõ ID cho người
+          // dùng tự xử lý tay, thay vì kẹt cả batch hoặc âm thầm mất dữ liệu.
+          const _bytes = _estimateDocBytes(clean);
+          if (_bytes > 950000) {
+            console.warn('[CLOUD] Document vượt 1MB dù đã gỡ ảnh — BỎ QUA record này (không ghi, không sửa dữ liệu):', colName, r.id, _bytes + ' bytes');
+            _oversizedSkips.push({ id: r.id, bytes: _bytes });
+            return; // không set record này vào batch
           }
           // Firebase-first: luôn dùng serverTimestamp() — đồng hồ thiết bị có thể lệch
           // gây record cũ ghi đè record mới. serverTimestamp() = đồng hồ Firestore server.
@@ -1044,6 +1084,15 @@ const CLOUD = (() => {
           batch.set(ref.doc(String(r.id)), { ...clean, _updated: SERVER_TS }, { merge: true });
         });
         await batch.commit();
+      }
+      if (_oversizedSkips.length > 0) {
+        const idsStr = _oversizedSkips.map(s => s.id + ' (' + Math.round(s.bytes/1024) + 'KB)').join(', ');
+        console.warn('[CLOUD] ' + _oversizedSkips.length + ' record trong "' + colName + '" KHÔNG đồng bộ được vì >1MB:', idsStr);
+        try {
+          if (typeof toast === 'function') {
+            toast('⚠️ ' + _oversizedSkips.length + ' bản ghi (' + colName + ') quá 1MB, KHÔNG đồng bộ được: ' + idsStr + '. Dữ liệu local vẫn an toàn, cần rút gọn dữ liệu để đồng bộ.', 'error');
+          }
+        } catch(e) {}
       }
       return true;
     } catch(e) {
@@ -2737,7 +2786,7 @@ function startAutoLogoutTimer() {
 const DB = (() => {
   const mem = {};
   let lsOk = false;
-  const APP_VERSION = '3.10.0';
+  const APP_VERSION = '3.10.1';
   const KEYS = ['dtn_products','dtn_imports','dtn_sales','dtn_shipping','dtn_settings','dtn_returns','dtn_paymentlogs','dtn_cashflows'];
   // Prefix để nhận biết dữ liệu đã nén
   const LZ_PREFIX = '\x00LZ:';
