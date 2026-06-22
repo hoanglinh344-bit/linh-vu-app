@@ -3580,48 +3580,71 @@ function exportExcel(sheetChoice) {
   }
 
   // ─── 7. SHEET: LỢI NHUẬN ─────────────────────────────────────
-  // Công thức giống đúng trang "Lợi Nhuận" trong app:
+  // Công thức giống đúng trang "Lợi Nhuận" trong app, có tách chi tiết VAT đầu ra/đầu vào
+  // để đối chiếu với hoá đơn giấy / số liệu kê khai thuế thực tế.
   // Lợi nhuận thực = Doanh thu thuần − Giá vốn hàng bán (COGS) − Phí VC cửa hàng tự chịu
   if (sheetChoice === 'all' || sheetChoice === 'profit') {
-    function _expCogsForSale(s) {
+    function _expCogsDetailForSale(s) {
       const sQty = parseFloat(s.qty) || 0;
       const saleVatRate = s.vatRate || 0;
       const candidates = [...(imports || [])].filter(i => i.productId === s.productId && i.date <= s.date).sort((a,b) => b.date.localeCompare(a.date));
       const imp = s.variantId ? (candidates.find(i => i.variantId === s.variantId) || candidates[0]) : candidates[0];
       if (!imp) {
         const buyPrice = (products || []).find(p => p.id === s.productId)?.buyPrice || 0;
-        return buyPrice * sQty;
+        return { unitPriceNet: buyPrice, impVatRate: 0, impVatAmt: 0, goodsCostCharged: buyPrice * sQty, shipCostNet: 0, shipVatAmt: 0, totalCost: buyPrice * sQty };
       }
       const unitPriceNet = imp.unitPrice || 0;
       const impVatRate   = imp.vatRate   || 0;
-      const costPerUnit  = (saleVatRate === 0 && impVatRate > 0) ? unitPriceNet * (1 + impVatRate/100) : unitPriceNet;
-      const goodsCost    = costPerUnit * sQty;
+      const grossUpApplied = (saleVatRate === 0 && impVatRate > 0);
+      const costPerUnit  = grossUpApplied ? unitPriceNet * (1 + impVatRate/100) : unitPriceNet;
+      const goodsCostCharged = costPerUnit * sQty;
+      const impVatAmt    = unitPriceNet * (impVatRate/100) * sQty;
       const impShipFee    = imp.shipFee    || 0;
       const impShipVatR   = imp.shipVatRate || 0;
       const impShipFeeNet = impShipVatR > 0 ? impShipFee/(1 + impShipVatR/100) : impShipFee;
+      const impShipVatAmt = impShipFee - impShipFeeNet;
       const impQty = parseFloat(imp.qty) || 1;
-      return goodsCost + (impQty > 0 ? impShipFeeNet/impQty : 0) * sQty;
+      const shipCostNet = impQty > 0 ? (impShipFeeNet/impQty) * sQty : 0;
+      const shipVatAmt  = impQty > 0 ? (impShipVatAmt/impQty) * sQty : 0;
+      return { unitPriceNet, impVatRate, impVatAmt, goodsCostCharged, shipCostNet, shipVatAmt, totalCost: goodsCostCharged + shipCostNet };
     }
     function _expProfitForSale(s) {
+      const cd      = _expCogsDetailForSale(s);
       const revenue = s.subTotal != null ? s.subTotal : Math.max(0, (s.total||0) - (s.shipFee||0) - (s.vatAmt||0));
-      const cogs    = _expCogsForSale(s);
-      const vcStore = (!s.shipForCustomer && s.shipFee) ? ((s.shipVatRate||0) > 0 ? (s.shipFee/(1+(s.shipVatRate||0)/100)) : s.shipFee) : 0;
-      return { revenue, cogs, vcStore, profit: revenue - cogs - vcStore };
+      const vatOut  = s.vatAmt || 0;
+      const total   = s.total != null ? s.total : (revenue + vatOut);
+      const shipVatR = s.shipVatRate || 0;
+      const vcStore    = (!s.shipForCustomer && s.shipFee) ? (shipVatR > 0 ? (s.shipFee/(1+shipVatR/100)) : s.shipFee) : 0;
+      const vcStoreVat = (!s.shipForCustomer && s.shipFee && shipVatR > 0) ? (s.shipFee - vcStore) : 0;
+      const cogs    = cd.totalCost;
+      const profit  = revenue - cogs - vcStore;
+      // Đơn bán VAT=0% → VAT đầu vào hàng đã gộp vào giá vốn (không được khấu trừ),
+      // nên KHÔNG tính lại vào đối chiếu VAT (tránh đếm 2 lần). Chỉ đơn có VAT mới đối chiếu.
+      const hasVat     = (s.vatRate || 0) > 0;
+      const vatInTotal = (hasVat ? cd.impVatAmt : 0) + cd.shipVatAmt + vcStoreVat;
+      const vatNetEst  = hasVat ? (vatOut - vatInTotal) : null;
+      return { revenue, vatOut, total, unitPriceNet: cd.unitPriceNet, impVatRate: cd.impVatRate, impVatAmt: cd.impVatAmt, cogs, vcStore, vatNetEst, profit };
     }
 
     const plCalc = [...sales].sort((a,b) => (b.date||'').localeCompare(a.date||'')).map(s => ({ s, r: _expProfitForSale(s) }));
-    const plHeaders = ['Ngày','Khách hàng','Sản phẩm','SL','Doanh thu thuần (đ)','Giá vốn (đ)','VC tự chịu (đ)','Lợi nhuận (đ)','Biên LN (%)'];
+    const plHeaders = ['Ngày','Khách hàng','Sản phẩm','SL','VAT bán (%)','Tạm tính/DT thuần (đ)','VAT đầu ra (đ)','Tổng cộng - khách trả (đ)','Giá nhập/đơn vị (đ)','VAT nhập (%)','VAT đầu vào hàng (đ)','Giá vốn tính LN (đ)','VC tự chịu (đ)','VAT phải nộp riêng đơn* (đ)','Lợi nhuận (đ)','Biên LN (%)'];
     const plRows = plCalc.map(({ s, r }) => {
       const margin = r.revenue > 0 ? (r.profit/r.revenue*100) : 0;
       return [fmtD(s.date), s.customer||'', s.productName||'', parseFloat(s.qty)||0,
-        numFmt(r.revenue), numFmt(r.cogs), numFmt(r.vcStore), numFmt(r.profit), margin.toFixed(1)+'%'];
+        s.vatRate||0, numFmt(r.revenue), numFmt(r.vatOut), numFmt(r.total),
+        numFmt(r.unitPriceNet), r.impVatRate||0, numFmt(r.impVatAmt),
+        numFmt(r.cogs), numFmt(r.vcStore), (r.vatNetEst==null ? '—' : numFmt(r.vatNetEst)), numFmt(r.profit), margin.toFixed(1)+'%'];
     });
     const totRevenueAll = plCalc.reduce((a,{r}) => a + r.revenue, 0);
+    const totVatOutAll  = plCalc.reduce((a,{r}) => a + r.vatOut, 0);
+    const totGrossAll   = plCalc.reduce((a,{r}) => a + r.total, 0);
+    const totVatInAll   = plCalc.reduce((a,{r}) => a + r.impVatAmt, 0);
     const totCogsAll    = plCalc.reduce((a,{r}) => a + r.cogs, 0);
     const totVcAll      = plCalc.reduce((a,{r}) => a + r.vcStore, 0);
+    const totVatNetAll  = plCalc.reduce((a,{r}) => a + (r.vatNetEst || 0), 0);
     const totProfitAll  = plCalc.reduce((a,{r}) => a + r.profit, 0);
     const marginAll      = totRevenueAll > 0 ? (totProfitAll/totRevenueAll*100) : 0;
-    plRows.push(['TỔNG CỘNG','','','', numFmt(totRevenueAll), numFmt(totCogsAll), numFmt(totVcAll), numFmt(totProfitAll), marginAll.toFixed(1)+'%']);
+    plRows.push(['TỔNG CỘNG','','','','', numFmt(totRevenueAll), numFmt(totVatOutAll), numFmt(totGrossAll), '', '', numFmt(totVatInAll), numFmt(totCogsAll), numFmt(totVcAll), numFmt(totVatNetAll), numFmt(totProfitAll), marginAll.toFixed(1)+'%']);
 
     // Ghép thêm Thu/Chi phát sinh để ra lợi nhuận thực tế cuối kỳ (toàn bộ thời gian)
     const cfIncomeAll  = (cashflows || []).filter(c => c.type === 'income').reduce((a,c) => a + (c.amount||0), 0);
@@ -3634,6 +3657,8 @@ function exportExcel(sheetChoice) {
       ['+ Thu phát sinh khác (đ)', numFmt(cfIncomeAll)],
       ['− Chi phát sinh khác (đ)', numFmt(cfExpenseAll)],
       ['= LỢI NHUẬN THỰC TẾ (đ)', numFmt(finalProfit)],
+      [],
+      ['* Cột "VAT phải nộp riêng đơn" chỉ mang tính tham khảo cho từng đơn lẻ. VAT phải nộp thực tế nhà nước được tính theo KỲ KÊ KHAI (gộp toàn bộ đơn bán + phiếu nhập trong kỳ), không tính riêng theo từng đơn — xem số chính xác tại trang Tổng Quan trong ứng dụng.'],
     ];
 
     const ws7 = XLSX.utils.aoa_to_sheet([]);
@@ -3673,9 +3698,13 @@ function exportExcel(sheetChoice) {
       if (a) a.s = { font: { bold: isFinal, name: 'Arial', sz: isFinal ? 12 : 10, color: { rgb: isFinal ? GREEN : '333333' } } };
       if (b) b.s = { font: { bold: true, name: 'Arial', sz: isFinal ? 12 : 10, color: { rgb: isFinal ? GREEN : '333333' } }, alignment: { horizontal: 'right' } };
     }
-    ws7['!cols'] = [{wch:12},{wch:20},{wch:26},{wch:8},{wch:18},{wch:16},{wch:14},{wch:16},{wch:12}];
-    ws7['!merges'] = [{ s:{r:0,c:0}, e:{r:0,c:8} }, { s:{r:1,c:0}, e:{r:1,c:8} }, { s:{r:sumLabelCellRow,c:0}, e:{r:sumLabelCellRow,c:8} }];
-    ws7['!ref'] = XLSX.utils.encode_range({ s:{r:0,c:0}, e:{r:4+plRows.length+sumRows.length-1,c:8} });
+    const footnoteRow = sumLabelCellRow + 6;
+    if (ws7['A' + (footnoteRow + 1)]) {
+      ws7['A' + (footnoteRow + 1)].s = { font: { italic: true, sz: 9, name: 'Arial', color: { rgb: '999999' } } };
+    }
+    ws7['!cols'] = [{wch:12},{wch:18},{wch:24},{wch:8},{wch:9},{wch:16},{wch:14},{wch:16},{wch:14},{wch:9},{wch:14},{wch:14},{wch:12},{wch:16},{wch:14},{wch:10}];
+    ws7['!merges'] = [{ s:{r:0,c:0}, e:{r:0,c:15} }, { s:{r:1,c:0}, e:{r:1,c:15} }, { s:{r:sumLabelCellRow,c:0}, e:{r:sumLabelCellRow,c:15} }, { s:{r:footnoteRow,c:0}, e:{r:footnoteRow,c:15} }];
+    ws7['!ref'] = XLSX.utils.encode_range({ s:{r:0,c:0}, e:{r:4+plRows.length+sumRows.length-1,c:15} });
     XLSX.utils.book_append_sheet(wb, ws7, '📈 Lợi Nhuận');
   }
 
@@ -14081,44 +14110,69 @@ function pgProfit() {
 
   const filteredSales = (sales || []).filter(s => matchPeriod(s.date));
 
-  // ── Tính lợi nhuận cho từng đơn bán ─────────────────────────
-  function cogsForSale(s) {
+  // ── Tính lợi nhuận chi tiết cho từng đơn bán (tách rõ VAT đầu ra / đầu vào) ─
+  function cogsDetailForSale(s) {
     const sQty = parseFloat(s.qty) || 0;
     const saleVatRate = s.vatRate || 0;
     const candidates = [...(imports || [])].filter(i => i.productId === s.productId && i.date <= s.date).sort((a,b)=>b.date.localeCompare(a.date));
     const imp = s.variantId ? (candidates.find(i=>i.variantId===s.variantId)||candidates[0]) : candidates[0];
     if (!imp) {
       const buyPrice = (products||[]).find(p=>p.id===s.productId)?.buyPrice || 0;
-      return buyPrice * sQty;
+      return {
+        hasImport: false, importDate: null,
+        unitPriceNet: buyPrice, impVatRate: 0, impVatAmt: 0, grossUpApplied: false,
+        goodsCostNet: buyPrice * sQty, goodsCostCharged: buyPrice * sQty,
+        shipCostNet: 0, shipVatAmt: 0,
+        totalCost: buyPrice * sQty,
+      };
     }
     const unitPriceNet = imp.unitPrice || 0;
     const impVatRate   = imp.vatRate   || 0;
-    const costPerUnit  = (saleVatRate===0 && impVatRate>0) ? unitPriceNet*(1+impVatRate/100) : unitPriceNet;
-    const goodsCost    = costPerUnit * sQty;
+    // Bán VAT=0% nhưng nhập có VAT → VAT đầu vào KHÔNG được khấu trừ, phải gộp vào giá vốn
+    const grossUpApplied  = (saleVatRate === 0 && impVatRate > 0);
+    const costPerUnit      = grossUpApplied ? unitPriceNet*(1+impVatRate/100) : unitPriceNet;
+    const goodsCostNet     = unitPriceNet * sQty;                    // giá vốn THUẦN (chưa VAT đầu vào)
+    const impVatAmt        = unitPriceNet * (impVatRate/100) * sQty; // VAT đầu vào của hàng, phân bổ theo SL đơn này
+    const goodsCostCharged = costPerUnit * sQty;                     // phần thực tính vào giá vốn (gộp VAT nếu bán 0%)
     const impShipFee    = imp.shipFee    || 0;
     const impShipVatR   = imp.shipVatRate || 0;
-    const impShipFeeNet = impShipVatR>0 ? impShipFee/(1+impShipVatR/100) : impShipFee;
-    const impQty = parseFloat(imp.qty)||1;
-    return goodsCost + (impQty>0 ? impShipFeeNet/impQty : 0)*sQty;
+    const impShipFeeNet = impShipVatR > 0 ? impShipFee/(1+impShipVatR/100) : impShipFee;
+    const impShipVatAmt = impShipFee - impShipFeeNet;
+    const impQty = parseFloat(imp.qty) || 1;
+    const shipCostNet = impQty > 0 ? (impShipFeeNet/impQty) * sQty : 0;
+    const shipVatAmt  = impQty > 0 ? (impShipVatAmt/impQty) * sQty : 0;
+    return {
+      hasImport: true, importDate: imp.date,
+      unitPriceNet, impVatRate, impVatAmt, grossUpApplied,
+      goodsCostNet, goodsCostCharged,
+      shipCostNet, shipVatAmt,
+      totalCost: goodsCostCharged + shipCostNet,
+    };
   }
+  function cogsForSale(s) { return cogsDetailForSale(s).totalCost; }
 
-  function profitForSale(s) {
-    const revenue = s.subTotal != null ? s.subTotal : Math.max(0,(s.total||0)-(s.shipFee||0)-(s.vatAmt||0));
-    const cogs    = cogsForSale(s);
-    const vcStore = (!s.shipForCustomer && s.shipFee) ? (() => {
-      const net = (s.shipVatRate||0)>0 ? (s.shipFee/(1+(s.shipVatRate||0)/100)) : s.shipFee;
-      return net;
-    })() : 0;
-    return revenue - cogs - vcStore;
-  }
-
-  const profitData = filteredSales.map(s => ({
-    ...s,
-    _revenue: s.subTotal != null ? s.subTotal : Math.max(0,(s.total||0)-(s.shipFee||0)-(s.vatAmt||0)),
-    _cogs:    cogsForSale(s),
-    _vcStore: (!s.shipForCustomer && s.shipFee) ? ((s.shipVatRate||0)>0?(s.shipFee/(1+(s.shipVatRate||0)/100)):s.shipFee) : 0,
-    _profit:  profitForSale(s),
-  }));
+  const profitData = filteredSales.map(s => {
+    const cd       = cogsDetailForSale(s);
+    const revenue  = s.subTotal != null ? s.subTotal : Math.max(0,(s.total||0)-(s.shipFee||0)-(s.vatAmt||0));
+    const vatOut   = s.vatAmt || 0;
+    const total    = s.total != null ? s.total : (revenue + vatOut);
+    const shipVatR = s.shipVatRate || 0;
+    const vcStore    = (!s.shipForCustomer && s.shipFee) ? (shipVatR>0 ? s.shipFee/(1+shipVatR/100) : s.shipFee) : 0;
+    const vcStoreVat = (!s.shipForCustomer && s.shipFee && shipVatR>0) ? (s.shipFee - vcStore) : 0;
+    const profit   = revenue - cd.totalCost - vcStore;
+    // VAT đầu vào liên quan đơn này (hàng + VC nhập phân bổ + VC giao cửa hàng tự chịu)
+    // — CHỈ MANG TÍNH THAM KHẢO cho riêng đơn này, không phải số liệu kê khai chính thức
+    //   (thuế khấu trừ theo KỲ kê khai, không tính riêng theo từng đơn lẻ)
+    const vatInTotal = cd.impVatAmt + cd.shipVatAmt + vcStoreVat;
+    const vatNetEst  = vatOut - vatInTotal;
+    return {
+      ...s,
+      _revenue: revenue, _cogs: cd.totalCost, _vcStore: vcStore, _profit: profit,
+      _vatOut: vatOut, _vatRate: s.vatRate || 0, _total: total,
+      _vcStoreVat: vcStoreVat, _vatInTotal: vatInTotal, _vatNetEst: vatNetEst,
+      _cd: cd,
+    };
+  });
 
   const totalRevenue = profitData.reduce((a,s)=>a+s._revenue,0);
   const totalCogs    = profitData.reduce((a,s)=>a+s._cogs,0);
@@ -14213,6 +14267,76 @@ function pgProfit() {
 
   function profitClass(v){return v>0?'profit-pos':v<0?'profit-neg':'profit-zero';}
 
+  // ── Panel chi tiết 1 đơn: tách rõ VAT đầu ra / đầu vào để đối chiếu giấy tờ ──
+  function orderDetailHTML(s) {
+    const vat = s._vatRate > 0;
+    const cd  = s._cd;
+    const row = (lbl, val, o={}) => `<div style="display:flex;justify-content:space-between;gap:10px;padding:3px 0;${o.bold?'font-weight:700;':''}${o.border?'border-top:1px solid var(--border2);margin-top:4px;padding-top:6px;':''}">
+        <span style="color:${o.muted?'var(--text3)':'var(--text2)'};font-size:11.5px">${lbl}</span>
+        <span style="font-size:11.5px;white-space:nowrap;${o.color?'color:'+o.color+';':''}">${val}</span>
+      </div>`;
+
+    let out = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px 28px;padding:12px 10px 4px">';
+
+    // Cột Đầu ra (bán hàng)
+    out += '<div>';
+    out += `<div style="font-size:11px;font-weight:700;color:var(--accent);margin-bottom:4px">🧾 ĐẦU RA — BÁN HÀNG ${vat?'(VAT '+s._vatRate+'%)':'(Không VAT)'}</div>`;
+    out += row(vat?'Tạm tính (DT thuần)':'Doanh thu bán', fmt(Math.round(s._revenue))+'đ');
+    if (vat) {
+      out += row('VAT đầu ra ('+s._vatRate+'%)', '+ '+fmt(Math.round(s._vatOut))+'đ', {color:'var(--blue)'});
+      out += row('Tổng cộng (khách trả)', fmt(Math.round(s._total))+'đ', {bold:true, border:true});
+    }
+    out += '</div>';
+
+    // Cột Đầu vào (giá vốn)
+    out += '<div>';
+    out += '<div style="font-size:11px;font-weight:700;color:var(--amber);margin-bottom:4px">📦 ĐẦU VÀO — GIÁ VỐN</div>';
+    if (cd.hasImport) {
+      out += row('Đơn giá nhập thuần', fmt(Math.round(cd.unitPriceNet))+'đ'+(cd.importDate?' <span style="color:var(--text3);font-size:10px">(NK '+fmtD(cd.importDate)+')</span>':''));
+      out += row('Giá vốn thuần (SL × giá nhập)', fmt(Math.round(cd.goodsCostNet))+'đ');
+      if (cd.impVatRate > 0) {
+        out += row('VAT đầu vào hàng ('+cd.impVatRate+'%)',
+          (cd.grossUpApplied?'+ ':'')+fmt(Math.round(cd.impVatAmt))+'đ '+
+          (cd.grossUpApplied
+            ? '<span style="color:var(--red);font-size:10px">(gộp vào giá vốn vì bán 0%)</span>'
+            : '<span style="color:var(--text3);font-size:10px">(khấu trừ riêng, không vào giá vốn)</span>'),
+          {color:'var(--blue)'});
+      }
+    } else {
+      out += row('Giá vốn (mặc định sản phẩm)', fmt(Math.round(cd.unitPriceNet))+'đ <span style="color:var(--text3);font-size:10px">(chưa có phiếu nhập)</span>');
+    }
+    if (s._vcStore > 0) {
+      out += row('VC tự chịu (thuần)', fmt(Math.round(s._vcStore))+'đ');
+      if (s._vcStoreVat > 0) out += row('VAT VC tự chịu', '+ '+fmt(Math.round(s._vcStoreVat))+'đ', {color:'var(--blue)'});
+    }
+    out += row('→ Giá vốn tính vào LN', fmt(Math.round(s._cogs))+'đ', {bold:true, border:true, color:'var(--amber)'});
+    out += '</div>';
+    out += '</div>'; // end grid
+
+    // Đối chiếu VAT — chỉ hiện khi đơn có VAT
+    if (vat) {
+      out += `<div style="margin:6px 10px 4px;padding:10px 12px;background:var(--bg3);border-radius:var(--r2);border:1px solid var(--border2)">
+        <div style="font-size:11px;font-weight:700;color:var(--text2);margin-bottom:6px">⚖️ ĐỐI CHIẾU VAT (tham khảo riêng đơn này)</div>
+        ${row('VAT đầu ra', '+ '+fmt(Math.round(s._vatOut))+'đ')}
+        ${row('VAT đầu vào (hàng + VC)', '− '+fmt(Math.round(s._vatInTotal))+'đ')}
+        ${row(s._vatNetEst>=0?'= Phải nộp thêm (ước tính)':'= Được khấu trừ (ước tính)', fmt(Math.round(Math.abs(s._vatNetEst)))+'đ', {bold:true, border:true, color: s._vatNetEst>=0?'var(--red)':'var(--green)'})}
+        <div style="font-size:10px;color:var(--text3);margin-top:6px;line-height:1.5">* Số tham khảo riêng đơn này. VAT phải nộp thực tế tính theo KỲ KÊ KHAI (gộp toàn bộ đơn bán + phiếu nhập trong kỳ) — xem số chính xác tại trang Tổng Quan.</div>
+      </div>`;
+    }
+
+    // Lợi nhuận thuần
+    const marginTxt = s._revenue>0 ? (s._profit/s._revenue*100).toFixed(1)+'%' : '—';
+    out += `<div style="margin:4px 10px 12px;padding:10px 12px;background:rgba(76,175,125,.08);border-radius:var(--r2);border:1px solid rgba(76,175,125,.25)">
+      <div style="display:flex;justify-content:space-between;align-items:center;font-weight:700">
+        <span style="color:var(--text2);font-size:12px">💰 Lợi nhuận thuần đơn này</span>
+        <span class="${profitClass(s._profit)}" style="font-size:13px">${fmt(Math.round(s._profit))}đ &nbsp;(${marginTxt})</span>
+      </div>
+      <div style="font-size:10px;color:var(--text3);margin-top:4px">= DT thuần − Giá vốn${s._vcStore>0?' − VC tự chịu':''} = ${fmt(Math.round(s._revenue))} − ${fmt(Math.round(s._cogs))}${s._vcStore>0?' − '+fmt(Math.round(s._vcStore)):''} = ${fmt(Math.round(s._profit))}đ</div>
+    </div>`;
+
+    return out;
+  }
+
   if (grp==='order') {
     const sorted=[...profitData].sort((a,b)=>b.date.localeCompare(a.date));
     if (!sorted.length) {
@@ -14222,16 +14346,32 @@ function pgProfit() {
     }
     sorted.forEach(s=>{
       const margin=s._revenue>0?(s._profit/s._revenue*100).toFixed(1):'—';
+      const okey = 'o:' + (s.id || (s.date+'|'+s.customer+'|'+s.productName));
+      const expanded = pgProfit._expand.has(okey);
       const tr=document.createElement('tr');
+      tr.style.cursor='pointer';
       tr.innerHTML=`
-        <td><div style="font-weight:600;font-size:12px">${escHtml(s.customer||'—')}</div><div style="font-size:11px;color:var(--text3)">${escHtml(s.productName||'')}</div></td>
+        <td><div style="font-weight:600;font-size:12px">${expanded?'▼':'▶'} ${escHtml(s.customer||'—')}</div><div style="font-size:11px;color:var(--text3);margin-top:2px">${escHtml(s.productName||'')} &nbsp;<span style="font-size:9px;padding:1px 6px;border-radius:99px;border:1px solid var(--border2);color:${s._vatRate>0?'var(--blue)':'var(--text3)'}">${s._vatRate>0?'VAT '+s._vatRate+'%':'Không VAT'}</span></div></td>
         <td style="white-space:nowrap;color:var(--text2)">${fmtD(s.date)}</td>
         <td>${fmt(Math.round(s._revenue))}đ</td>
         <td style="color:var(--amber)">${fmt(Math.round(s._cogs))}đ</td>
         <td style="color:var(--text2)">${s._vcStore>0?fmt(Math.round(s._vcStore))+'đ':'—'}</td>
         <td class="${profitClass(s._profit)}">${fmt(Math.round(s._profit))}đ</td>
         <td class="${profitClass(s._profit)}">${margin!=='—'?margin+'%':'—'}</td>`;
+      tr.onclick=()=>{
+        if (pgProfit._expand.has(okey)) pgProfit._expand.delete(okey); else pgProfit._expand.add(okey);
+        render();
+      };
       tbody.appendChild(tr);
+      if (expanded) {
+        const dtr=document.createElement('tr');
+        dtr.style.background='rgba(255,255,255,.02)';
+        const dtd=document.createElement('td');
+        dtd.colSpan=7;
+        dtd.innerHTML=orderDetailHTML(s);
+        dtr.appendChild(dtd);
+        tbody.appendChild(dtr);
+      }
     });
   } else {
     // Group by day/month/year
