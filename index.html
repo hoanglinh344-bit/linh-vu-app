@@ -1013,7 +1013,17 @@ const CLOUD = (() => {
           if (!r || !r.id) return;
           // Dọn undefined TRƯỚC, rồi mới gắn _updated (sentinel serverTimestamp()
           // không phải plain object thường, không cần/không nên đi qua sanitize).
-          const clean = _sanitizeForFirestore(r);
+          let clean = _sanitizeForFirestore(r);
+          // SAFETY NET: dữ liệu cũ (ảnh sản phẩm lưu trước khi có nén ảnh) có thể
+          // đã vượt giới hạn 1MB/document của Firestore → nếu cứ đẩy nguyên vẹn,
+          // document đó sẽ THẤT BẠI VĨNH VIỄN, kẹt mọi field khác (giá, tồn kho...)
+          // không lên được cloud. Phát hiện field 'image' quá nặng → tạm gỡ field
+          // đó ra khỏi lần ghi này (các field còn lại vẫn lên cloud bình thường),
+          // người dùng chỉ cần chọn lại ảnh (đã được tự nén) để cập nhật sau.
+          if (clean.image && typeof clean.image === 'string' && clean.image.length > 900000) {
+            console.warn('[CLOUD] Ảnh sản phẩm quá khổ (>900KB sau base64), tạm bỏ field image khi đồng bộ:', r.id);
+            clean = { ...clean, image: '' };
+          }
           // Firebase-first: luôn dùng serverTimestamp() — đồng hồ thiết bị có thể lệch
           // gây record cũ ghi đè record mới. serverTimestamp() = đồng hồ Firestore server.
           // merge:true → chỉ cập nhật field thay đổi, không xoá field khác.
@@ -5579,6 +5589,48 @@ function pgInventory() {
   return wrap;
 }
 
+// ── Nén ảnh sản phẩm trước khi lưu (FIX: tránh vượt giới hạn 1MB/document
+//    của Firestore). Ảnh gốc → resize tối đa 1000px cạnh dài + giảm dần
+//    chất lượng JPEG đến khi dataURL < ~600KB (an toàn, còn chỗ cho field khác).
+function _compressImageForFirestore(file, cb) {
+  const MAX_DIM = 1000;        // px, cạnh dài nhất sau resize
+  const MAX_BYTES = 600 * 1024; // ngưỡng an toàn cho 1 field trong document Firestore (limit thật 1MB/doc)
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    const img = new Image();
+    img.onload = function() {
+      let w = img.width, h = img.height;
+      if (w > MAX_DIM || h > MAX_DIM) {
+        if (w >= h) { h = Math.round(h * MAX_DIM / w); w = MAX_DIM; }
+        else        { w = Math.round(w * MAX_DIM / h); h = MAX_DIM; }
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, h);
+      let q = 0.82;
+      let dataUrl = canvas.toDataURL('image/jpeg', q);
+      // Giảm dần chất lượng nếu vẫn còn quá nặng cho 1 document Firestore
+      while (dataUrl.length > MAX_BYTES && q > 0.35) {
+        q -= 0.1;
+        dataUrl = canvas.toDataURL('image/jpeg', q);
+      }
+      // Nếu vẫn quá nặng dù đã nén tối đa (ảnh quá to/đặc biệt) → thu nhỏ kích thước thêm 1 lần
+      if (dataUrl.length > MAX_BYTES) {
+        const canvas2 = document.createElement('canvas');
+        canvas2.width = Math.round(w * 0.6); canvas2.height = Math.round(h * 0.6);
+        canvas2.getContext('2d').drawImage(img, 0, 0, canvas2.width, canvas2.height);
+        dataUrl = canvas2.toDataURL('image/jpeg', 0.6);
+      }
+      cb(dataUrl);
+    };
+    img.onerror = function() { cb(null); };
+    img.src = e.target.result;
+  };
+  reader.onerror = function() { cb(null); };
+  reader.readAsDataURL(file);
+}
+
 function openProduct(prod, rebuild) {
   const TYPES = ['Granite','Marble','Onyx','Basalt','Quartzite','Travertine','Slate','Serpentine','Khác'];
   const UNITS  = ['m²','tấm','tấn','viên','m³','kg','cái','bao'];
@@ -5935,10 +5987,17 @@ function openProduct(prod, rebuild) {
   imgFileInput.addEventListener('change', function(){
     const file = this.files[0];
     if (!file) return;
-    if (file.size > 2 * 1024 * 1024) { alert('Ảnh quá lớn! Vui lòng chọn ảnh dưới 2MB.'); return; }
-    const reader = new FileReader();
-    reader.onload = function(e) {
-      f.image = e.target.result;
+    // Chỉ chặn file quá khổ ở mức ngưỡng đọc được (8MB) — kích thước THỰC LƯU
+    // vào Firestore sẽ được nén nhỏ lại bên dưới, không phụ thuộc size file gốc.
+    if (file.size > 8 * 1024 * 1024) { alert('Ảnh quá lớn! Vui lòng chọn ảnh dưới 8MB.'); return; }
+    imgPickBtn.disabled = true; imgPickBtn.innerHTML = '⏳ Đang xử lý ảnh...';
+    _compressImageForFirestore(file, function(dataUrl){
+      imgPickBtn.disabled = false; imgPickBtn.innerHTML = '📷 ' + (f.image ? 'Đổi ảnh' : 'Chọn ảnh sản phẩm');
+      if (!dataUrl) { alert('Không đọc được ảnh này, vui lòng thử ảnh khác.'); return; }
+      // FIX gốc của lỗi "Đồng bộ lên Firebase thất bại: dtn_products": ảnh base64
+      // gốc (chưa nén) dễ vượt giới hạn 1MB/document của Firestore → ghi bị từ
+      // chối âm thầm. Ảnh đã được resize + nén ở trên nên luôn an toàn để lưu.
+      f.image = dataUrl;
       imgPreviewEl.style.display = 'block';
       imgPreviewEl.innerHTML = '';
       const imgEl = document.createElement('img');
@@ -5949,8 +6008,7 @@ function openProduct(prod, rebuild) {
       rmBtn.style.marginTop = '6px'; rmBtn.style.display = 'block';
       rmBtn.onclick = function(){ f.image = ''; imgPreviewEl.style.display = 'none'; imgPreviewEl.innerHTML = ''; imgFileInput.value = ''; };
       imgPreviewEl.appendChild(rmBtn);
-    };
-    reader.readAsDataURL(file);
+    });
   });
 
   const imgPickBtn = document.createElement('button');
