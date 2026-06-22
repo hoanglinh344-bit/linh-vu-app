@@ -12,6 +12,7 @@
 <!-- Firebase SDK -->
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-storage-compat.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 :root{
@@ -292,6 +293,7 @@ const CLOUD = (() => {
   const CFG_KEY = 'dtn_cloud_cfg';
   let _app = null;
   let _db  = null;
+  let _storage = null; // Firebase Storage — dùng để lưu file ảnh sản phẩm riêng (không base64 trong Firestore)
   let _cfg = null;
   let _online = navigator.onLine;
   let _syncStatus = 'idle';
@@ -347,11 +349,12 @@ const CLOUD = (() => {
 
   // ── Load / save config ──────────────────────────────────────
   const DEFAULT_CFG = {
-    apiKey:     'AIzaSyBcBGZL9-S2TJv0vZMBJYQGNc9kDLU5484',
-    authDomain: 'datunhienlinhvu-42a05.firebaseapp.com',
-    projectId:  'datunhienlinhvu-42a05',
-    shopId:     'shop1',
-    enabled:    true
+    apiKey:        'AIzaSyBcBGZL9-S2TJv0vZMBJYQGNc9kDLU5484',
+    authDomain:    'datunhienlinhvu-42a05.firebaseapp.com',
+    projectId:     'datunhienlinhvu-42a05',
+    storageBucket: '', // tuỳ chọn — chỉ cần điền nếu SDK không tự xác định được bucket Storage
+    shopId:        'shop1',
+    enabled:       true
   };
   function loadCfg() {
     try {
@@ -387,6 +390,17 @@ const CLOUD = (() => {
       // App này dùng localStorage làm cache offline (bootSync đã xử lý) nên
       // không cần thêm 1 layer cache nữa từ Firestore.
       // _db.enablePersistence({ synchronizeTabs: true }) — đã tắt có chủ đích
+
+      // ── Firebase Storage (lưu file ảnh sản phẩm riêng) ─────────
+      // Nếu _cfg.storageBucket không có, SDK tự xác định bucket mặc định
+      // của project (project.firebasestorage.app hoặc project.appspot.com).
+      // Chỉ cần điền storageBucket trong Cài đặt nếu tự xác định bị lỗi.
+      try {
+        _storage = _cfg.storageBucket
+          ? _app.storage('gs://' + _cfg.storageBucket.replace(/^gs:\/\//,''))
+          : _app.storage();
+      } catch(e) { console.warn('[CLOUD] Storage init error:', e.message||e); _storage = null; }
+
       return true;
     } catch(e) { console.warn('[CLOUD] Firebase init error:', e); return false; }
   }
@@ -1038,6 +1052,27 @@ const CLOUD = (() => {
     }
   }
 
+  // ── Firebase Storage: upload/xoá file ảnh sản phẩm ─────────
+  // Lưu ảnh dưới dạng file riêng trên Storage (không nhúng base64 vào
+  // Firestore) → document gọn nhẹ, không lo giới hạn 1MB/document, ảnh
+  // load nhanh hơn vì có CDN của Firebase Storage.
+  async function uploadImageToStorage(path, blob) {
+    if (!_storage || !blob) return null;
+    try {
+      const ref = _storage.ref(path);
+      await ref.put(blob, { contentType: blob.type || 'image/jpeg' });
+      return await ref.getDownloadURL();
+    } catch(e) {
+      console.warn('[CLOUD] uploadImageToStorage error:', path, e.message||e);
+      return null;
+    }
+  }
+  async function deleteImageFromStorage(path) {
+    if (!_storage || !path) return;
+    try { await _storage.ref(path).delete(); }
+    catch(e) { /* file đã không còn / lỗi mạng — bỏ qua, không chặn UI vì không quan trọng */ }
+  }
+
   // ── Sync toàn bộ state lên Firestore ───────────────────────
   async function syncAll(S) {
     if (!_db || !_online) return false;
@@ -1548,6 +1583,11 @@ const CLOUD = (() => {
     // Dùng ở các nơi tạo sales/imports/returns để đánh dấu _stockTx
     // (xem applyLedgerToStock) — tránh hoà giải tồn kho đếm trùng giao dịch
     unionStockTx,
+    // ── Firebase Storage cho ảnh sản phẩm ──────────────────────
+    uploadImageToStorage,
+    deleteImageFromStorage,
+    isOnline: () => _online,
+    hasStorage: () => !!_storage,
     // Cho phép người dùng ẩn banner cảnh báo "đã chặn ghi đè bất thường"
     // sau khi đã đọc và xử lý (xem trang Cài đặt)
     _clearSuspiciousPull() { _suspiciousPull = null; notifyStatus(); },
@@ -5574,7 +5614,10 @@ function pgInventory() {
                       + (relReturns.length ? '• ' + relReturns.length + ' phiếu trả hàng\n' : '')
                       + '\n⚠️ Xoá sẽ giữ lại lịch sử giao dịch nhưng sản phẩm sẽ biến mất khỏi kho. Tiếp tục?'
                     : 'Xoá sản phẩm "' + p.name + '" (SKU: ' + (p.sku || '—') + ')?';
-                  S.confirm = { msg: warnMsg, onYes: () => { softDelete('products', p.id, () => {}); toast('Đã xoá sản phẩm ' + (p.sku ? '[' + p.sku + ']' : ''), 'info'); rebuild(); } };
+                  S.confirm = { msg: warnMsg, onYes: () => {
+                    if (p.imagePath && CLOUD.isOnline()) CLOUD.deleteImageFromStorage(p.imagePath);
+                    softDelete('products', p.id, () => {}); toast('Đã xoá sản phẩm ' + (p.sku ? '[' + p.sku + ']' : ''), 'info'); rebuild();
+                  } };
                   render();
                 } }, '🗑')
               ))
@@ -5592,6 +5635,8 @@ function pgInventory() {
 // ── Nén ảnh sản phẩm trước khi lưu (FIX: tránh vượt giới hạn 1MB/document
 //    của Firestore). Ảnh gốc → resize tối đa 1000px cạnh dài + giảm dần
 //    chất lượng JPEG đến khi dataURL < ~600KB (an toàn, còn chỗ cho field khác).
+// Dùng làm FALLBACK khi không có mạng/Storage (xem openProduct bên dưới) —
+// trường hợp bình thường ảnh được lưu qua _compressImageToBlob + Storage.
 function _compressImageForFirestore(file, cb) {
   const MAX_DIM = 1000;        // px, cạnh dài nhất sau resize
   const MAX_BYTES = 600 * 1024; // ngưỡng an toàn cho 1 field trong document Firestore (limit thật 1MB/doc)
@@ -5631,13 +5676,51 @@ function _compressImageForFirestore(file, cb) {
   reader.readAsDataURL(file);
 }
 
+// ── Nén ảnh sản phẩm thành Blob để upload lên Firebase Storage ─────
+// Không bị giới hạn 1MB như Firestore document nên có thể giữ ảnh nét hơn
+// (cạnh dài tối đa 1600px), nhưng vẫn nén để tải nhanh + tiết kiệm dung
+// lượng Storage. canvas.toBlob là async nên dùng đệ quy giảm quality dần.
+function _compressImageToBlob(file, cb) {
+  const MAX_DIM = 1600;
+  const TARGET_BYTES = 500 * 1024;
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    const img = new Image();
+    img.onload = function() {
+      let w = img.width, h = img.height;
+      if (w > MAX_DIM || h > MAX_DIM) {
+        if (w >= h) { h = Math.round(h * MAX_DIM / w); w = MAX_DIM; }
+        else        { w = Math.round(w * MAX_DIM / h); h = MAX_DIM; }
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+      const tryQuality = (q) => {
+        canvas.toBlob(function(blob) {
+          if (!blob) { cb(null); return; }
+          if (blob.size > TARGET_BYTES && q > 0.4) tryQuality(q - 0.15);
+          else cb(blob);
+        }, 'image/jpeg', q);
+      };
+      tryQuality(0.85);
+    };
+    img.onerror = function() { cb(null); };
+    img.src = e.target.result;
+  };
+  reader.onerror = function() { cb(null); };
+  reader.readAsDataURL(file);
+}
+
 function openProduct(prod, rebuild) {
   const TYPES = ['Granite','Marble','Onyx','Basalt','Quartzite','Travertine','Slate','Serpentine','Khác'];
   const UNITS  = ['m²','tấm','tấn','viên','m³','kg','cái','bao'];
-  let f = prod ? { ...prod } : { name: '', sku: '', type: 'Granite', origin: '', unit: 'm²', buyPrice: '', sellPrice: '', stock: '', description: '', image: '', qrCode: '', variants: [], thickness: '', length: '', width: '', multiVariant: false };
+  let f = prod ? { ...prod } : { id: 'p' + uid(), name: '', sku: '', type: 'Granite', origin: '', unit: 'm²', buyPrice: '', sellPrice: '', stock: '', description: '', image: '', imagePath: '', qrCode: '', variants: [], thickness: '', length: '', width: '', multiVariant: false };
   // Đảm bảo luôn có trường variants và multiVariant
   if (!f.variants) f.variants = [];
   if (f.multiVariant === undefined) f.multiVariant = f.variants.length > 0;
+  // imagePath: đường dẫn file ảnh trên Firebase Storage (rỗng nếu ảnh cũ dạng base64
+  // hoặc chưa từng có ảnh) — dùng để xoá ảnh cũ khi đổi/xoá ảnh, tránh rác trên Storage.
+  if (f.imagePath === undefined) f.imagePath = '';
 
   // Tạo tất cả input 1 lần — KHÔNG re-render khi gõ số
   const inpName   = mkInput('text',   'VD: Granite Đen Impala',  f.name,        v => { f.name = v; });
@@ -5974,6 +6057,14 @@ function openProduct(prod, rebuild) {
   variantsSectionWrap.appendChild(addVariantBtn);
 
   // ── Ảnh sản phẩm ──────────────────────────────────────────
+  // _origImagePath: path ảnh ĐANG được lưu chính thức khi mở form này — nếu
+  // người dùng bấm "Huỷ", path này KHÔNG bao giờ bị xoá trên Storage (chỉ xoá
+  // khi bấm "Lưu" thành công thật và ảnh đã thay đổi).
+  // _uploadedPathsThisSession: các ảnh MỚI upload trong lần sửa này nhưng
+  // cuối cùng không được giữ lại (bị thay tiếp hoặc Huỷ) — cần dọn rác.
+  const _origImagePath = f.imagePath || '';
+  let _uploadedPathsThisSession = [];
+
   const imgPreviewEl = document.createElement('div');
   imgPreviewEl.style.cssText = 'margin-top:8px;display:' + (f.image ? 'block' : 'none');
   if (f.image) {
@@ -5982,33 +6073,85 @@ function openProduct(prod, rebuild) {
     imgPreviewEl.appendChild(imgEl);
   }
 
+  function _renderImgPreview() {
+    imgPreviewEl.style.display = f.image ? 'block' : 'none';
+    imgPreviewEl.innerHTML = '';
+    if (!f.image) return;
+    const imgEl = document.createElement('img');
+    imgEl.src = f.image; imgEl.style.cssText = 'max-width:100%;max-height:120px;border-radius:6px;border:1px solid var(--border2);object-fit:cover';
+    imgPreviewEl.appendChild(imgEl);
+    const rmBtn = document.createElement('button');
+    rmBtn.textContent = '✕ Xoá ảnh'; rmBtn.className = 'btn btn-xs btn-ghost';
+    rmBtn.style.marginTop = '6px'; rmBtn.style.display = 'block';
+    rmBtn.onclick = function(){
+      const oldPath = f.imagePath;
+      f.image = ''; f.imagePath = '';
+      imgFileInput.value = '';
+      _renderImgPreview();
+      // Chỉ xoá ngay trên Storage nếu đây là ảnh MỚI upload trong session này
+      // (chưa lưu nên không ai khác đang tham chiếu). Ảnh GỐC đã lưu thì để
+      // nguyên — sẽ chỉ bị xoá thật khi bấm "Lưu" thành công bên dưới.
+      if (oldPath && oldPath !== _origImagePath && CLOUD.isOnline()) {
+        CLOUD.deleteImageFromStorage(oldPath);
+        _uploadedPathsThisSession = _uploadedPathsThisSession.filter(p => p !== oldPath);
+      }
+    };
+    imgPreviewEl.appendChild(rmBtn);
+  }
+
   const imgFileInput = document.createElement('input');
   imgFileInput.type = 'file'; imgFileInput.accept = 'image/*'; imgFileInput.style.display = 'none';
   imgFileInput.addEventListener('change', function(){
     const file = this.files[0];
     if (!file) return;
-    // Chỉ chặn file quá khổ ở mức ngưỡng đọc được (8MB) — kích thước THỰC LƯU
-    // vào Firestore sẽ được nén nhỏ lại bên dưới, không phụ thuộc size file gốc.
-    if (file.size > 8 * 1024 * 1024) { alert('Ảnh quá lớn! Vui lòng chọn ảnh dưới 8MB.'); return; }
-    imgPickBtn.disabled = true; imgPickBtn.innerHTML = '⏳ Đang xử lý ảnh...';
-    _compressImageForFirestore(file, function(dataUrl){
-      imgPickBtn.disabled = false; imgPickBtn.innerHTML = '📷 ' + (f.image ? 'Đổi ảnh' : 'Chọn ảnh sản phẩm');
-      if (!dataUrl) { alert('Không đọc được ảnh này, vui lòng thử ảnh khác.'); return; }
-      // FIX gốc của lỗi "Đồng bộ lên Firebase thất bại: dtn_products": ảnh base64
-      // gốc (chưa nén) dễ vượt giới hạn 1MB/document của Firestore → ghi bị từ
-      // chối âm thầm. Ảnh đã được resize + nén ở trên nên luôn an toàn để lưu.
-      f.image = dataUrl;
-      imgPreviewEl.style.display = 'block';
-      imgPreviewEl.innerHTML = '';
-      const imgEl = document.createElement('img');
-      imgEl.src = f.image; imgEl.style.cssText = 'max-width:100%;max-height:120px;border-radius:6px;border:1px solid var(--border2);object-fit:cover';
-      imgPreviewEl.appendChild(imgEl);
-      const rmBtn = document.createElement('button');
-      rmBtn.textContent = '✕ Xoá ảnh'; rmBtn.className = 'btn btn-xs btn-ghost';
-      rmBtn.style.marginTop = '6px'; rmBtn.style.display = 'block';
-      rmBtn.onclick = function(){ f.image = ''; imgPreviewEl.style.display = 'none'; imgPreviewEl.innerHTML = ''; imgFileInput.value = ''; };
-      imgPreviewEl.appendChild(rmBtn);
-    });
+    // Kích thước thực lưu sẽ được nén nhỏ lại bên dưới, không phụ thuộc nhiều vào size file gốc.
+    if (file.size > 12 * 1024 * 1024) { alert('Ảnh quá lớn! Vui lòng chọn ảnh dưới 12MB.'); return; }
+
+    const useStorage = CLOUD.isOnline() && CLOUD.hasStorage();
+    imgPickBtn.disabled = true;
+    imgPickBtn.innerHTML = useStorage ? '⏳ Đang tải ảnh lên...' : '⏳ Đang xử lý ảnh...';
+
+    const finishUI = () => { imgPickBtn.disabled = false; imgPickBtn.innerHTML = '📷 ' + (f.image ? 'Đổi ảnh' : 'Chọn ảnh sản phẩm'); };
+
+    if (useStorage) {
+      // ── Đường chính: nén thành Blob → upload Firebase Storage → lưu URL ──
+      _compressImageToBlob(file, function(blob){
+        if (!blob) { finishUI(); alert('Không đọc được ảnh này, vui lòng thử ảnh khác.'); return; }
+        const path = 'product_images/' + f.id + '/' + Date.now() + '.jpg';
+        CLOUD.uploadImageToStorage(path, blob).then(function(url){
+          finishUI();
+          if (!url) {
+            alert('Tải ảnh lên Firebase Storage thất bại (kiểm tra mạng/Storage Rules). Ảnh chưa được lưu, vui lòng thử lại.');
+            return;
+          }
+          const oldPath = f.imagePath;
+          f.image = url;
+          f.imagePath = path;
+          _uploadedPathsThisSession.push(path);
+          imgFileInput.value = '';
+          _renderImgPreview();
+          // Nếu ảnh vừa bị thay là ảnh MỚI của chính session này (không phải
+          // ảnh gốc đã lưu) → dọn ngay, tránh tích rác khi đổi ảnh nhiều lần.
+          if (oldPath && oldPath !== _origImagePath) {
+            CLOUD.deleteImageFromStorage(oldPath);
+            _uploadedPathsThisSession = _uploadedPathsThisSession.filter(p => p !== oldPath);
+          }
+        });
+      });
+    } else {
+      // ── Fallback: mất mạng hoặc chưa cấu hình Storage → tạm lưu base64 nén
+      // nhỏ (như cũ) thẳng vào Firestore. Lần sau chọn lại ảnh khi có mạng,
+      // ảnh sẽ tự chuyển sang lưu trên Storage như bình thường.
+      _compressImageForFirestore(file, function(dataUrl){
+        finishUI();
+        if (!dataUrl) { alert('Không đọc được ảnh này, vui lòng thử ảnh khác.'); return; }
+        f.image = dataUrl;
+        f.imagePath = ''; // base64 fallback, không có path trên Storage
+        imgFileInput.value = '';
+        _renderImgPreview();
+        toast('📡 Không có mạng — ảnh tạm lưu trực tiếp, sẽ chuyển sang Storage ở lần chọn ảnh kế tiếp khi có mạng.', 'info');
+      });
+    }
   });
 
   const imgPickBtn = document.createElement('button');
@@ -6017,18 +6160,12 @@ function openProduct(prod, rebuild) {
   imgPickBtn.innerHTML = '📷 ' + (f.image ? 'Đổi ảnh' : 'Chọn ảnh sản phẩm');
   imgPickBtn.onclick = function(){ imgFileInput.click(); };
 
-  // Nút xoá ảnh nếu đang có ảnh
-  if (f.image) {
-    const rmBtn2 = document.createElement('button');
-    rmBtn2.type = 'button'; rmBtn2.textContent = '✕ Xoá ảnh'; rmBtn2.className = 'btn btn-xs btn-ghost';
-    rmBtn2.style.marginLeft = '8px';
-    rmBtn2.onclick = function(){ f.image = ''; imgPreviewEl.style.display = 'none'; imgPreviewEl.innerHTML = ''; };
-    imgPickBtn.parentNode && imgPickBtn.parentNode.insertBefore(rmBtn2, imgPickBtn.nextSibling);
-  }
+  // Gắn nút xoá ảnh ban đầu (nếu đang có ảnh) qua cùng hàm render dùng chung
+  if (f.image) _renderImgPreview();
 
   const imgWrap = document.createElement('div');
   imgWrap.className = 'form-group fg-full';
-  const imgLabel = document.createElement('label'); imgLabel.className = 'form-label'; imgLabel.textContent = '📸 Ảnh sản phẩm (tùy chọn, tối đa 2MB)';
+  const imgLabel = document.createElement('label'); imgLabel.className = 'form-label'; imgLabel.textContent = '📸 Ảnh sản phẩm (tùy chọn)';
   imgWrap.appendChild(imgLabel);
   imgWrap.appendChild(imgFileInput);
   imgWrap.appendChild(imgPickBtn);
@@ -6164,7 +6301,13 @@ function openProduct(prod, rebuild) {
       variantsSectionWrap
     ),
     footer: [
-      h('button', { className: 'btn', onClick: () => { S.modal = null; render(); } }, 'Huỷ'),
+      h('button', { className: 'btn', onClick: () => {
+        // Dọn các ảnh MỚI đã upload trong lần sửa này nhưng không được lưu
+        // (vd: chọn ảnh rồi đổi ý bấm Huỷ) — tránh tích rác trên Storage.
+        // Ảnh GỐC (_origImagePath) không nằm trong danh sách này nên luôn an toàn.
+        _uploadedPathsThisSession.forEach(p => CLOUD.deleteImageFromStorage(p));
+        S.modal = null; render();
+      } }, 'Huỷ'),
       h('button', { className: 'btn btn-primary', onClick: () => {
         const nm = inpName.value.trim();
         const bp = inpBuy.value, sp = inpSell.value;
@@ -6185,6 +6328,7 @@ function openProduct(prod, rebuild) {
           buyPrice: parseFloat(bp)||0, sellPrice: parseFloat(sp)||0,
           description: taDesc.value.trim(),
           image: f.image || '',
+          imagePath: f.imagePath || '', // path file ảnh trên Firebase Storage (rỗng nếu ảnh base64 cũ / không có ảnh)
           qrCode: inpQrCode.value.trim(),
           thickness: f.thickness || 0,
           length: f.length || 0,
@@ -6193,7 +6337,12 @@ function openProduct(prod, rebuild) {
           variants: f.multiVariant ? f.variants : [] };
         const nowIso = new Date().toISOString();
         if (prod) { S.products = S.products.map(x => x.id === prod.id ? { ...x, ...p, _updated: nowIso } : x); toast('Đã cập nhật sản phẩm', 'success'); }
-        else { S.products = [...S.products, { ...p, id: 'p' + uid(), createdAt: nowIso, _updated: nowIso, _stockTx: [] }]; toast('Đã thêm sản phẩm mới', 'success'); }
+        else { S.products = [...S.products, { ...p, id: f.id, createdAt: nowIso, _updated: nowIso, _stockTx: [] }]; toast('Đã thêm sản phẩm mới', 'success'); }
+        // Lưu thành công thật → giờ mới xoá ảnh GỐC cũ trên Storage nếu ảnh đã đổi/bị xoá
+        // (trước lúc này ảnh gốc luôn được giữ nguyên, phòng trường hợp người dùng bấm Huỷ)
+        if (_origImagePath && _origImagePath !== p.imagePath) {
+          CLOUD.deleteImageFromStorage(_origImagePath);
+        }
         save('products'); S.modal = null; rebuild(); render();
       } }, '💾 Lưu')
     ]
@@ -12058,6 +12207,7 @@ function pgSync() {
         (() => {
           let cfgApiKey    = cloudCfg.apiKey    || '';
           let cfgProjectId = cloudCfg.projectId || '';
+          let cfgBucket    = cloudCfg.storageBucket || '';
           let cfgShopId    = cloudCfg.shopId    || 'shop1';
           let cfgEnabled   = cloudCfg.enabled   || false;
           let testMsg = '';
@@ -12065,6 +12215,7 @@ function pgSync() {
 
           const apiKeyInp   = h('input', { type: 'password', className: 'form-input', placeholder: 'AIzaSy...', value: cfgApiKey,    style: { fontFamily: 'monospace', fontSize: 12 }, onInput: e => { cfgApiKey    = e.target.value.trim(); } });
           const projectInp  = h('input', { type: 'text',     className: 'form-input', placeholder: 'my-project-id', value: cfgProjectId, style: { fontFamily: 'monospace', fontSize: 12 }, onInput: e => { cfgProjectId = e.target.value.trim(); } });
+          const bucketInp   = h('input', { type: 'text',     className: 'form-input', placeholder: '(tự xác định nếu để trống) — vd: my-project.firebasestorage.app', value: cfgBucket, style: { fontFamily: 'monospace', fontSize: 12 }, onInput: e => { cfgBucket = e.target.value.trim(); } });
           const shopIdInp   = h('input', { type: 'text',     className: 'form-input', placeholder: 'shop1',          value: cfgShopId,    style: { fontFamily: 'monospace', fontSize: 12 }, onInput: e => { cfgShopId    = e.target.value.trim() || 'shop1'; } });
 
           const statusDiv = h('div', { style: { marginTop: 8, fontSize: 12 } });
@@ -12091,7 +12242,7 @@ function pgSync() {
           } }, '🔌 Kiểm tra kết nối');
 
           const btnSave = h('button', { className: 'btn btn-primary btn-sm', onClick: () => {
-            CLOUD.saveCfg({ apiKey: cfgApiKey, projectId: cfgProjectId, shopId: cfgShopId, enabled: cfgEnabled });
+            CLOUD.saveCfg({ apiKey: cfgApiKey, projectId: cfgProjectId, storageBucket: cfgBucket, shopId: cfgShopId, enabled: cfgEnabled });
             toast(cfgEnabled ? '✅ Đã lưu cấu hình! Firebase sync đã bật.' : '💾 Đã lưu cấu hình (sync tắt).', 'success');
             rebuild();
           } }, '💾 Lưu cấu hình');
@@ -12249,6 +12400,10 @@ function pgSync() {
                 h('label', { className: 'form-label' }, 'Project ID'),
                 projectInp
               )
+            ),
+            h('div', { className: 'form-group' },
+              h('label', { className: 'form-label' }, 'Storage Bucket (tuỳ chọn — chỉ điền nếu lưu ảnh lên Firebase Storage bị lỗi tự xác định bucket)'),
+              bucketInp
             ),
             h('div', { className: 'form-group' },
               h('label', { className: 'form-label' }, 'Shop ID (phân biệt nhiều cửa hàng, mặc định "shop1")'),
