@@ -967,7 +967,20 @@ const CLOUD = (() => {
       // Pull full thành công có dữ liệu (hoặc baseline cũng đang rỗng — hợp lệ)
       // → gỡ cờ cảnh báo cũ của ĐÚNG collection này nếu có.
       if (_suspiciousPull && _suspiciousPull.name === name) _suspiciousPull = null;
-      return changed;
+      // ── FIX (mất sản phẩm vừa tạo): KHÔNG trả về cloud-only ──────────────
+      // Trước đây pull-full trả thẳng `changed` (CHỈ dữ liệu cloud). Vì bootApp
+      // reset S về rỗng rồi ghi đè localStorage bằng kết quả này, MỌI bản ghi
+      // LOCAL chưa kịp đẩy lên cloud (vừa tạo SP + nhập kho rồi thoát app ngay,
+      // hoặc đang offline/mạng chậm) sẽ bị XOÁ SẠCH. Đây chính là lỗi "tạo SP,
+      // nhập kho, out app vào lại mất SP".
+      // Sửa: ghép cloud ĐÈ LÊN baseline theo id (cloud thắng record trùng — kể
+      // cả tombstone _deleted nên KHÔNG hồi sinh record đã xoá), nhưng GIỮ các
+      // record local-only chưa có trên cloud để lần flush sau đẩy lên. Giống
+      // hành vi merge-vào-local của bản cũ (v7.9.8) đã chạy ổn định.
+      const fmap = {};
+      baseline.forEach(r => { if (r && r.id) fmap[r.id] = r; });
+      changed.forEach(r => { if (r && r.id) fmap[r.id] = r; });
+      return Object.values(fmap);
     }
 
     // Có cursor → ghép phần thay đổi vào baseline theo id (cloud luôn thắng)
@@ -1208,6 +1221,21 @@ const CLOUD = (() => {
     return null; // không hydrate được → bỏ qua
   }
 
+  // ── Lấy các bản ghi đang CHỜ đẩy lên cloud của 1 collection ──────────
+  // Dùng làm "lưới an toàn" cuối cùng trong bootSync: nếu cache localStorage
+  // (dtn_products...) bị mất nhưng hàng đợi đẩy (dtn_sync_queue) vẫn còn, các
+  // bản ghi local chưa đồng bộ vẫn được khôi phục thay vì biến mất.
+  function _queuedDocs(colName) {
+    try {
+      const out = [];
+      _syncQueue.filter(q => q.colName === colName).forEach(item => {
+        const hy = hydrateQueueItem(item);
+        if (hy && Array.isArray(hy.data)) hy.data.forEach(r => { if (r && r.id && !r._deleted) out.push(r); });
+      });
+      return out;
+    } catch(e) { return []; }
+  }
+
   async function flushQueue() {
     if (_flushing || !_online || !_db || _syncQueue.length === 0) return;
     _flushing = true;
@@ -1335,6 +1363,16 @@ const CLOUD = (() => {
       // _deleted records bị lọc ra luôn — chỉ giữ data còn sống.
       const _S = window._S || S_state;
 
+      // ── Lưới an toàn: ghép các bản ghi còn KẸT trong hàng đợi đẩy ───────
+      // (chưa xác nhận lên cloud) vào kết quả pull. Bảo vệ trường hợp cache
+      // localStorage bị mất nhưng hàng đợi vẫn còn — record local-only không
+      // bị rơi mất khi reset S lúc boot. _queuedDocs đã lọc bỏ _deleted.
+      const _qProducts = _queuedDocs('dtn_products');
+      if (_qProducts.length) {
+        const seen = new Set(products.map(r => r && r.id).filter(Boolean));
+        _qProducts.forEach(r => { if (!seen.has(r.id)) { products.push(r); seen.add(r.id); } });
+      }
+
       // Products: filter _deleted. KHÔNG còn tự gộp trùng tên (xem FIX #4).
       if (products.length) {
         const { products: mergedProds, reroutes, dupNames } = mergeProducts([], products); // base rỗng → products đã đại diện full cloud rồi
@@ -1356,13 +1394,22 @@ const CLOUD = (() => {
         }
       }
 
-      // Transactions: filter _deleted → ghi thẳng vào S
-      _S.imports     = imports.filter(r => r && !r._deleted);
-      _S.sales       = sales.filter(r => r && !r._deleted);
-      _S.returns     = returns.filter(r => r && !r._deleted);
-      _S.paymentlogs = paymentlogs.filter(r => r && !r._deleted);
-      _S.shipping    = shipping.filter(r => r && !r._deleted);
-      _S.cashflows   = cashflowsArr.filter(r => r && !r._deleted);
+      // Transactions: filter _deleted → ghi thẳng vào S.
+      // _mergeQueued: ghép thêm bản ghi còn kẹt trong hàng đợi đẩy (vd: phiếu
+      // nhập kho vừa tạo chưa kịp lên cloud) để không bị mất khi reset S.
+      const _mergeQueued = (arr, colName) => {
+        const q = _queuedDocs(colName);
+        if (!q.length) return arr;
+        const seen = new Set(arr.map(r => r && r.id).filter(Boolean));
+        q.forEach(r => { if (!seen.has(r.id)) { arr.push(r); seen.add(r.id); } });
+        return arr;
+      };
+      _S.imports     = _mergeQueued(imports.filter(r => r && !r._deleted),     'dtn_imports');
+      _S.sales       = _mergeQueued(sales.filter(r => r && !r._deleted),       'dtn_sales');
+      _S.returns     = _mergeQueued(returns.filter(r => r && !r._deleted),     'dtn_returns');
+      _S.paymentlogs = _mergeQueued(paymentlogs.filter(r => r && !r._deleted), 'dtn_paymentlogs');
+      _S.shipping    = _mergeQueued(shipping.filter(r => r && !r._deleted),    'dtn_shipping');
+      _S.cashflows   = _mergeQueued(cashflowsArr.filter(r => r && !r._deleted), 'dtn_cashflows');
 
       // Settings
       if (settingsArr.length > 0) {
@@ -2525,6 +2572,7 @@ function openPdfMobile(htmlContent, filename) {
 let _hbIv = null;
 let _visibilityHandler = null;
 let _hiddenAt = 0; // thời điểm tab/app bị ẩn — dùng để quyết định có cần restart listener không
+let _pagehideBound = false; // chỉ gắn listener 'pagehide' (flush queue khi đóng app) một lần
 const LISTENER_RESTART_THRESHOLD_MS = 3 * 60 * 1000; // chỉ restart nếu ẩn lâu hơn 3 phút
 
 // ═══════════════════════════════════════════════════════════════
@@ -2694,6 +2742,12 @@ async function bootApp() {
       _visibilityHandler = () => {
         if (document.hidden) {
           _hiddenAt = Date.now();
+          // FIX (mất SP khi thoát app ngay sau khi tạo): cố đẩy nốt hàng đợi
+          // NGAY khi app bị ẩn/đóng, để bản ghi vừa tạo kịp lên cloud trước khi
+          // hệ điều hành "ngủ"/huỷ tiến trình. Không chờ tới heartbeat 60s.
+          if (AUTH.currentUser() && cloudCfg.enabled && navigator.onLine) {
+            try { CLOUD.flushPending(); } catch(e) {}
+          }
           return;
         }
         if (AUTH.currentUser() && cloudCfg.enabled) {
@@ -2713,6 +2767,17 @@ async function bootApp() {
         }
       };
       document.addEventListener('visibilitychange', _visibilityHandler);
+      // FIX (mất SP khi đóng app): 'pagehide' bắn khi app thực sự bị đóng/điều
+      // hướng (đặc biệt trên iOS/Android home-screen webapp) — cố đẩy nốt queue
+      // lần cuối. Chỉ gắn 1 lần cho cả vòng đời trang.
+      if (!_pagehideBound) {
+        _pagehideBound = true;
+        window.addEventListener('pagehide', () => {
+          if (AUTH.currentUser() && cloudCfg.enabled && navigator.onLine) {
+            try { CLOUD.flushPending(); } catch(e) {}
+          }
+        });
+      }
     }
   }, 100);
 
@@ -3266,9 +3331,16 @@ function softDelete(arrayKey, id, extraFn) {
   // Push CHỈ record bị xoá lên cloud (không push lại toàn bộ mảng — tốn write quota)
   if (deletedRecord) {
     const withDeleted = [{ ...deletedRecord, _deleted: true, _updated: now }];
-    if (typeof CLOUD !== 'undefined' && CLOUD._pushDeletedRecord) {
-      CLOUD._pushDeletedRecord(dbMap[arrayKey], withDeleted);
-    } else if (typeof CLOUD !== 'undefined') {
+    // ── FIX (record đã xoá "sống lại"): đẩy tombstone QUA HÀNG ĐỢI thay vì
+    // _pushDeletedRecord (đẩy thẳng, không qua queue). Lý do:
+    //  1. Offline-safe: _pushDeletedRecord gọi pushCollection trực tiếp — nếu
+    //     đang offline/lỗi mạng thì lệnh xoá MẤT LUÔN (không retry), trong khi
+    //     bản "còn sống" vừa tạo vẫn nằm trong hàng đợi → khi online lại, bản
+    //     sống được đẩy lên → record xoá HỒI SINH trên cloud + mọi thiết bị.
+    //  2. enqueue gộp theo id (bản mới thắng) → tombstone GHI ĐÈ bản sống đang
+    //     chờ đẩy cùng id trong hàng đợi → không còn mâu thuẫn sống/xoá.
+    // CLOUD.push → enqueue → flush ngay nếu online, hoặc giữ lại retry nếu offline.
+    if (typeof CLOUD !== 'undefined') {
       CLOUD.push(dbMap[arrayKey], withDeleted);
     }
   }
