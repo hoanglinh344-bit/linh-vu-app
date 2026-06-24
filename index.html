@@ -5832,6 +5832,49 @@ function _compressImageToBlob(file, cb) {
   reader.readAsDataURL(file);
 }
 
+// ── Nén lại 1 ảnh base64 ĐÃ CÓ (data:image/...) cho vừa giới hạn Firestore ──
+// Dùng cho công cụ "Sửa ảnh chưa đồng bộ": ảnh cũ/nặng quá 900KB bị luồng sync
+// bỏ field image khi đẩy lên cloud → máy khác không nhận được ảnh. Vẽ lại ảnh
+// lên canvas, hạ kích thước + chất lượng để ra base64 nhỏ < MAX_BYTES, rồi lưu
+// đè để lần sync sau đẩy được lên cloud. cb(null) nếu ảnh hỏng/không đọc được
+// (caller giữ nguyên ảnh gốc, không làm mất dữ liệu).
+function _recompressDataUrl(dataUrl, cb) {
+  const MAX_DIM = 1000;
+  const MAX_BYTES = 550 * 1024; // nhỏ hơn ngưỡng drop 900KB nhiều để chắc chắn đồng bộ được
+  const img = new Image();
+  img.onload = function() {
+    try {
+      let w = img.width, h = img.height;
+      if (!w || !h) { cb(null); return; }
+      if (w > MAX_DIM || h > MAX_DIM) {
+        if (w >= h) { h = Math.round(h * MAX_DIM / w); w = MAX_DIM; }
+        else        { w = Math.round(w * MAX_DIM / h); h = MAX_DIM; }
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+      let q = 0.78;
+      let out = canvas.toDataURL('image/jpeg', q);
+      while (out.length > MAX_BYTES && q > 0.35) {
+        q -= 0.1;
+        out = canvas.toDataURL('image/jpeg', q);
+      }
+      if (out.length > MAX_BYTES) {
+        const c2 = document.createElement('canvas');
+        c2.width = Math.round(w * 0.6); c2.height = Math.round(h * 0.6);
+        c2.getContext('2d').drawImage(img, 0, 0, c2.width, c2.height);
+        out = c2.toDataURL('image/jpeg', 0.6);
+      }
+      // An toàn: nếu vì lý do nào đó kết quả KHÔNG nhỏ hơn bản gốc thì coi như
+      // không cải thiện → trả null để giữ nguyên ảnh cũ (không làm xấu đi).
+      if (!out || out.length >= dataUrl.length) { cb(null); return; }
+      cb(out);
+    } catch(e) { cb(null); }
+  };
+  img.onerror = function() { cb(null); };
+  img.src = dataUrl;
+}
+
 function openProduct(prod, rebuild) {
   const TYPES = ['Granite','Marble','Onyx','Basalt','Quartzite','Travertine','Slate','Serpentine','Khác'];
   const UNITS  = ['m²','tấm','tấn','viên','m³','kg','cái','bao'];
@@ -12506,6 +12549,58 @@ function pgSync() {
             render();
           } }, '🔧 Sửa tồn kho từ cloud');
 
+          // ── Sửa ảnh sản phẩm chưa đồng bộ (ảnh base64 quá khổ bị luồng sync
+          // bỏ qua → máy khác không nhận được ảnh). Nén nhỏ lại tại chỗ rồi đẩy
+          // lên Firebase. CHỈ làm việc trên dữ liệu LOCAL của máy này → phải
+          // chạy trên máy ĐANG hiển thị ảnh đúng. Không xoá/không làm rỗng ảnh.
+          const btnFixImages = h('button', { className: 'btn btn-sm', style: { background: 'rgba(91,143,232,0.18)', color: 'var(--blue)', borderColor: 'rgba(91,143,232,0.4)', fontWeight: 700 }, onClick: async () => {
+            if (!cloudCfg.enabled) { toast('Chưa bật Firebase sync!', 'error'); return; }
+            // Ngưỡng: luồng sync bỏ field image khi base64 > 900.000 ký tự (xem CLOUD.push).
+            // Lấy > 850.000 để gom cả ảnh sát giới hạn, tránh sót.
+            const THRESHOLD = 850000;
+            const targets = (S.products || []).filter(p =>
+              p && typeof p.image === 'string' && p.image.indexOf('data:') === 0 && p.image.length > THRESHOLD);
+            if (targets.length === 0) {
+              toast('✅ Máy này không có ảnh quá khổ nào — không cần sửa. Nếu máy kia vẫn thiếu ảnh, hãy chạy nút này trên máy ĐANG hiển thị ảnh ĐÚNG.', 'info');
+              return;
+            }
+            S.confirm = {
+              msg: '🖼️ Sửa ' + targets.length + ' ảnh quá khổ chưa đồng bộ?\n\n• Hãy chạy trên máy ĐANG hiển thị ảnh ĐÚNG (thường là máy tính).\n• Các ảnh nặng sẽ được NÉN NHỎ lại rồi đẩy lên Firebase để máy kia nhận được.\n• KHÔNG xoá sản phẩm, KHÔNG đụng tới ảnh nhỏ/bình thường.\n• Ảnh nào lỗi sẽ được giữ nguyên (không mất dữ liệu).',
+              onYes: async () => {
+                toast('⏳ Đang nén lại ' + targets.length + ' ảnh...', 'info');
+                let fixed = 0, failed = 0;
+                const fixedProducts = [];
+                for (const p of targets) {
+                  const newImg = await new Promise(res => _recompressDataUrl(p.image, res));
+                  if (!newImg) { failed++; continue; } // giữ nguyên ảnh gốc
+                  const updated = { ...p, image: newImg, _updated: new Date().toISOString() };
+                  S.products = S.products.map(x => x.id === p.id ? updated : x);
+                  fixedProducts.push(updated);
+                  fixed++;
+                }
+                if (fixedProducts.length === 0) {
+                  toast('❌ Không nén lại được ảnh nào (' + failed + ' lỗi). Dữ liệu giữ nguyên, không có gì thay đổi.', 'error');
+                  render();
+                  return;
+                }
+                // Lưu cache local trước (đề phòng đẩy cloud lỗi vẫn còn bản nén ở máy này)
+                try { if (typeof DB !== 'undefined') DB.set('dtn_products', S.products); } catch(e) {}
+                // Đẩy lên Firebase CHỜ XÁC NHẬN THẬT (không fire-and-forget)
+                const pushOk = await CLOUD.pushAwait('dtn_products', fixedProducts);
+                if (!pushOk) {
+                  toast('❌ Đã nén ảnh ở máy này NHƯNG đẩy lên Firebase THẤT BẠI — máy kia chưa nhận được. Kiểm tra mạng/đăng nhập rồi bấm lại nút này.', 'error');
+                  render();
+                  return;
+                }
+                // Đánh dấu đã push để save()/listener không hiểu nhầm là "còn thay đổi chưa đẩy"
+                if (typeof _seedLastPushed === 'function') _seedLastPushed('products', fixedProducts);
+                toast('✅ Đã nén & đồng bộ ' + fixed + ' ảnh' + (failed ? (' (' + failed + ' ảnh lỗi, giữ nguyên)') : '') + '. Mở app trên máy kia để kiểm tra.', 'success');
+                render();
+              }
+            };
+            render();
+          } }, '🖼️ Sửa ảnh chưa đồng bộ');
+
           const guideDiv = h('div', { style: { background: 'var(--bg3)', borderRadius: 'var(--r2)', padding: '10px 14px', fontSize: 12, color: 'var(--text2)', lineHeight: 1.7, marginTop: 12, borderLeft: '3px solid var(--blue)' } },
             h('b', { style: { color: 'var(--blue)' } }, '💡 Hướng dẫn lấy thông tin Firebase:'), h('br'),
             '1. Vào ', h('b', {}, 'console.firebase.google.com'), ' → Tạo project mới (miễn phí)', h('br'),
@@ -12537,7 +12632,7 @@ function pgSync() {
               shopIdInp
             ),
             toggleDiv,
-            h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } }, btnTest, btnSave, cloudCfg.enabled && btnSyncNow, cloudCfg.enabled && btnPull, cloudCfg.enabled && btnFixStock),
+            h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } }, btnTest, btnSave, cloudCfg.enabled && btnSyncNow, cloudCfg.enabled && btnPull, cloudCfg.enabled && btnFixStock, cloudCfg.enabled && btnFixImages),
             statusDiv,
             guideDiv
           );
