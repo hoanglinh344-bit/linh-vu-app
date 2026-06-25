@@ -944,6 +944,16 @@ const CLOUD = (() => {
     // array sẽ crash ở baseline.forEach. Coi baseline không-phải-array = rỗng
     // → tự động fallback full pull, không bao giờ crash bootSync.
     const baseline = Array.isArray(baselineRaw) ? baselineRaw : [];
+    // ── Rehydrate ảnh sản phẩm từ IndexedDB ──────────────────────
+    // localStorage (baseline) đã strip ảnh base64. Nạp lại ảnh từ IDB cho các
+    // bản ghi KHÔNG đổi. Doc cloud thay đổi vẫn GHI ĐÈ baseline theo id phía
+    // dưới → ảnh mới / xoá ảnh từ cloud đều thắng đúng (không hồi sinh ảnh cũ).
+    if (name === 'dtn_products' && typeof IMG !== 'undefined' && IMG.available() && baseline.length) {
+      try {
+        const _imgs = await IMG.getAll();
+        baseline.forEach(p => { if (p && p.id && !p.image && _imgs[p.id]) p.image = _imgs[p.id]; });
+      } catch(e) {}
+    }
     const useFull = !!forceFull || baseline.length === 0;
     const cursor = useFull ? '' : _getCursor(name);
 
@@ -1333,6 +1343,13 @@ const CLOUD = (() => {
         _S.returns     = DB.get('dtn_returns',     []);
         _S.paymentlogs = DB.get('dtn_paymentlogs', []);
         _S.cashflows   = DB.get('dtn_cashflows',   []);
+        // Rehydrate ảnh sản phẩm từ IndexedDB (localStorage đã strip base64)
+        try {
+          if (typeof IMG !== 'undefined' && IMG.available() && _S.products && _S.products.length) {
+            const _imgs = await IMG.getAll();
+            _S.products.forEach(p => { if (p && p.id && !p.image && _imgs[p.id]) p.image = _imgs[p.id]; });
+          }
+        } catch(e) {}
       }
       _bootDone = true;
       return false;
@@ -1496,6 +1513,13 @@ const CLOUD = (() => {
         _S.returns     = DB.get('dtn_returns',     []);
         _S.paymentlogs = DB.get('dtn_paymentlogs', []);
         _S.cashflows   = DB.get('dtn_cashflows',   []);
+        // Rehydrate ảnh sản phẩm từ IndexedDB (localStorage đã strip base64)
+        try {
+          if (typeof IMG !== 'undefined' && IMG.available() && _S.products && _S.products.length) {
+            const _imgs = await IMG.getAll();
+            _S.products.forEach(p => { if (p && p.id && !p.image && _imgs[p.id]) p.image = _imgs[p.id]; });
+          }
+        } catch(e) {}
       }
       _syncStatus = 'error';
       _bootDone = true;
@@ -2686,6 +2710,33 @@ function warnIfStuckUnsynced() {
   } catch(e) {}
 }
 
+// ── Migration 1 lần: chuyển ảnh base64 đang nằm trong localStorage sang
+//    IndexedDB. AN TOÀN (R6): chỉ strip localStorage SAU KHI đã ghi IDB
+//    thành công VÀ verify đọc lại được — nếu chưa chắc thì để nguyên, thử
+//    lại lần boot sau (không bao giờ mất ảnh giữa chừng).
+async function _migrateImagesToIDB() {
+  try {
+    if (typeof IMG === 'undefined' || !IMG.available()) return; // không có IDB → giữ LS như cũ
+    await IMG.ready();
+    if (localStorage.getItem('dtn_img_migrated') === '1') return;
+    const prods = DB.get('dtn_products', []); // bản LS hiện tại (format cũ, còn ảnh base64)
+    if (Array.isArray(prods) && prods.length) {
+      const imgMap = {};
+      prods.forEach(p => { if (p && p.id && typeof p.image === 'string' && p.image.indexOf('data:') === 0) imgMap[p.id] = p.image; });
+      const ids = Object.keys(imgMap);
+      if (ids.length) {
+        const ok = await IMG.setMany(imgMap);
+        if (!ok) return; // ghi IDB thất bại → KHÔNG strip, giữ ảnh trong LS, thử lại sau
+        const check = await IMG.getAll();
+        if (!ids.every(id => check[id])) return; // verify chưa chắc → không strip
+        DB.set('dtn_products', prods); // DB.set tự strip ảnh khỏi LS (IDB đã có)
+        console.info('[IMG] Đã migrate', ids.length, 'ảnh sản phẩm sang IndexedDB');
+      }
+    }
+    localStorage.setItem('dtn_img_migrated', '1');
+  } catch(e) { console.warn('[IMG] migration error:', e); }
+}
+
 async function bootApp() {
   _raf = false;
   const root = document.getElementById('app');
@@ -2698,6 +2749,9 @@ async function bootApp() {
 
   // ── Pull Firebase → ghi thẳng vào S → cache xuống local ──
   window._S = S; // cần cho applyCloudData (realtime listener dùng sau này)
+  // Mở IndexedDB + migrate ảnh từ localStorage sang IDB TRƯỚC khi bootSync
+  // đọc baseline (để pull đọc đúng cache đã chuẩn hoá).
+  await _migrateImagesToIDB();
   const cloudCfg = CLOUD.getCfg();
   if (root) root.innerHTML = `<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg,#0f1117)">
     <div style="text-align:center;color:#9a9590">
@@ -2848,8 +2902,107 @@ function startAutoLogoutTimer() {
 // ═══════════════════════════════════════════════════════════════
 //  STORAGE — localStorage + LZ-String compression + quota guard
 // ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+//  IMG — kho ẢNH sản phẩm trong IndexedDB (tách khỏi localStorage)
+//
+//  Vì sao: ảnh base64 (~500KB/ảnh) nhồi vào localStorage 5MB gây TRÀN
+//  quota → DB.set thất bại ÂM THẦM → ảnh không được cache → out app vào
+//  lại MẤT ảnh trên máy (điện thoại vẫn có vì kéo từ cloud). IndexedDB có
+//  hạn mức hàng trăm MB → chứa ảnh thoải mái. localStorage giờ CHỈ giữ
+//  phần text nhẹ của sản phẩm (đã strip ảnh base64).
+//
+//  Thiết kế: 1 store 'images', key = product.id, value = dataURL (string).
+//  Firestore VẪN lưu base64 inline trong product doc (KHÔNG đổi) → điện
+//  thoại/máy khác không bị ảnh hưởng; IndexedDB chỉ là CACHE bền cục bộ.
+//  Nếu IndexedDB không khả dụng → available()=false, DB.set quay về hành
+//  vi cũ (giữ ảnh trong localStorage) để không vỡ app.
+// ═══════════════════════════════════════════════════════════
+const IMG = (() => {
+  const DB_NAME = 'dtn_images';
+  const STORE   = 'images';
+  let _idb = null;
+  let _ready = null;
+  let imgOk = (typeof indexedDB !== 'undefined' && indexedDB !== null);
+
+  function open() {
+    if (_ready) return _ready;
+    _ready = new Promise((resolve) => {
+      if (!imgOk) { resolve(null); return; }
+      try {
+        const req = indexedDB.open(DB_NAME, 1);
+        req.onupgradeneeded = () => { try { req.result.createObjectStore(STORE); } catch(e) {} };
+        req.onsuccess = () => { _idb = req.result; resolve(_idb); };
+        req.onerror   = () => { imgOk = false; resolve(null); };
+        req.onblocked = () => { resolve(null); };
+      } catch(e) { imgOk = false; resolve(null); }
+    });
+    return _ready;
+  }
+
+  return {
+    available() { return imgOk; },
+    ready: open,
+
+    // Đọc TẤT CẢ ảnh → { id: dataURL }. Không bao giờ throw.
+    async getAll() {
+      const db = await open();
+      if (!db) return {};
+      return new Promise((resolve) => {
+        const out = {};
+        try {
+          const req = _idb.transaction(STORE, 'readonly').objectStore(STORE).openCursor();
+          req.onsuccess = (e) => {
+            const cur = e.target.result;
+            if (cur) { out[cur.key] = cur.value; cur.continue(); }
+            else resolve(out);
+          };
+          req.onerror = () => resolve(out);
+        } catch(e) { resolve(out); }
+      });
+    },
+
+    // Ghi nhiều ảnh: map = { id: dataURL }. Trả về Promise<bool> thành công.
+    async setMany(map) {
+      const db = await open();
+      if (!db) return false;
+      const ids = Object.keys(map || {});
+      if (ids.length === 0) return true;
+      return new Promise((resolve) => {
+        try {
+          const t = _idb.transaction(STORE, 'readwrite');
+          const store = t.objectStore(STORE);
+          ids.forEach(id => { try { store.put(map[id], id); } catch(e) {} });
+          t.oncomplete = () => resolve(true);
+          t.onerror    = () => resolve(false);
+          t.onabort    = () => resolve(false);
+        } catch(e) { resolve(false); }
+      });
+    },
+
+    // Xoá ảnh theo id (hoặc mảng id). Trả về Promise.
+    async del(ids) {
+      const db = await open();
+      if (!db) return;
+      const arr = Array.isArray(ids) ? ids : [ids];
+      if (arr.length === 0) return;
+      return new Promise((resolve) => {
+        try {
+          const t = _idb.transaction(STORE, 'readwrite');
+          const store = t.objectStore(STORE);
+          arr.forEach(id => { try { store.delete(id); } catch(e) {} });
+          t.oncomplete = () => resolve();
+          t.onerror    = () => resolve();
+        } catch(e) { resolve(); }
+      });
+    },
+  };
+})();
+
 const DB = (() => {
   const mem = {};
+  // Theo dõi ảnh đã ghi vào IndexedDB (id → dataURL) để CHỈ ghi ảnh thay đổi,
+  // tránh ghi lại toàn bộ ảnh mỗi lần save('products') (mỗi lần bán/nhập kho).
+  const _imgWritten = {};
   let lsOk = false;
   const APP_VERSION = '3.10.1';
   const KEYS = ['dtn_products','dtn_imports','dtn_sales','dtn_shipping','dtn_settings','dtn_returns','dtn_paymentlogs','dtn_cashflows'];
@@ -2927,11 +3080,41 @@ const DB = (() => {
 
     // Trả về true = lưu OK, false = lưu thất bại (quota đầy)
     set(k, v) {
-      mem[k] = v; // Luôn giữ in-memory
+      mem[k] = v; // Luôn giữ in-memory BẢN ĐẦY ĐỦ (còn ảnh) — export/backup dùng
       if (!lsOk) return true; // in-memory only, chấp nhận
+      // ── Tách ảnh sản phẩm sang IndexedDB ──────────────────────
+      // localStorage chỉ giữ phần text nhẹ → KHÔNG bao giờ tràn vì ảnh base64.
+      // Chỉ strip ảnh dạng data: (base64); ảnh dạng URL http (Storage) nhẹ, giữ.
+      // Ảnh vẫn còn ở mem (RAM) + S.products (RAM) + cloud → không mất.
+      if (k === 'dtn_products' && IMG.available() && Array.isArray(v)) {
+        const imgMap = {};   // ảnh cần GHI (mới/đổi so với lần ghi trước)
+        const delIds = [];   // ảnh cần XOÁ (sản phẩm còn đó nhưng đã gỡ ảnh)
+        const stripped = v.map(p => {
+          if (p && p.id && typeof p.image === 'string' && p.image.indexOf('data:') === 0) {
+            if (_imgWritten[p.id] !== p.image) imgMap[p.id] = p.image; // chỉ ghi nếu đổi
+            return { ...p, image: '' }; // bản ghi LS không chứa base64
+          }
+          // Sản phẩm còn trong mảng nhưng KHÔNG còn ảnh base64 → nếu trước có thì xoá khỏi IDB
+          if (p && p.id && _imgWritten[p.id] !== undefined) delIds.push(p.id);
+          return p;
+        });
+        if (Object.keys(imgMap).length) {
+          // fire-and-forget (cloud là nguồn dự phòng nếu IDB lỗi); chỉ đánh dấu đã-ghi khi thành công
+          IMG.setMany(imgMap).then(ok => { if (ok) Object.keys(imgMap).forEach(id => { _imgWritten[id] = imgMap[id]; }); });
+        }
+        if (delIds.length) { IMG.del(delIds); delIds.forEach(id => { delete _imgWritten[id]; }); }
+        return lsSet(k, encode(stripped));
+      }
       const encoded = encode(v);
       const ok = lsSet(k, encoded);
       return ok;
+    },
+
+    // Như get() nhưng ưu tiên bản RAM ĐẦY ĐỦ (mem) nếu có — dùng cho luồng
+    // restore/import: localStorage đã strip ảnh, nhưng mem giữ products còn ảnh.
+    getFull(k, def) {
+      if (mem[k] != null) return mem[k];
+      return this.get(k, def);
     },
 
     isLocal() { return lsOk; },
@@ -2960,12 +3143,14 @@ const DB = (() => {
 
     exportAll() {
       const obj = { _version: APP_VERSION, _exported: new Date().toISOString(), _device: navigator.userAgent.includes('iPhone') ? 'iPhone' : navigator.userAgent.includes('Mac') ? 'Mac' : 'Other' };
-      KEYS.forEach(k => { const v = this.get(k, null); if (v) obj[k] = v; });
+      // dtn_products: lấy từ mem (BẢN ĐẦY ĐỦ còn ảnh) vì localStorage đã strip ảnh
+      KEYS.forEach(k => { const v = (k === 'dtn_products' && mem[k] != null) ? mem[k] : this.get(k, null); if (v) obj[k] = v; });
       return JSON.stringify(obj, null, 2);
     },
     exportCompact() {
       const obj = { _v: APP_VERSION, _t: Date.now() };
-      KEYS.forEach(k => { const v = this.get(k, null); if (v) obj[k] = v; });
+      // dtn_products: lấy từ mem (BẢN ĐẦY ĐỦ còn ảnh) vì localStorage đã strip ảnh
+      KEYS.forEach(k => { const v = (k === 'dtn_products' && mem[k] != null) ? mem[k] : this.get(k, null); if (v) obj[k] = v; });
       return JSON.stringify(obj);
     },
     importAll(json) {
@@ -3186,7 +3371,8 @@ const SEED = {
 // ─── Helper: reload toàn bộ state từ DB sau khi import/restore ──
 // Dùng ở tất cả các restore flow để đảm bảo đồng bộ, không bỏ sót field
 function reloadStateFromDB() {
-  S.products    = DB.get('dtn_products',    SEED.products);
+  // getFull: lấy products còn ảnh từ mem (localStorage đã strip ảnh sang IDB)
+  S.products    = DB.getFull('dtn_products', SEED.products);
   S.imports     = DB.get('dtn_imports',     SEED.imports);
   S.sales       = DB.get('dtn_sales',       SEED.sales);
   S.shipping    = DB.get('dtn_shipping',    SEED.shipping);
@@ -3327,6 +3513,8 @@ function softDelete(arrayKey, id, extraFn) {
   S[arrayKey] = S[arrayKey].filter(r => r.id !== id);
   const dbMap = {products:'dtn_products',imports:'dtn_imports',sales:'dtn_sales',shipping:'dtn_shipping',returns:'dtn_returns',paymentlogs:'dtn_paymentlogs',cashflows:'dtn_cashflows'};
   if (dbMap[arrayKey]) DB.set(dbMap[arrayKey], S[arrayKey]);
+  // Sản phẩm bị xoá → dọn ảnh khỏi IndexedDB (tránh ảnh mồ côi)
+  if (arrayKey === 'products') { try { if (typeof IMG !== 'undefined') IMG.del(id); } catch(e) {} }
   if (typeof extraFn === 'function') extraFn();
   // Push CHỈ record bị xoá lên cloud (không push lại toàn bộ mảng — tốn write quota)
   if (deletedRecord) {
@@ -4426,6 +4614,7 @@ const ALL_PAGES = [
   {id:'shiptrack',label:'Vận Chuyển', icon:'🚛', adminOnly: true,  staffVisible: false},
   {id:'debt',     label:'Công nợ',     icon:'💳', adminOnly: true,  staffVisible: true},
   {id:'invoice',  label:'Hoá đơn',     icon:'📄', adminOnly: true,  staffVisible: true},
+  {id:'xuatkho',  label:'Phiếu Xuất Kho', icon:'📦', adminOnly: true,  staffVisible: true},
   {id:'quotation',label:'Báo Giá',     icon:'💰', adminOnly: false,  staffVisible: true},
   {id:'bienban',  label:'Biên Bản GN', icon:'📋', adminOnly: false,  staffVisible: true},
   {id:'hopdong',  label:'Hợp Đồng',    icon:'📝', adminOnly: false,  staffVisible: true},
@@ -4535,6 +4724,7 @@ function buildApp() {
     staffreport: pgStaffReport,
     vatrpt: pgVatReport,
     search: pgSearch,
+    xuatkho: pgXuatKho,
     accounts: pgAccounts, settings: pgSettings, sync: pgSync, recovery: pgRecovery };
   const content = (pageMap[safePage] || pgDashboard)();
 
@@ -6513,6 +6703,8 @@ function openProduct(prod, rebuild) {
         if (_origImagePath && _origImagePath !== p.imagePath) {
           CLOUD.deleteImageFromStorage(_origImagePath);
         }
+        // Ảnh bị gỡ khỏi sản phẩm → xoá khỏi IndexedDB để rehydrate không hồi sinh ảnh cũ
+        try { if (typeof IMG !== 'undefined' && !p.image) IMG.del(prod ? prod.id : f.id); } catch(e) {}
         save('products'); S.modal = null; rebuild(); render();
       } }, '💾 Lưu')
     ]
@@ -10045,6 +10237,251 @@ ${autoprint ? '<scr'+'ipt>document.title=" ";var _t=document.title;window.addEve
           )
         ),
         h('div', { style:{ flex:1, minWidth:'280px' } }, preview)
+      )
+    ));
+  };
+  rebuild();
+  return wrap;
+}
+
+// ── PHIẾU XUẤT KHO ────────────────────────────────────────────
+// Lập phiếu xuất kho dựa trên đơn hàng đã bán.
+// Chỉ thể hiện: hình ảnh, số lượng, ghi chú riêng từng sản phẩm — KHÔNG có giá bán.
+function pgXuatKho() {
+  const wrap = h('div', {});
+  let selectedGroup = null, search = '';
+  // Ghi chú riêng cho từng dòng sản phẩm: { [itemId]: text }
+  const notes = {};
+  const esc = s => s ? String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') : '';
+
+  // Gộp các bản ghi bán hàng thành nhóm đơn hàng (giống pgInvoice)
+  function buildOrderGroups(sales) {
+    const groupMap = {};
+    sales.forEach(s => {
+      const key = s.orderId || s.id;
+      if (!groupMap[key]) {
+        groupMap[key] = {
+          groupId: key, orderId: s.orderId || null, date: s.date,
+          customer: s.customer, phone: s.phone || '', address: s.address || '',
+          note: s.note || '', staffName: s.staffName, items: [], status: 'done'
+        };
+      }
+      groupMap[key].items.push(s);
+      if (s.status !== 'done') groupMap[key].status = 'debt';
+    });
+    return Object.values(groupMap).sort((a, b) => b.date.localeCompare(a.date));
+  }
+
+  // Lấy ảnh sản phẩm (ưu tiên ảnh trong kho theo productId)
+  function prodImage(item) {
+    const p = (S.products || []).find(p => p.id === item.productId);
+    return (p && p.image) || item.image || '';
+  }
+
+  // Ô ghi chú (persistent DOM → không mất focus / không cắt tiếng Việt)
+  function noteInput(itemId) {
+    const ta = document.createElement('textarea');
+    ta.className = 'form-input';
+    ta.rows = 2;
+    ta.placeholder = 'Ghi chú cho sản phẩm này...';
+    ta.style.cssText = 'width:100%;min-width:130px;resize:vertical;font-size:12px;line-height:1.5';
+    ta.value = notes[itemId] || '';
+    // Chỉ lưu vào state, KHÔNG rebuild → giữ con trỏ
+    ta.addEventListener('input', e => { notes[itemId] = e.target.value; });
+    return ta;
+  }
+
+  // ── HTML in / xuất PDF ──────────────────────────────────────
+  function buildXuatKhoHTML(grp, autoprint) {
+    const slipNo = (grp.items.length === 1 ? grp.items[0].id : (grp.orderId || grp.groupId)).toUpperCase();
+    const totalQty = grp.items.reduce((a, s) => a + (parseFloat(s.qty) || 0), 0);
+    const rowsHTML = grp.items.map((s, idx) => {
+      const img = prodImage(s);
+      const imgCell = img
+        ? `<img src="${img}" style="width:74px;height:74px;object-fit:cover;border:1px solid #ccc;border-radius:4px;display:block;margin:0 auto">`
+        : `<div style="width:74px;height:74px;border:1px dashed #ccc;border-radius:4px;display:flex;align-items:center;justify-content:center;color:#bbb;font-size:10px;margin:0 auto">Không ảnh</div>`;
+      return `<tr>
+        <td class="c">${idx + 1}</td>
+        <td class="c">${imgCell}</td>
+        <td><b>${esc(s.productName)}</b>${s.variantSize ? ' <span style="color:#888;font-size:11px">(' + esc(s.variantSize) + ')</span>' : ''}</td>
+        <td class="c">${esc(s.unit) || ''}</td>
+        <td class="c"><b>${s.qty || '—'}</b></td>
+        <td>${esc(notes[s.id] || '').replace(/\n/g, '<br>')}</td>
+      </tr>`;
+    }).join('');
+    return `<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>Phiếu Xuất Kho - ${esc(grp.customer)}</title>
+<style>
+* { box-sizing:border-box; margin:0; padding:0; }
+body { font-family:'Times New Roman',Times,serif; font-size:13px; color:#000; background:#fff; }
+.page { max-width:790px; margin:0 auto; padding:24px 30px; }
+.header { display:flex; justify-content:space-between; align-items:flex-start; padding-bottom:14px; border-bottom:2px solid #555; margin-bottom:6px; }
+.shop-name { font-size:18px; font-weight:700; }
+.shop-info { font-size:11px; color:#555; margin-top:3px; line-height:1.7; }
+h2 { text-align:center; font-size:18px; font-weight:700; letter-spacing:1.5px; margin:14px 0 4px; text-transform:uppercase; }
+.slip-meta { text-align:center; font-size:12px; font-style:italic; color:#444; margin-bottom:12px; }
+.cust { background:#f6f6f6; border:1px solid #ddd; border-radius:5px; padding:8px 12px; margin-bottom:12px; font-size:12.5px; line-height:1.9; }
+table { width:100%; border-collapse:collapse; font-size:12.5px; margin-bottom:8px; }
+th,td { border:1px solid #555; padding:6px 8px; vertical-align:middle; }
+thead th { background:#eee; font-weight:700; text-align:center; font-size:11.5px; }
+td.c { text-align:center; }
+.totrow { font-weight:700; background:#f0f0f0; }
+.sigs { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:30px; text-align:center; }
+.sig-t { font-weight:700; font-size:12.5px; text-transform:uppercase; }
+.sig-n { font-size:11px; font-style:italic; color:#666; margin:3px 0 60px; }
+@media print { @page{size:A4;margin:8mm 10mm;} body{print-color-adjust:exact;-webkit-print-color-adjust:exact;} }
+</style></head><body><div class="page">
+  <div class="header">
+    <div>
+      <div class="shop-name">${esc(S.settings.shopName) || 'Đá Tự Nhiên'}</div>
+      <div class="shop-info">${esc(S.settings.address) || ''}<br>${esc(S.settings.phone) || ''}${S.settings.email ? ' | ' + esc(S.settings.email) : ''}${S.settings.taxId ? '<br>MST: ' + esc(S.settings.taxId) : ''}</div>
+    </div>
+  </div>
+  <h2>Phiếu Xuất Kho</h2>
+  <div class="slip-meta">Số: <b>${slipNo}</b> &nbsp;—&nbsp; Ngày: <b>${fmtD(grp.date)}</b></div>
+  <div class="cust">
+    <b>Người nhận hàng:</b> ${esc(grp.customer) || '..............................'}${grp.phone ? ' &nbsp;|&nbsp; <b>SĐT:</b> ' + esc(grp.phone) : ''}<br>
+    ${grp.address ? '<b>Địa chỉ:</b> ' + esc(grp.address) + '<br>' : ''}<b>Lý do xuất kho:</b> Xuất giao hàng theo đơn bán
+  </div>
+  <table>
+    <thead><tr>
+      <th style="width:34px">STT</th>
+      <th style="width:90px">Hình ảnh</th>
+      <th>Tên sản phẩm</th>
+      <th style="width:60px">ĐVT</th>
+      <th style="width:60px">Số lượng</th>
+      <th style="width:200px">Ghi chú</th>
+    </tr></thead>
+    <tbody>
+      ${rowsHTML}
+      <tr class="totrow"><td class="c" colspan="4">Tổng số lượng</td><td class="c">${fmt(totalQty)}</td><td></td></tr>
+    </tbody>
+  </table>
+  <div class="sigs">
+    <div><div class="sig-t">Người lập phiếu</div><div class="sig-n">(Ký, ghi rõ họ tên)</div></div>
+    <div><div class="sig-t">Thủ kho</div><div class="sig-n">(Ký, ghi rõ họ tên)</div></div>
+    <div><div class="sig-t">Người nhận hàng</div><div class="sig-n">(Ký, ghi rõ họ tên)</div></div>
+  </div>
+</div>
+${autoprint ? '<scr' + 'ipt>window.onload=function(){window.print()};<\/scr' + 'ipt>' : ''}
+</body></html>`;
+  }
+
+  const rebuild = () => {
+    const { sales } = S;
+    const currentUser = AUTH.currentUser();
+    const isAdmin = currentUser && currentUser.role === 'admin';
+    const mySales = isAdmin ? sales : sales.filter(s => s.staffId === currentUser.username);
+    const q = search.toLowerCase();
+    const filteredSales = mySales.filter(s =>
+      (s.customer || '').toLowerCase().includes(q) ||
+      (s.productName || '').toLowerCase().includes(q) ||
+      (s.orderId || '').toLowerCase().includes(q)
+    );
+    const groups = buildOrderGroups(filteredSales);
+    if (selectedGroup && !groups.find(g => g.groupId === selectedGroup.groupId)) selectedGroup = null;
+
+    // ── Preview phiếu xuất kho ──
+    let preview;
+    if (selectedGroup) {
+      const grp = selectedGroup;
+      const totalQty = grp.items.reduce((a, s) => a + (parseFloat(s.qty) || 0), 0);
+
+      const slipEl = h('div', { style: { background: '#fff', color: '#111', borderRadius: 'var(--r)', padding: '22px', fontSize: 13, lineHeight: 1.7 } },
+        h('div', { style: { textAlign: 'center', borderBottom: '2px solid #ccc', paddingBottom: 12, marginBottom: 14 } },
+          h('div', { style: { fontSize: 18, fontWeight: 700, color: '#333' } }, 'PHIẾU XUẤT KHO'),
+          h('div', { style: { fontSize: 12, color: '#666', marginTop: 4 } },
+            'Số: ', h('b', {}, (grp.items.length === 1 ? grp.items[0].id : (grp.orderId || grp.groupId)).toUpperCase()),
+            ' · Ngày: ', h('b', {}, fmtD(grp.date)))
+        ),
+        h('div', { style: { background: '#faf7f0', borderRadius: 6, padding: '10px 14px', marginBottom: 14, fontSize: 12.5, color: '#333' } },
+          h('b', {}, 'Người nhận: '), grp.customer || '—',
+          grp.phone ? [' | ', h('b', {}, 'SĐT: '), grp.phone] : null,
+          grp.address ? [h('br'), h('b', {}, 'Địa chỉ: '), grp.address] : null
+        ),
+        h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12.5, color: '#111' } },
+          h('thead', {}, h('tr', { style: { background: '#f0ece4' } },
+            h('th', { style: { padding: '8px', textAlign: 'center', color: '#555', fontWeight: 600, border: '1px solid #ddd' } }, 'STT'),
+            h('th', { style: { padding: '8px', textAlign: 'center', color: '#555', fontWeight: 600, border: '1px solid #ddd' } }, 'Hình ảnh'),
+            h('th', { style: { padding: '8px', textAlign: 'left', color: '#555', fontWeight: 600, border: '1px solid #ddd' } }, 'Sản phẩm'),
+            h('th', { style: { padding: '8px', textAlign: 'center', color: '#555', fontWeight: 600, border: '1px solid #ddd' } }, 'ĐVT'),
+            h('th', { style: { padding: '8px', textAlign: 'center', color: '#555', fontWeight: 600, border: '1px solid #ddd' } }, 'SL'),
+            h('th', { style: { padding: '8px', textAlign: 'left', color: '#555', fontWeight: 600, border: '1px solid #ddd' } }, 'Ghi chú')
+          )),
+          h('tbody', {},
+            ...grp.items.map((s, idx) => {
+              const img = prodImage(s);
+              const imgCell = img
+                ? h('img', { src: img, style: { width: '60px', height: '60px', objectFit: 'cover', borderRadius: 4, border: '1px solid #ddd', display: 'block', margin: '0 auto' } })
+                : h('div', { style: { width: '60px', height: '60px', border: '1px dashed #ccc', borderRadius: 4, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#bbb', fontSize: 10, margin: '0 auto' } }, '📷');
+              return h('tr', {},
+                h('td', { style: { padding: '8px', border: '1px solid #eee', textAlign: 'center', color: '#555' } }, String(idx + 1)),
+                h('td', { style: { padding: '8px', border: '1px solid #eee', textAlign: 'center' } }, imgCell),
+                h('td', { style: { padding: '8px', border: '1px solid #eee', fontWeight: 500 } }, s.productName + (s.variantSize ? ' (' + s.variantSize + ')' : '')),
+                h('td', { style: { padding: '8px', border: '1px solid #eee', textAlign: 'center', color: '#555' } }, s.unit || '—'),
+                h('td', { style: { padding: '8px', border: '1px solid #eee', textAlign: 'center', fontWeight: 700 } }, s.qty || '—'),
+                h('td', { style: { padding: '8px', border: '1px solid #eee', minWidth: 150 } }, noteInput(s.id))
+              );
+            }),
+            h('tr', { style: { background: '#f0ece4', fontWeight: 700 } },
+              h('td', { style: { padding: '8px', border: '1px solid #ddd', textAlign: 'center' }, colSpan: 4 }, 'Tổng số lượng'),
+              h('td', { style: { padding: '8px', border: '1px solid #ddd', textAlign: 'center' } }, fmt(totalQty)),
+              h('td', { style: { padding: '8px', border: '1px solid #ddd' } }, '')
+            )
+          )
+        )
+      );
+
+      preview = h('div', {},
+        h('div', { style: { fontSize: 11, color: 'var(--text3)', marginBottom: 10, fontStyle: 'italic' } },
+          '💡 Nhập ghi chú cho từng sản phẩm vào bảng bên dưới rồi bấm In / Xuất PDF. Phiếu không hiển thị giá bán.'),
+        slipEl,
+        h('div', { style: { marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' } },
+          h('button', { className: 'btn btn-primary', onClick: () => {
+            openPdfMobile(buildXuatKhoHTML(grp, true), 'Phiếu xuất kho - ' + (grp.customer || ''));
+          } }, '🖨️ In phiếu'),
+          h('button', { className: 'btn', onClick: () => {
+            openPdfMobile(buildXuatKhoHTML(grp, false), 'Phiếu xuất kho PDF - ' + (grp.customer || ''));
+          } }, '📄 Xuất PDF')
+        )
+      );
+    } else {
+      preview = h('div', { className: 'empty', style: { paddingTop: 60 } },
+        h('div', { className: 'empty-icon' }, '📦'),
+        h('div', {}, 'Chọn một đơn hàng đã bán để lập phiếu xuất kho')
+      );
+    }
+
+    wrap.innerHTML = '';
+    wrap.appendChild(h('div', {},
+      h('div', { className: 'page-header' },
+        h('div', {},
+          h('div', { className: 'page-title' }, '📦 Phiếu Xuất Kho'),
+          h('div', { className: 'page-sub' }, 'Lập phiếu xuất kho theo đơn đã bán · Hình ảnh + số lượng + ghi chú · Không có giá')
+        )
+      ),
+      h('div', { style: { display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-start' } },
+        h('div', { style: { minWidth: '260px', flex: '0 0 280px' } },
+          inp('text', '🔍 Tìm đơn hàng...', search, v => { search = v; rebuild(); }, { style: { marginBottom: 10 } }),
+          h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, maxHeight: '520px', overflowY: 'auto' } },
+            ...groups.map(grp => h('div', {
+              style: { padding: '12px 14px', background: selectedGroup?.groupId === grp.groupId ? 'var(--bg4)' : 'var(--bg2)', border: `1px solid ${selectedGroup?.groupId === grp.groupId ? 'var(--accent)' : 'var(--border)'}`, borderRadius: 'var(--r2)', cursor: 'pointer', transition: 'all .15s' },
+              onClick: () => { selectedGroup = grp; rebuild(); }
+            },
+              h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
+                h('span', { style: { fontWeight: 600 } }, grp.customer),
+                h('span', { className: 'badge badge-' + (grp.status === 'done' ? 'green' : 'red') }, grp.status === 'done' ? 'Xong' : 'Nợ')
+              ),
+              h('div', { style: { fontSize: 11, color: 'var(--text2)', marginTop: 4 } },
+                grp.items.length > 1
+                  ? grp.items.length + ' sản phẩm · ' + fmtD(grp.date)
+                  : (grp.items[0]?.productName || '') + ' · ' + fmtD(grp.date)
+              )
+            )),
+            groups.length === 0 && h('div', { className: 'empty' }, 'Không có đơn hàng')
+          )
+        ),
+        h('div', { style: { flex: 1, minWidth: '280px' } }, preview)
       )
     ));
   };
