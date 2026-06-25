@@ -9190,6 +9190,200 @@ function openSale(rebuild, preselectedProduct) {
   _raf = false; render(); // Force render ngay — bỏ qua debounce để modal hiện tức thì
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  XUẤT CÔNG NỢ KHÁCH HÀNG — PDF hoặc Excel
+//  custList: [{ name, phone, orders:[saleRecord] }]
+//  Chi tiết từng mặt hàng: ngày mua, tên SP, SL, đơn giá, thành tiền,
+//  đã thanh toán, còn nợ, địa chỉ công trình.
+// ═══════════════════════════════════════════════════════════════
+// Lọc các đơn còn nợ của 1 khách (remaining > 0)
+function _debtOrdersOf(cust) {
+  return (cust.orders || [])
+    .filter(s => (s.total || 0) - (s.paid || 0) > 0.5)
+    .sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+}
+
+// Chuẩn bị dữ liệu xuất: chỉ giữ khách còn công nợ
+function _buildDebtExportData(custList) {
+  return custList
+    .map(c => ({ name: c.name, phone: c.phone || '', items: _debtOrdersOf(c) }))
+    .filter(c => c.items.length > 0)
+    .sort((a, b) => a.name.localeCompare(b.name, 'vi'));
+}
+
+function exportCustDebtExcel(custList, label) {
+  if (typeof XLSX === 'undefined') { toast('Thư viện Excel chưa sẵn sàng', 'error'); return; }
+  const data = _buildDebtExportData(custList);
+  if (data.length === 0) { toast('Không có công nợ để xuất', 'info'); return; }
+  const shop = (S.settings && S.settings.shopName) || 'Đá Tự Nhiên';
+  const dateStr = today();
+  const GOLD = 'C9A84C', RED = '5c1a1a';
+
+  const hStyle = { font:{bold:true,color:{rgb:'FFFFFF'},name:'Arial',sz:10}, fill:{fgColor:{rgb:RED},patternType:'solid'}, alignment:{horizontal:'center',vertical:'center',wrapText:true}, border:{top:{style:'thin',color:{rgb:'CCC'}},bottom:{style:'thin',color:{rgb:'CCC'}},left:{style:'thin',color:{rgb:'CCC'}},right:{style:'thin',color:{rgb:'CCC'}}} };
+  const dStyle = align => ({ font:{name:'Arial',sz:10}, alignment:{horizontal:align||'left',vertical:'center'}, border:{top:{style:'hair',color:{rgb:'EEE'}},bottom:{style:'hair',color:{rgb:'EEE'}},left:{style:'hair',color:{rgb:'EEE'}},right:{style:'hair',color:{rgb:'EEE'}}} });
+  const subStyle = align => ({ font:{bold:true,name:'Arial',sz:10}, fill:{fgColor:{rgb:'F3E9D2'},patternType:'solid'}, alignment:{horizontal:align||'left',vertical:'center'} });
+
+  const headers = ['Khách hàng','SĐT','Ngày mua','Tên sản phẩm','Số lượng','Đơn giá (đ)','Thành tiền (đ)','Đã thanh toán (đ)','Còn nợ (đ)','Địa chỉ công trình'];
+  const aoa = [
+    [shop + ' — BẢNG CÔNG NỢ KHÁCH HÀNG' + (label ? ' (' + label + ')' : '')],
+    ['Ngày xuất: ' + fmtD(dateStr)],
+    [],
+    headers
+  ];
+  // Theo dõi style từng dòng: 'data' | 'sub'
+  const rowKinds = [];
+  let grandTotal = 0, grandPaid = 0, grandRemain = 0;
+
+  data.forEach(c => {
+    let cTotal = 0, cPaid = 0, cRemain = 0;
+    c.items.forEach(s => {
+      const remain = (s.total || 0) - (s.paid || 0);
+      cTotal += (s.total || 0); cPaid += (s.paid || 0); cRemain += remain;
+      aoa.push([
+        c.name, c.phone, fmtD(s.date),
+        s.productName || '',
+        (s.qty > 0 ? s.qty + (s.unit ? ' ' + s.unit : '') : ''),
+        numFmt(s.unitPrice || 0),
+        numFmt(s.total || 0),
+        numFmt(s.paid || 0),
+        numFmt(remain),
+        s.address || ''
+      ]);
+      rowKinds.push('data');
+    });
+    aoa.push(['', '', '', 'Cộng — ' + c.name, '', '', numFmt(cTotal), numFmt(cPaid), numFmt(cRemain), '']);
+    rowKinds.push('sub');
+    grandTotal += cTotal; grandPaid += cPaid; grandRemain += cRemain;
+  });
+  aoa.push([]);
+  aoa.push(['TỔNG CỘNG', '', '', '', '', '', numFmt(grandTotal), numFmt(grandPaid), numFmt(grandRemain), '']);
+  const grandRowIdx = aoa.length - 1;
+
+  const ws = XLSX.utils.aoa_to_sheet([]);
+  XLSX.utils.sheet_add_aoa(ws, aoa);
+  ws['A1'] = { v: aoa[0][0], t: 's', s: { font: { bold: true, sz: 14, name: 'Arial', color: { rgb: GOLD } } } };
+  ws['A2'] = { v: aoa[1][0], t: 's', s: { font: { italic: true, sz: 10, name: 'Arial', color: { rgb: '888888' } } } };
+  // Header (dòng index 3)
+  headers.forEach((_, ci) => { const a = XLSX.utils.encode_cell({ r: 3, c: ci }); if (ws[a]) ws[a].s = hStyle; });
+  // Dòng dữ liệu / subtotal
+  rowKinds.forEach((kind, i) => {
+    const r = 4 + i;
+    headers.forEach((_, ci) => {
+      const a = XLSX.utils.encode_cell({ r, c: ci });
+      if (!ws[a]) return;
+      const right = ci >= 5 && ci <= 8;
+      ws[a].s = kind === 'sub' ? subStyle(right ? 'right' : 'left') : dStyle(right ? 'right' : 'left');
+    });
+  });
+  // Dòng tổng cộng
+  headers.forEach((_, ci) => {
+    const a = XLSX.utils.encode_cell({ r: grandRowIdx, c: ci });
+    if (ws[a]) ws[a].s = { font: { bold: true, sz: 11, name: 'Arial', color: { rgb: ci >= 6 ? '000000' : 'FFFFFF' } }, fill: { fgColor: { rgb: ci >= 6 ? 'F3D9A0' : RED }, patternType: 'solid' }, alignment: { horizontal: ci >= 6 ? 'right' : 'left' } };
+  });
+  ws['!cols'] = [{wch:22},{wch:13},{wch:12},{wch:30},{wch:12},{wch:14},{wch:15},{wch:16},{wch:15},{wch:30}];
+  ws['!ref'] = XLSX.utils.encode_range({ s:{r:0,c:0}, e:{r:grandRowIdx,c:9} });
+  ws['!merges'] = [{ s:{r:0,c:0}, e:{r:0,c:9} }, { s:{r:1,c:0}, e:{r:1,c:9} }];
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Công nợ KH');
+  const fname = shop.replace(/\s/g, '') + '_CongNo' + (label ? '_' + label.replace(/[^\w]/g, '') : '') + '_' + dateStr.replace(/-/g, '') + '.xlsx';
+  XLSX.writeFile(wb, fname);
+  toast('✅ Đã xuất Excel: ' + fname, 'success');
+}
+
+function exportCustDebtPDF(custList, label) {
+  const data = _buildDebtExportData(custList);
+  if (data.length === 0) { toast('Không có công nợ để xuất', 'info'); return; }
+  const shop = (S.settings && S.settings.shopName) || 'Đá Tự Nhiên';
+  const st = S.settings || {};
+  let grandTotal = 0, grandPaid = 0, grandRemain = 0;
+
+  const sections = data.map(c => {
+    let cTotal = 0, cPaid = 0, cRemain = 0;
+    const rows = c.items.map((s, idx) => {
+      const remain = (s.total || 0) - (s.paid || 0);
+      cTotal += (s.total || 0); cPaid += (s.paid || 0); cRemain += remain;
+      return `<tr>
+        <td class="c">${idx + 1}</td>
+        <td class="c">${fmtD(s.date)}</td>
+        <td>${escHtml(s.productName || '')}</td>
+        <td class="c">${s.qty > 0 ? escHtml(s.qty + (s.unit ? ' ' + s.unit : '')) : '—'}</td>
+        <td class="r">${s.unitPrice > 0 ? fmt(s.unitPrice) : '—'}</td>
+        <td class="r">${fmt(s.total || 0)}</td>
+        <td class="r">${fmt(s.paid || 0)}</td>
+        <td class="r" style="color:#c0392b;font-weight:700">${fmt(remain)}</td>
+        <td>${escHtml(s.address || '')}</td>
+      </tr>`;
+    }).join('');
+    grandTotal += cTotal; grandPaid += cPaid; grandRemain += cRemain;
+    return `<div class="cust-sec">
+      <div class="cust-hd"><b>${escHtml(c.name)}</b>${c.phone ? ' &nbsp;·&nbsp; 📞 ' + escHtml(c.phone) : ''} &nbsp;·&nbsp; <span style="color:#c0392b">Còn nợ: ${fmt(cRemain)}đ</span></div>
+      <table>
+        <thead><tr>
+          <th style="width:30px">STT</th><th style="width:78px">Ngày mua</th><th>Tên sản phẩm</th>
+          <th style="width:80px">Số lượng</th><th style="width:90px">Đơn giá</th><th style="width:100px">Thành tiền</th>
+          <th style="width:100px">Đã TT</th><th style="width:100px">Còn nợ</th><th style="width:150px">Địa chỉ công trình</th>
+        </tr></thead>
+        <tbody>
+          ${rows}
+          <tr class="sub"><td class="r" colspan="5">Cộng</td><td class="r">${fmt(cTotal)}</td><td class="r">${fmt(cPaid)}</td><td class="r">${fmt(cRemain)}</td><td></td></tr>
+        </tbody>
+      </table>
+    </div>`;
+  }).join('');
+
+  const html = `<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>Công nợ khách hàng${label ? ' - ' + escHtml(label) : ''}</title>
+<style>
+* { box-sizing:border-box; margin:0; padding:0; }
+body { font-family:'Times New Roman',Times,serif; font-size:12.5px; color:#000; background:#fff; }
+.page { max-width:1000px; margin:0 auto; padding:22px 26px; }
+.head { display:flex; justify-content:space-between; align-items:flex-start; border-bottom:2px solid #555; padding-bottom:10px; margin-bottom:8px; }
+.shop { font-size:17px; font-weight:700; }
+.shop-info { font-size:11px; color:#555; margin-top:3px; line-height:1.6; }
+h2 { text-align:center; font-size:17px; font-weight:700; letter-spacing:1px; margin:12px 0 2px; text-transform:uppercase; }
+.meta { text-align:center; font-size:11px; font-style:italic; color:#444; margin-bottom:14px; }
+.summary { background:#faf3e0; border:1px solid #e0d2a8; border-radius:5px; padding:9px 14px; margin-bottom:16px; font-size:13px; display:flex; gap:24px; flex-wrap:wrap; }
+.cust-sec { margin-bottom:18px; page-break-inside:avoid; }
+.cust-hd { font-size:13.5px; background:#f0ece0; padding:6px 10px; border-left:4px solid #c9a84c; margin-bottom:4px; }
+table { width:100%; border-collapse:collapse; font-size:12px; }
+th,td { border:1px solid #888; padding:4px 7px; vertical-align:middle; }
+thead th { background:#eee; font-weight:700; text-align:center; font-size:11px; }
+td.c { text-align:center; } td.r { text-align:right; }
+tr.sub td { background:#f6f0e2; font-weight:700; }
+@media print { @page{size:A4 landscape;margin:8mm;} body{print-color-adjust:exact;-webkit-print-color-adjust:exact;} }
+</style></head><body><div class="page">
+  <div class="head">
+    <div>
+      <div class="shop">${escHtml(shop)}</div>
+      <div class="shop-info">${escHtml(st.address || '')}${st.phone ? '<br>' + escHtml(st.phone) : ''}${st.taxId ? ' · MST: ' + escHtml(st.taxId) : ''}</div>
+    </div>
+  </div>
+  <h2>Bảng Công Nợ Khách Hàng</h2>
+  <div class="meta">${label ? escHtml(label) + ' · ' : ''}Ngày xuất: ${fmtD(today())}</div>
+  <div class="summary">
+    <div>Số khách còn nợ: <b>${data.length}</b></div>
+    <div>Tổng tiền hàng: <b>${fmt(grandTotal)}đ</b></div>
+    <div>Đã thanh toán: <b style="color:#1a7d3c">${fmt(grandPaid)}đ</b></div>
+    <div>Tổng còn nợ: <b style="color:#c0392b">${fmt(grandRemain)}đ</b></div>
+  </div>
+  ${sections}
+</div>
+<scr${''}ipt>window.onload=function(){window.print()};</scr${''}ipt>
+</body></html>`;
+  openPdfMobile(html, 'Công nợ KH' + (label ? ' - ' + label : ''));
+}
+
+// Cụm 2 nút Xuất PDF / Excel cho công nợ
+function debtExportButtons(getCustList, label) {
+  return h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
+    h('button', { className: 'btn btn-sm', style: { background: 'var(--blue)', color: '#fff', border: 'none' },
+      onClick: () => exportCustDebtPDF(getCustList(), label) }, '📄 PDF'),
+    h('button', { className: 'btn btn-sm', style: { background: 'var(--green)', color: '#fff', border: 'none' },
+      onClick: () => exportCustDebtExcel(getCustList(), label) }, '📊 Excel')
+  );
+}
+
 // ── DEBT ──────────────────────────────────────────────────────
 function pgDebt() {
   const wrap = h('div', {});
@@ -9233,6 +9427,10 @@ function pgDebt() {
     if (tab === 'customer') {
       tabContent = h('div', {},
         totalC > 0 && h('div', { className: 'alert alert-err' }, `⚠️ Còn ${custDebts.length} đơn chưa TT · Tổng phải thu: ${fmt(totalC)}đ`),
+        custDebts.length > 0 && h('div', { style: { display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8, marginBottom: 12, flexWrap: 'wrap' } },
+          h('span', { style: { fontSize: 12, color: 'var(--text3)' } }, 'Xuất toàn bộ công nợ:'),
+          debtExportButtons(() => allCusts, 'Tất cả KH')
+        ),
         custDebts.length === 0
           ? h('div', { style: { textAlign: 'center', padding: 48, color: 'var(--green)', fontSize: 15 } }, '✅ Không có công nợ khách hàng')
           : h('div', { className: 'table-wrap' }, h('table', {},
@@ -9746,6 +9944,7 @@ function pgDebt() {
                   custDebt > 0
                     ? h('div', { className: 'badge badge-red', style: { fontSize: 12, padding: '5px 12px' } }, '⚠️ Còn nợ: ' + fmt(custDebt) + 'đ')
                     : h('div', { className: 'badge badge-green', style: { fontSize: 12, padding: '5px 12px' } }, '✅ Không có nợ'),
+                  custDebt > 0 && debtExportButtons(() => [cust], cust.name),
                   custDebt > 0 && h('button', {
                     className: 'btn btn-primary btn-sm',
                     style: { background: 'var(--green)', borderColor: 'var(--green)', color: '#fff', fontWeight: 700 },
