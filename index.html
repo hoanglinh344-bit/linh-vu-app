@@ -4608,6 +4608,7 @@ function render() {
 const ALL_PAGES = [
   {id:'dashboard',label:'Tổng quan',   icon:'📊', adminOnly: false, staffVisible: true},
   {id:'inventory',label:'Kho hàng',    icon:'💎', adminOnly: true,  staffVisible: false},
+  {id:'itemledger',label:'Sổ kho',     icon:'📒', adminOnly: true,  staffVisible: false},
   {id:'imports',  label:'Nhập hàng',   icon:'📥', adminOnly: true,  staffVisible: false},
   {id:'sales',    label:'Bán hàng',    icon:'🧾', adminOnly: false,  staffVisible: true},
   {id:'returns',  label:'Trả hàng',    icon:'🔄', adminOnly: true,  staffVisible: false},
@@ -4716,7 +4717,7 @@ function buildApp() {
     )
   );
 
-  const pageMap = { dashboard: pgDashboard, inventory: pgInventory, imports: pgImports,
+  const pageMap = { dashboard: pgDashboard, inventory: pgInventory, itemledger: pgItemLedger, imports: pgImports,
     sales: pgSales, returns: pgReturns, debt: pgDebt, invoice: pgInvoice, quotation: pgQuotation,
     bienban: pgBienBan,
     hopdong: pgHopDong,
@@ -13456,6 +13457,141 @@ function pgSync() {
 //  các productId / productName KHÔNG còn tồn tại trong S.products.
 //  Cho phép tái tạo lại sản phẩm từ thông tin đã lưu trong giao dịch.
 // ══════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════
+//  SỔ KHO — CHI TIẾT NHẬP / BÁN THEO TỪNG MẶT HÀNG (pgItemLedger)
+//
+//  CHỈ ĐỌC: lọc S.imports / S.sales / S.returns theo productId để hiển thị.
+//  KHÔNG tạo/sửa/xoá bất kỳ bản ghi nào, KHÔNG đụng đồng bộ Firebase.
+// ══════════════════════════════════════════════════════════════════
+function pgItemLedger() {
+  const wrap = h('div', {});
+
+  const variantSize = (prod, vid) => {
+    if (!vid || !prod || !prod.variants) return '';
+    const vt = prod.variants.find(v => v.id === vid);
+    return vt ? (vt.size || vt.name || '') : '';
+  };
+
+  const rebuild = () => {
+    wrap.innerHTML = '';
+    const section = h('div', {});
+
+    section.appendChild(h('div', { className: 'page-header' },
+      h('div', {},
+        h('div', { className: 'page-title' }, '📒 Sổ Kho — Chi Tiết Mặt Hàng'),
+        h('div', { className: 'page-sub' }, 'Xem toàn bộ phiếu nhập và đơn bán của một mặt hàng (chỉ xem — không sửa dữ liệu)')
+      )
+    ));
+
+    // ── Bộ chọn mặt hàng ──
+    const products = (S.products || []).slice().sort((a, b) => (a.name || '').localeCompare(b.name || '', 'vi'));
+    const sel = document.createElement('select');
+    sel.className = 'form-input';
+    sel.style.maxWidth = '520px';
+    const opt0 = document.createElement('option'); opt0.value = ''; opt0.textContent = '— Chọn mặt hàng —'; sel.appendChild(opt0);
+    products.forEach(p => {
+      const o = document.createElement('option'); o.value = p.id;
+      o.textContent = p.name + (p.sku ? ' [' + p.sku + ']' : '');
+      if (p.id === S._ledgerProductId) o.selected = true;
+      sel.appendChild(o);
+    });
+    sel.onchange = () => { S._ledgerProductId = sel.value; rebuild(); };
+    section.appendChild(h('div', { className: 'form-group', style: { marginBottom: 16, maxWidth: 520 } },
+      h('label', { className: 'form-label' }, 'Chọn mặt hàng'), sel));
+
+    const prod = products.find(p => p.id === S._ledgerProductId);
+    if (!prod) {
+      section.appendChild(h('div', { className: 'card', style: { textAlign: 'center', padding: 40, color: 'var(--text2)' } },
+        'Chọn một mặt hàng ở trên để xem sổ nhập – bán.'));
+      wrap.appendChild(section);
+      return;
+    }
+
+    // ── Lấy dữ liệu (CHỈ ĐỌC) ──
+    const imps = (S.imports || []).filter(i => i.productId === prod.id).slice().sort((a, b) => (a.date || '') < (b.date || '') ? -1 : 1);
+    const sals = (S.sales   || []).filter(s => s.productId === prod.id).slice().sort((a, b) => (a.date || '') < (b.date || '') ? -1 : 1);
+    const rets = (S.returns || []).filter(r => r.productId === prod.id);
+
+    const sum = (arr, f) => arr.reduce((a, r) => a + (parseFloat(r[f]) || 0), 0);
+    const totImpQty   = sum(imps, 'qty');
+    const totImpMoney = sum(imps, 'total');
+    const totSaleQty  = sum(sals, 'qty');
+    const totSaleMoney = sum(sals, 'total');
+    const totRetQty   = rets.reduce((a, r) => a + (parseFloat(r.returnQty) || 0), 0);
+    const conLai      = totImpQty - totSaleQty + totRetQty;
+    const grossProfit = totSaleMoney - totSaleQty * (parseFloat(prod.buyPrice) || 0);
+    const unit = prod.unit || '';
+
+    // ── Thẻ tóm tắt ──
+    const statCard = (label, val, color) => h('div', { className: 'stat' },
+      h('div', { className: 'stat-label' }, label),
+      h('div', { className: 'stat-val', style: { fontSize: 17, color: color || 'var(--text)' } }, val)
+    );
+    section.appendChild(h('div', { className: 'stats-grid', style: { gridTemplateColumns: 'repeat(4,1fr)', marginBottom: 14 } },
+      statCard('📥 Tổng nhập', fmtQty(totImpQty) + ' ' + unit, 'var(--accent)'),
+      statCard('🧾 Tổng bán', fmtQty(totSaleQty) + ' ' + unit, 'var(--blue)'),
+      statCard('📦 Tồn còn lại', fmtQty(conLai) + ' ' + unit, conLai < 0 ? 'var(--red)' : 'var(--green)'),
+      statCard('📈 LN gộp (ước tính)', fmt(grossProfit) + 'đ', grossProfit >= 0 ? 'var(--green)' : 'var(--red)')
+    ));
+    section.appendChild(h('div', { className: 'stats-grid', style: { gridTemplateColumns: 'repeat(3,1fr)', marginBottom: 20 } },
+      statCard('Tiền nhập', fmt(totImpMoney) + 'đ'),
+      statCard('Tiền bán', fmt(totSaleMoney) + 'đ'),
+      statCard('Tồn theo kho', fmtQty(parseFloat(prod.stock) || 0) + ' ' + unit)
+    ));
+
+    // ── Bảng NHẬP ──
+    section.appendChild(h('div', { className: 'card', style: { padding: 0, marginBottom: 20, overflowX: 'auto' } },
+      h('div', { style: { padding: '14px 18px', fontWeight: 700, fontSize: 14, borderBottom: '1px solid var(--border)' } }, '📥 Phiếu nhập (' + imps.length + ')'),
+      h('table', {},
+        h('thead', {}, h('tr', {}, th('Ngày'), th('Nhà cung cấp'), th('Quy cách'), th('SL', true), th('Đơn giá', true), th('Thành tiền', true), th('Đã trả', true), th('Còn nợ', true))),
+        h('tbody', {},
+          ...imps.map(i => {
+            const debt = Math.max(0, (i.total || 0) - (i.paid || 0));
+            return h('tr', {},
+              h('td', {}, fmtD(i.date)),
+              h('td', {}, i.supplier || '—'),
+              h('td', {}, variantSize(prod, i.variantId) || '—'),
+              h('td', { style: { textAlign: 'right' } }, fmtQty(parseFloat(i.qty) || 0)),
+              h('td', { style: { textAlign: 'right' } }, fmt(i.unitPrice || 0)),
+              h('td', { style: { textAlign: 'right', fontWeight: 700 } }, fmt(i.total || 0)),
+              h('td', { style: { textAlign: 'right', color: 'var(--green)' } }, fmt(i.paid || 0)),
+              h('td', { style: { textAlign: 'right', color: debt > 0 ? 'var(--red)' : 'var(--text3)' } }, debt > 0 ? fmt(debt) : '—')
+            );
+          }),
+          imps.length === 0 && h('tr', {}, h('td', { colspan: 8, style: { textAlign: 'center', padding: 24, color: 'var(--text3)' } }, 'Chưa có phiếu nhập'))
+        )
+      )
+    ));
+
+    // ── Bảng BÁN ──
+    section.appendChild(h('div', { className: 'card', style: { padding: 0, overflowX: 'auto' } },
+      h('div', { style: { padding: '14px 18px', fontWeight: 700, fontSize: 14, borderBottom: '1px solid var(--border)' } }, '🧾 Đơn bán (' + sals.length + ')'),
+      h('table', {},
+        h('thead', {}, h('tr', {}, th('Ngày'), th('Khách hàng'), th('Quy cách'), th('SL', true), th('Đơn giá', true), th('Thành tiền', true), th('Trạng thái'))),
+        h('tbody', {},
+          ...sals.map(s => {
+            const paid = s.status === 'done' || (s.paid || 0) >= (s.total || 0);
+            return h('tr', {},
+              h('td', {}, fmtD(s.date)),
+              h('td', {}, s.customer || '—'),
+              h('td', {}, variantSize(prod, s.variantId) || s.variantSize || '—'),
+              h('td', { style: { textAlign: 'right' } }, fmtQty(parseFloat(s.qty) || 0)),
+              h('td', { style: { textAlign: 'right' } }, fmt(s.unitPrice || 0)),
+              h('td', { style: { textAlign: 'right', fontWeight: 700 } }, fmt(s.total || 0)),
+              h('td', {}, paid ? h('span', { style: { color: 'var(--green)' } }, '✅ Đã thu') : h('span', { style: { color: 'var(--red)' } }, '⏳ Còn nợ'))
+            );
+          }),
+          sals.length === 0 && h('tr', {}, h('td', { colspan: 7, style: { textAlign: 'center', padding: 24, color: 'var(--text3)' } }, 'Chưa có đơn bán'))
+        )
+      )
+    ));
+
+    wrap.appendChild(section);
+  };
+  rebuild();
+  return wrap;
+}
+
 function pgRecovery() {
   const wrap = h('div', {});
 
