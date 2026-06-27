@@ -88,6 +88,9 @@ th{text-align:left;padding:10px 14px;font-size:10px;font-weight:700;color:var(--
 td{padding:11px 14px;border-bottom:1px solid var(--border);color:var(--text);vertical-align:middle}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:rgba(255,255,255,.02)}
+.main-inner.wide{max-width:1600px}
+.wide .table-wrap table{font-size:12px;min-width:0}
+.wide .table-wrap th,.wide .table-wrap td{padding:7px 9px}
 /* ── Badges ── */
 .badge{display:inline-flex;align-items:center;padding:3px 10px;border-radius:99px;font-size:11px;font-weight:700;white-space:nowrap}
 .badge-green{background:rgba(76,175,125,.15);color:var(--green);border:1px solid rgba(76,175,125,.3)}
@@ -4731,8 +4734,10 @@ function buildApp() {
     accounts: pgAccounts, settings: pgSettings, sync: pgSync, recovery: pgRecovery };
   const content = (pageMap[safePage] || pgDashboard)();
 
+  const _widePages = ['inventory','imports','sales','returns','debt','cashflow','itemledger'];
+  const _innerCls = 'main-inner' + (_widePages.indexOf(safePage) !== -1 ? ' wide' : '');
   const els = [sidebar, overlay,
-    h('div', { className: 'main' }, topbar, h('div', { className: 'main-inner' }, content)),
+    h('div', { className: 'main' }, topbar, h('div', { className: _innerCls }, content)),
     bottomNav
   ];
 
@@ -8371,6 +8376,10 @@ return h('tr', {},
                 })(),
                 h('td', {}, h('span', {className:'badge badge-'+(s.status==='done'?'green':'red')}, s.status==='done'?'Xong':'Nợ')),
                 h('td', {}, h('div', {style:{display:'flex',gap:4}},
+                  h('button', {
+                    className:'btn btn-xs', style:{background:'var(--blue)',color:'#fff',border:'none'},
+                    onClick: () => openSaleEdit(s, rebuild)
+                  }, '✏️ Sửa'),
                   s.status==='debt' && h('button', {
                     className:'btn btn-xs', style:{background:'var(--green)',color:'#fff',border:'none'},
                     onClick: () => { S.sales=S.sales.map(x=>x.id===s.id?{...x,paid:x.total,status:'done',_updated:new Date().toISOString()}:x); save('sales'); toast('Đã thu hết nợ','success'); rebuild(); }
@@ -8598,6 +8607,140 @@ function openSaleWithProduct(product, rebuild) {
     console.error('[openSaleWithProduct] Error:', e);
     toast('❌ Lỗi mở form bán hàng: ' + e.message, 'error');
   }
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  SỬA ĐƠN BÁN — một dòng đơn (openSaleEdit)
+//
+//  CHỈ sửa các trường KHÔNG ảnh hưởng tồn kho: giá bán, VAT, phí vận
+//  chuyển, thông tin khách, ngày, ghi chú, đã thanh toán. Số lượng /
+//  sản phẩm / quy cách GIỮ NGUYÊN (hiển thị chỉ-đọc) — muốn đổi thì Xoá
+//  rồi tạo lại. KHÔNG đụng S.products / tồn kho. Tính lại tổng + trạng
+//  thái đúng công thức openSale. Đã thanh toán bị khoá nếu đơn đã có
+//  lịch sử thu nợ (paymentlogs) để không lệch số liệu thu.
+// ══════════════════════════════════════════════════════════════════
+function openSaleEdit(s, rebuild) {
+  const SALE_SHIP_UNITS = ['chuyến','tấn','cái','thùng','kg','m²','tấm'];
+  const cur = (S.sales || []).find(x => x.id === s.id);
+  if (!cur) { toast('Không tìm thấy đơn (có thể đã bị xoá).', 'error'); return; }
+  const hasLogs = (S.paymentlogs || []).some(l => l.refId === cur.id && l.type === 'customer');
+  const qty = parseFloat(cur.qty) || 0;
+
+  const mk = (type, val, ph) => { const e = document.createElement('input'); e.className = 'form-input'; e.type = type; if (ph) e.placeholder = ph; if (type === 'number') e.step = 'any'; e.value = (val == null ? '' : val); return e; };
+  const fDate  = mk('date', cur.date || today());
+  const fCust  = mk('text', cur.customer || '', 'Tên khách');
+  const fPhone = mk('tel',  cur.phone || '', 'SĐT');
+  const fAddr  = mk('text', cur.address || '', 'Địa chỉ');
+  const fNote  = mk('text', cur.note || '', 'Ghi chú');
+  const fPrice = mk('number', cur.unitPrice || 0);
+  const fVat   = mk('number', cur.vatRate || 0);
+  const fShipPrice = mk('number', cur.shipUnitPrice || 0, 'Đơn giá VC (chưa VAT)');
+  const fShipQty   = mk('number', cur.shipQty || '', 'SL');
+  const fShipVat   = mk('number', cur.shipVatRate || 0, 'VAT VC %');
+  const fPaid  = mk('number', cur.paid || 0); if (hasLogs) fPaid.disabled = true;
+
+  const fShipUnit = document.createElement('select'); fShipUnit.className = 'form-input';
+  SALE_SHIP_UNITS.forEach(u => { const o = document.createElement('option'); o.value = u; o.textContent = u; if (u === (cur.shipUnit || 'chuyến')) o.selected = true; fShipUnit.appendChild(o); });
+
+  const fShipForCust = document.createElement('input'); fShipForCust.type = 'checkbox'; fShipForCust.checked = !!cur.shipForCustomer;
+
+  const preview = document.createElement('div');
+  preview.style.cssText = 'background:var(--bg3);border:1px solid var(--border);border-radius:var(--r2);padding:12px 14px;font-size:13px;line-height:1.7';
+
+  const compute = () => {
+    const price = parseFloat(fPrice.value) || 0;
+    const vat = parseFloat(fVat.value) || 0;
+    const sub = qty * price;
+    const vatAmt = Math.round(sub * vat / 100);
+    const goods = sub + vatAmt;
+    const shipUnit = fShipUnit.value;
+    const sQty = shipUnit === 'chuyến' ? 1 : (parseFloat(fShipQty.value) || 0);
+    const sNet = Math.round((parseFloat(fShipPrice.value) || 0) * sQty);
+    const svRate = parseFloat(fShipVat.value) || 0;
+    const sVat = svRate > 0 ? Math.round(sNet * svRate / 100) : 0;
+    const shipFee = sNet + sVat;
+    const forCust = fShipForCust.checked;
+    const total = goods + (forCust ? shipFee : 0);
+    const paid = hasLogs ? (parseFloat(cur.paid) || 0) : (parseFloat(fPaid.value) || 0);
+    const debt = Math.max(0, total - paid);
+    return { sub, vatAmt, goods, shipFee, forCust, total, paid, debt, sQty, status: (paid >= total && total > 0) ? 'done' : 'debt' };
+  };
+  const renderPreview = () => {
+    const c = compute();
+    preview.innerHTML =
+      '📋 Doanh thu (chưa VAT): <b>' + fmt(c.sub) + 'đ</b><br>' +
+      (c.vatAmt > 0 ? '🏛️ VAT hàng hoá: +' + fmt(c.vatAmt) + 'đ<br>' : '') +
+      '🚚 Phí VC (gồm VAT): <b>' + fmt(c.shipFee) + 'đ</b> ' + (c.forCust ? '<span style="color:var(--accent)">(tính cho khách)</span>' : '<span style="color:var(--text3)">(cửa hàng chịu)</span>') + '<br>' +
+      '💰 Tổng tiền: <b style="color:var(--accent)">' + fmt(c.total) + 'đ</b><br>' +
+      '✅ Đã thanh toán: ' + fmt(c.paid) + 'đ' + (c.debt > 0 ? ' · <span style="color:var(--red)">⚠️ Còn nợ ' + fmt(c.debt) + 'đ</span>' : ' · <span style="color:var(--green)">Đã đủ</span>');
+  };
+  [fPrice, fVat, fShipPrice, fShipQty, fShipVat, fPaid].forEach(e => e.addEventListener('input', renderPreview));
+  fShipUnit.addEventListener('change', renderPreview);
+  fShipForCust.addEventListener('change', renderPreview);
+  renderPreview();
+
+  const fg = (label, el) => h('div', { className: 'form-group' }, h('label', { className: 'form-label' }, label), el);
+
+  S.modal = {
+    title: '✏️ Sửa đơn: ' + (cur.productName || ''),
+    content: h('div', {},
+      h('div', { style: { background: 'rgba(91,143,232,.08)', border: '1px solid rgba(91,143,232,.25)', borderRadius: 'var(--r2)', padding: '10px 14px', fontSize: 12, color: 'var(--blue)', marginBottom: 14 } },
+        '🔒 Số lượng (' + fmtQty(qty) + ' ' + (cur.unit || '') + '), sản phẩm và quy cách KHÔNG sửa ở đây (giữ đúng tồn kho). Muốn đổi → Xoá đơn rồi tạo lại.'),
+      h('div', { className: 'fg fg2' },
+        fg('Ngày', fDate),
+        fg('Khách hàng', fCust),
+        fg('SĐT', fPhone),
+        fg('Địa chỉ', fAddr),
+        fg('Đơn giá bán', fPrice),
+        fg('VAT hàng hoá (%)', fVat),
+        fg('Phí VC — đơn giá (chưa VAT)', fShipPrice),
+        fg('Phí VC — đơn vị', fShipUnit),
+        fg('Phí VC — số lượng', fShipQty),
+        fg('Phí VC — VAT (%)', fShipVat),
+        fg('Đã thanh toán' + (hasLogs ? ' (đã khoá — đơn có lịch sử thu nợ)' : ''), fPaid),
+        h('div', { className: 'form-group' }, h('label', { className: 'form-label' }, 'Tính VC cho khách'),
+          h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, padding: '8px 0' } }, fShipForCust, h('span', {}, 'Tick = in lên hoá đơn & cộng vào tiền khách trả')))
+      ),
+      fg('Ghi chú', fNote),
+      h('div', { style: { marginTop: 6 } }, preview)
+    ),
+    footer: [
+      h('button', { className: 'btn', onClick: () => { S.modal = null; render(); } }, 'Huỷ'),
+      h('button', { className: 'btn btn-primary', onClick: () => {
+        const price = parseFloat(fPrice.value) || 0;
+        if (price < 0) { toast('Đơn giá không hợp lệ', 'error'); return; }
+        const c = compute();
+        const now = new Date().toISOString();
+        S.sales = (S.sales || []).map(x => x.id !== cur.id ? x : {
+          ...x,
+          date: fDate.value || x.date,
+          customer: fCust.value.trim(),
+          phone: fPhone.value.trim(),
+          address: fAddr.value.trim(),
+          note: fNote.value.trim(),
+          unitPrice: price,
+          vatRate: parseFloat(fVat.value) || 0,
+          subTotal: c.sub,
+          vatAmt: c.vatAmt,
+          total: c.total,
+          paid: c.paid,
+          status: c.status,
+          shipUnitPrice: parseFloat(fShipPrice.value) || 0,
+          shipUnit: fShipUnit.value,
+          shipQty: c.sQty,
+          shipVatRate: parseFloat(fShipVat.value) || 0,
+          shipFee: c.shipFee,
+          shipForCustomer: fShipForCust.checked,
+          _updated: now
+        });
+        save('sales');
+        toast('✅ Đã cập nhật đơn bán (tồn kho không đổi).', 'success');
+        S.modal = null;
+        rebuild(); render();
+      } }, '✅ Lưu')
+    ]
+  };
+  render();
 }
 
 function openSale(rebuild, preselectedProduct) {
@@ -13483,21 +13626,43 @@ function pgItemLedger() {
       )
     ));
 
-    // ── Bộ chọn mặt hàng ──
+    // ── Bộ chọn mặt hàng (ô tìm kiếm + danh sách lọc) ──
     const products = (S.products || []).slice().sort((a, b) => (a.name || '').localeCompare(b.name || '', 'vi'));
+
+    const search = document.createElement('input');
+    search.className = 'form-input';
+    search.type = 'text';
+    search.placeholder = '🔍 Gõ tên hoặc mã SKU để lọc (không cần dấu)...';
+    search.value = S._ledgerSearch || '';
+
     const sel = document.createElement('select');
     sel.className = 'form-input';
-    sel.style.maxWidth = '520px';
-    const opt0 = document.createElement('option'); opt0.value = ''; opt0.textContent = '— Chọn mặt hàng —'; sel.appendChild(opt0);
-    products.forEach(p => {
-      const o = document.createElement('option'); o.value = p.id;
-      o.textContent = p.name + (p.sku ? ' [' + p.sku + ']' : '');
-      if (p.id === S._ledgerProductId) o.selected = true;
-      sel.appendChild(o);
-    });
+
+    const cnt = document.createElement('div');
+    cnt.style.cssText = 'font-size:11px;color:var(--text3);margin-top:4px';
+
+    // Đổ lại danh sách trong <select> theo từ khoá — CHỈ cập nhật select,
+    // KHÔNG rebuild cả trang nên ô tìm kiếm giữ nguyên focus/con trỏ.
+    const fillOptions = () => {
+      const q = _normVi(search.value.trim());
+      const filtered = q ? products.filter(p => _normVi((p.name || '') + ' ' + (p.sku || '')).indexOf(q) !== -1) : products;
+      sel.innerHTML = '';
+      const opt0 = document.createElement('option'); opt0.value = ''; opt0.textContent = '— Chọn mặt hàng —'; sel.appendChild(opt0);
+      filtered.forEach(p => {
+        const o = document.createElement('option'); o.value = p.id;
+        o.textContent = p.name + (p.sku ? ' [' + p.sku + ']' : '');
+        if (p.id === S._ledgerProductId) o.selected = true;
+        sel.appendChild(o);
+      });
+      cnt.textContent = q ? (filtered.length + ' / ' + products.length + ' mặt hàng khớp') : (products.length + ' mặt hàng');
+    };
+    fillOptions();
+    search.oninput = () => { S._ledgerSearch = search.value; fillOptions(); };
     sel.onchange = () => { S._ledgerProductId = sel.value; rebuild(); };
+
     section.appendChild(h('div', { className: 'form-group', style: { marginBottom: 16, maxWidth: 520 } },
-      h('label', { className: 'form-label' }, 'Chọn mặt hàng'), sel));
+      h('label', { className: 'form-label' }, 'Tìm & chọn mặt hàng'),
+      search, h('div', { style: { height: 8 } }), sel, cnt));
 
     const prod = products.find(p => p.id === S._ledgerProductId);
     if (!prod) {
