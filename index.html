@@ -4263,14 +4263,16 @@ function applyExcelRestore(parsed, commit) {
   const cashflows  = commit ? (S.cashflows || (S.cashflows = [])) : JSON.parse(JSON.stringify(S.cashflows || []));
 
   const nameIndex = new Map();
-  products.forEach(p => nameIndex.set(_normVi(p.name), p));
+  const skuIndex  = new Map(); // FIX (nhân đôi SP): đối chiếu thêm theo SKU, không chỉ theo tên
+  products.forEach(p => { nameIndex.set(_normVi(p.name), p); if (p.sku) skuIndex.set(String(p.sku).toLowerCase(), p); });
 
   // 1) KHO HÀNG — CHỈ điền vào trường còn trống/0 của sản phẩm đã có
   //    (không bao giờ ghi đè giá trị đang khác 0/khác rỗng) — an toàn cho khôi phục.
   //    Sản phẩm không tìm thấy theo tên → coi là sản phẩm đã bị mất, tạo lại mới.
   parsed.products.forEach(ep => {
     const key = _normVi(ep.name);
-    const existing = nameIndex.get(key);
+    // Đối chiếu theo tên HOẶC mã SKU — tránh tạo trùng khi tên lệch nhẹ nhưng SKU giống
+    const existing = nameIndex.get(key) || (ep.sku ? skuIndex.get(String(ep.sku).toLowerCase()) : null);
     if (existing) {
       let changed = false;
       const fill = (field, val) => { if (val && !existing[field]) { existing[field] = val; changed = true; } };
@@ -4288,7 +4290,7 @@ function applyExcelRestore(parsed, commit) {
         description: ep.description || '', variants: [],
         createdAt: now, _updated: now, _stockTx: [], _recoveredFromExcel: true
       };
-      products.push(np); nameIndex.set(key, np); stats.prodNew++;
+      products.push(np); nameIndex.set(key, np); if (np.sku) skuIndex.set(String(np.sku).toLowerCase(), np); stats.prodNew++;
     }
   });
 
@@ -4304,7 +4306,7 @@ function applyExcelRestore(parsed, commit) {
         stock: 0, description: '', variants: [], createdAt: now, _updated: now, _stockTx: [],
         _recoveredFromExcel: true
       };
-      products.push(p); nameIndex.set(key, p); stats.prodNew++;
+      products.push(p); nameIndex.set(key, p); if (p.sku) skuIndex.set(String(p.sku).toLowerCase(), p); stats.prodNew++;
     }
     return p;
   }
@@ -13348,12 +13350,27 @@ function pgSync() {
             fileInp.onchange = e => {
               const file = e.target.files[0]; if (!file) return;
               const reader = new FileReader();
-              reader.onload = ev => {
+              reader.onload = async ev => {
                 try {
                   const parsed = parseExcelBackup(ev.target.result);
                   if (!parsed.products.length && !parsed.sales.length && !parsed.imports.length) {
                     toast('❌ Không đọc được dữ liệu — kiểm tra lại đúng file Excel do app xuất ra', 'error');
                     return;
+                  }
+                  // ── FIX (nhân đôi SP): ÉP KÉO FULL TỪ CLOUD TRƯỚC KHI ĐỐI CHIẾU ──
+                  // Nguyên nhân gốc của lỗi "26 SP trùng": khi local đang THIẾU sản phẩm
+                  // (chưa đồng bộ về máy), applyExcelRestore đối chiếu trùng chỉ dựa trên
+                  // S.products LOCAL → không thấy SP đã có → tạo mới → nhân đôi (cùng tên,
+                  // cùng SKU tự sinh, khác id). Kéo full từ cloud (đúng code nút "Kéo từ
+                  // cloud về") để local đầy đủ trước khi đối chiếu. Offline → cảnh báo rõ.
+                  let syncWarn = '';
+                  const _cfgEnabled = (typeof CLOUD !== 'undefined' && CLOUD.getCfg && CLOUD.getCfg().enabled);
+                  if (_cfgEnabled && CLOUD.isOnline && CLOUD.isOnline()) {
+                    toast('⏳ Đang đồng bộ dữ liệu mới nhất từ cloud trước khi khôi phục...', 'info');
+                    const _synced = await CLOUD.bootSync(S, true).catch(() => false);
+                    if (!_synced) syncWarn = '\n\n⚠️ CHƯA kéo được dữ liệu mới nhất từ cloud — danh sách có thể thiếu, dễ tạo SP TRÙNG. Nên kiểm tra mạng rồi thử lại.';
+                  } else if (_cfgEnabled) {
+                    syncWarn = '\n\n⚠️ Đang OFFLINE — không kéo được dữ liệu mới nhất từ cloud. Nếu máy đang thiếu sản phẩm, khôi phục lúc này có thể tạo SP TRÙNG. Nên bật mạng rồi thử lại.';
                   }
                   const preview = applyExcelRestore(parsed, false);
                   S.confirm = {
@@ -13363,7 +13380,7 @@ function pgSync() {
                       '• ' + preview.saleNew + ' đơn bán sẽ khôi phục (bỏ qua ' + preview.saleSkip + ' đơn đã có/trùng)\n' +
                       '• ' + preview.impNew + ' phiếu nhập sẽ khôi phục (bỏ qua ' + preview.impSkip + ' phiếu đã có/trùng)\n' +
                       '• ' + preview.cfNew + ' phiếu thu/chi sẽ khôi phục (bỏ qua ' + preview.cfSkip + ' phiếu đã có/trùng)\n\n' +
-                      'Toàn bộ thay đổi sẽ được đẩy lên Firebase ngay sau khi xác nhận. Tiếp tục?',
+                      'Toàn bộ thay đổi sẽ được đẩy lên Firebase ngay sau khi xác nhận. Tiếp tục?' + syncWarn,
                     onYes: () => {
                       const result = applyExcelRestore(parsed, true);
                       toast('✅ Đã khôi phục: +' + result.prodNew + ' SP, +' + result.saleNew + ' đơn bán, +' + result.impNew + ' phiếu nhập, +' + result.cfNew + ' thu/chi — đã đồng bộ lên Firebase!', 'success');
