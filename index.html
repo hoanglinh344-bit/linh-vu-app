@@ -818,7 +818,13 @@ const CLOUD = (() => {
       if (!skipRender) {
         // Re-render nhẹ nhàng, không làm mất focus
         try {
-          if (typeof render === 'function') render();
+          // FIX mất focus khi tìm kiếm: render() làm root.innerHTML='' và dựng lại
+          // toàn bộ app → cướp focus khỏi ô đang gõ. Nếu user đang gõ trong 1 ô
+          // input/textarea thì HOÃN render (dữ liệu đã được lưu vào S/localStorage ở
+          // trên rồi, sẽ hiển thị ở lần thao tác kế tiếp). Vẫn báo toast như cũ.
+          const _ae = document.activeElement;
+          const _typing = _ae && (_ae.tagName === 'INPUT' || _ae.tagName === 'TEXTAREA') && _ae.closest('#app');
+          if (typeof render === 'function' && !_typing) render();
           // Toast thông báo có dữ liệu mới
           if (typeof toast === 'function') {
             const labels = { sales:'đơn hàng', imports:'phiếu nhập', returns:'hoàn trả',
@@ -4420,10 +4426,11 @@ function inp(type, placeholder, value, onInput, extra = {}) {
     _ime = false;
     onInput(e.target.value);
     if (!el.isConnected) {
-      requestAnimationFrame(() => {
-        const nw = [...document.querySelectorAll('input.form-input')].find(x => x.placeholder === placeholder && x.isConnected);
-        if (nw) { nw.focus(); try { nw.setSelectionRange(nw.value.length, nw.value.length); } catch(_) {} }
-      });
+      // FIX mất focus mobile: refocus ĐỒNG BỘ (không dùng rAF) ngay sau rebuild để
+      // còn nằm trong thao tác gõ → bàn phím điện thoại không bị đóng. Sau onInput
+      // (rebuild chạy synchronous) input mới đã có sẵn trong DOM nên tìm được ngay.
+      const nw = [...document.querySelectorAll('input.form-input')].find(x => x.placeholder === placeholder && x.isConnected);
+      if (nw) { nw.focus(); try { nw.setSelectionRange(nw.value.length, nw.value.length); } catch(_) {} }
     }
   });
   el.addEventListener('input', e => {
@@ -4432,7 +4439,8 @@ function inp(type, placeholder, value, onInput, extra = {}) {
     try { caret = e.target.selectionStart; } catch(_) {}
     onInput(e.target.value);
     if (!el.isConnected) {
-      requestAnimationFrame(() => {
+      // FIX mất focus mobile: refocus đồng bộ (xem compositionend ở trên)
+      {
         const nw = [...document.querySelectorAll('input.form-input')].find(x => x.placeholder === placeholder && x.isConnected);
         if (nw) {
           nw.focus();
@@ -4443,7 +4451,7 @@ function inp(type, placeholder, value, onInput, extra = {}) {
             } catch(_) {}
           }
         }
-      });
+      }
     }
   });
   return el;
@@ -5655,11 +5663,19 @@ function pgInventory() {
     _composing = false;
     search = e.target.value;
     rebuild();
+    // FIX mất focus: rebuild() gọi wrap.innerHTML='' làm input bị detach khỏi DOM
+    // → mất focus trên CẢ desktop lẫn mobile. Re-focus lại đúng node cũ (đồng bộ,
+    // trong sự kiện gõ) để con trỏ & bàn phím mobile không bị đóng.
+    _searchInp.focus();
+    try { _searchInp.setSelectionRange(_searchInp.value.length, _searchInp.value.length); } catch(_) {}
   });
   _searchInp.addEventListener('input', e => {
     if (_composing) return; // dang go IME (tieng Viet) - cho den khi xong
     search = e.target.value;
+    const _pos = e.target.selectionStart;
     rebuild();
+    _searchInp.focus(); // FIX mất focus (xem compositionend ở trên)
+    try { _searchInp.setSelectionRange(_pos, _pos); } catch(_) {}
   });
   const _selType = document.createElement('select');
   _selType.className = 'form-input'; _selType.style.width = '140px';
@@ -7888,12 +7904,19 @@ function pgSales() {
     search = e.target.value;
     curPage = 0;
     rebuild();
+    // FIX mất focus: rebuild() gọi wrap.innerHTML='' làm input bị detach khỏi DOM
+    // → mất focus trên CẢ desktop lẫn mobile. Re-focus lại đúng node cũ (đồng bộ).
+    _salesSearchInp.focus();
+    try { _salesSearchInp.setSelectionRange(_salesSearchInp.value.length, _salesSearchInp.value.length); } catch(_) {}
   });
   _salesSearchInp.addEventListener('input', e => {
     if (_salesComposing) return;
     search = e.target.value;
     curPage = 0;
+    const _pos = e.target.selectionStart;
     rebuild();
+    _salesSearchInp.focus(); // FIX mất focus (xem compositionend ở trên)
+    try { _salesSearchInp.setSelectionRange(_pos, _pos); } catch(_) {}
   });
   const _salesStatusSel = document.createElement('select');
   _salesStatusSel.className = 'form-input';
