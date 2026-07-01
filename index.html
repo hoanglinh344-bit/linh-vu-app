@@ -13,6 +13,8 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-storage-compat.js"></script>
+<!-- EmailJS — gửi mã xác nhận đặt lại mật khẩu qua email admin -->
+<script src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 :root{
@@ -1722,12 +1724,21 @@ const CLOUD = (() => {
     _clearSuspiciousPull() { _suspiciousPull = null; notifyStatus(); },
   };
 })();
+// ─── EmailJS — gửi mã xác nhận reset mật khẩu tới email admin ────
+const EMAILJS_CFG = {
+  serviceId:  'service_linhvuapp',
+  templateId: 'template_02dj60a',
+  publicKey:  'KncD5Is7T76eWBQBl',
+};
+try { if (typeof emailjs !== 'undefined') emailjs.init({ publicKey: EMAILJS_CFG.publicKey }); } catch(e) {}
+
 // ═══════════════════════════════════════════════════════════════
 //  AUTH — Hệ thống đăng nhập Admin / Nhân viên  (v7.5.0)
 //  Cải tiến bảo mật:
 //    1. Hash mật khẩu bằng SHA-256 (Web Crypto API)
 //    2. Brute-force protection: lockout 5 phút sau 5 lần sai
-//    3. Reset mật khẩu yêu cầu mã xác nhận 6 số (không tự động reset)
+//    3. Reset mật khẩu yêu cầu mã xác nhận 6 số, gửi qua email admin
+//       (không hiển thị công khai trên màn hình để tránh tự-reset)
 //    4. Tự động migrate mật khẩu plaintext sang hash khi login
 // ═══════════════════════════════════════════════════════════════
 const AUTH = (() => {
@@ -1880,19 +1891,42 @@ const AUTH = (() => {
     }
   })();
 
-  // ── Reset PIN (6 số, tạo mới mỗi lần gọi) ───────────────────
-  let _resetPin = null;
-  let _resetPinExpiry = 0;
+  // ── Reset PIN (6 số, hash trước khi lưu, chống brute-force) ──
+  // Lưu ở localStorage (thay vì biến in-memory) để cooldown/số lần thử
+  // không bị "reset sạch" chỉ bằng cách tải lại trang.
+  const RESET_PIN_KEY          = 'dtn_reset_pin_state';
+  const RESET_PIN_TTL_MS       = 10 * 60 * 1000; // hiệu lực 10 phút
+  const RESET_PIN_COOLDOWN_MS  = 60 * 1000;      // tối thiểu 60s giữa 2 lần tạo mã
+  const RESET_PIN_MAX_ATTEMPTS = 5;              // khoá sau 5 lần nhập sai
+
+  function getResetPinState() {
+    try { const v = localStorage.getItem(RESET_PIN_KEY); return v ? JSON.parse(v) : null; } catch(e) { return null; }
+  }
+  function saveResetPinState(s) {
+    try { localStorage.setItem(RESET_PIN_KEY, JSON.stringify(s)); } catch(e) {}
+  }
+  function clearResetPinState() {
+    try { localStorage.removeItem(RESET_PIN_KEY); } catch(e) {}
+  }
   function generateResetPin() {
-    _resetPin = String(Math.floor(100000 + Math.random() * 900000));
-    _resetPinExpiry = Date.now() + 10 * 60 * 1000; // 10 phút
-    return _resetPin;
+    const st = getResetPinState();
+    if (st && Date.now() - st.createdAt < RESET_PIN_COOLDOWN_MS) {
+      return { error: 'cooldown', wait: Math.ceil((RESET_PIN_COOLDOWN_MS - (Date.now() - st.createdAt)) / 1000) };
+    }
+    const pin = String(Math.floor(100000 + Math.random() * 900000));
+    saveResetPinState({ hash: hashPwSync(pin, '__reset_pin__'), createdAt: Date.now(), attempts: 0 });
+    return { pin };
   }
   function verifyResetPin(pin) {
-    if (!_resetPin || Date.now() > _resetPinExpiry) return false;
-    const ok = _resetPin === pin.trim();
-    if (ok) { _resetPin = null; _resetPinExpiry = 0; } // dùng 1 lần
-    return ok;
+    const st = getResetPinState();
+    if (!st) return false;
+    if (Date.now() - st.createdAt > RESET_PIN_TTL_MS) { clearResetPinState(); return false; }
+    if ((st.attempts || 0) >= RESET_PIN_MAX_ATTEMPTS) { clearResetPinState(); return false; }
+    const ok = st.hash === hashPwSync((pin || '').trim(), '__reset_pin__');
+    if (ok) { clearResetPinState(); return true; } // dùng 1 lần
+    st.attempts = (st.attempts || 0) + 1;
+    saveResetPinState(st);
+    return false;
   }
 
   return {
@@ -2006,6 +2040,33 @@ const AUTH = (() => {
       return true;
     },
 
+    // ── Email khôi phục mật khẩu (nhận mã reset qua email) ─────
+    // Đổi được CHỈ khi biết mật khẩu admin hiện tại — tránh nhân viên
+    // tự trỏ email khôi phục sang hộp thư của họ rồi tự reset.
+    getRecoveryEmail() {
+      const admin = getAdminCred();
+      return (admin && admin.recoveryEmail) || '';
+    },
+    setRecoveryEmail(email, password) {
+      const admin = getAdminCred();
+      if (!admin) return false;
+      if (!verifyPassword(password, admin)) return false;
+      const trimmed = (email || '').trim();
+      const updated = new Date().toISOString();
+      const newCred = { ...admin, recoveryEmail: trimmed, _updated: updated };
+      try { localStorage.setItem(ADMIN_KEY, JSON.stringify(newCred)); } catch(e) {}
+      try {
+        if (typeof CLOUD !== 'undefined' && CLOUD.getCfg().enabled && typeof firebase !== 'undefined' && firebase.apps.length) {
+          const db = firebase.firestore();
+          const shopId = CLOUD.getCfg().shopId || 'shop1';
+          db.collection('shops').doc(shopId).collection('dtn_admin_cred').doc('admin_cred')
+            .set({ id:'admin_cred', recoveryEmail: trimmed, _updated: updated }, { merge: true })
+            .catch(e => console.warn('[AUTH] cloud push admin_cred error:', e));
+        }
+      } catch(e) {}
+      return true;
+    },
+
     // ── Reset PIN flow ─────────────────────────────────────────
     generateResetPin,
     verifyResetPin,
@@ -2082,6 +2143,15 @@ function showLoginScreen() {
     try { const v = localStorage.getItem('dtn_admin_cred'); return v ? JSON.parse(v).username : 'admin'; } catch(e) { return 'admin'; }
   }
 
+  // Che bớt email khi hiển thị trên màn login (chưa xác thực) — vd "ho***@gmail.com"
+  function maskEmail(email) {
+    const parts = (email || '').split('@');
+    if (parts.length !== 2) return email;
+    const [local, domain] = parts;
+    const visible = local.slice(0, Math.min(2, local.length));
+    return visible + '***@' + domain;
+  }
+
   function render() {
     const adminUser = getAdminUsername();
     const lockSt = AUTH.getLockStatus();
@@ -2102,10 +2172,9 @@ function showLoginScreen() {
       if (resetStep === 1) {
         resetHtml = `<div style="margin-top:14px;padding:14px;background:rgba(91,143,232,0.08);border:1px solid rgba(91,143,232,0.3);border-radius:var(--r2)">
           <div style="font-size:13px;font-weight:700;color:var(--blue);margin-bottom:8px">🔑 Đặt lại mật khẩu Admin</div>
-          <div style="font-size:12px;color:var(--text2);line-height:1.7;margin-bottom:10px">Nhấn "Tạo mã" để hiển thị mã xác nhận 6 số. Ghi lại ngay — hết hạn sau 10 phút.</div>
-          <div id="pinDisplay" style="font-size:28px;font-weight:700;letter-spacing:8px;color:var(--accent);text-align:center;padding:12px;background:var(--bg4);border-radius:var(--r2);border:2px dashed var(--accent);margin-bottom:10px">——————</div>
+          <div id="resetStatusMsg" style="font-size:12px;color:var(--text2);line-height:1.7;margin-bottom:10px">Mã xác nhận 6 số sẽ được gửi tới email khôi phục đã đăng ký (không hiển thị ở đây). Mã có hiệu lực 10 phút.</div>
           <div style="display:flex;gap:8px">
-            <button id="genPinBtn" class="btn btn-primary btn-sm" style="flex:1;justify-content:center">🎲 Tạo mã xác nhận</button>
+            <button id="genPinBtn" class="btn btn-primary btn-sm" style="flex:1;justify-content:center">📧 Gửi mã qua email</button>
             <button id="nextStepBtn" class="btn btn-sm" style="flex:1;justify-content:center;display:none">Tiếp tục →</button>
           </div>
         </div>`;
@@ -2231,13 +2300,38 @@ function showLoginScreen() {
 
     if (showReset && resetStep === 1) {
       const genBtn = root.querySelector('#genPinBtn');
-      const pinDisplay = root.querySelector('#pinDisplay');
+      const statusMsg = root.querySelector('#resetStatusMsg');
       const nextStepBtn = root.querySelector('#nextStepBtn');
       if (genBtn) {
-        genBtn.addEventListener('click', () => {
-          const pin = AUTH.generateResetPin();
-          if (pinDisplay) pinDisplay.textContent = pin;
-          if (nextStepBtn) nextStepBtn.style.display = '';
+        genBtn.addEventListener('click', async () => {
+          const email = AUTH.getRecoveryEmail();
+          if (!email) {
+            if (statusMsg) statusMsg.innerHTML = '❌ Chưa cấu hình email khôi phục. Đăng nhập rồi vào Cài đặt → Tài khoản Admin để thiết lập trước.';
+            return;
+          }
+          const result = AUTH.generateResetPin();
+          if (result.error === 'cooldown') {
+            if (statusMsg) statusMsg.textContent = `⏳ Vừa gửi mã, vui lòng đợi ${result.wait} giây rồi thử lại.`;
+            return;
+          }
+          genBtn.disabled = true;
+          genBtn.textContent = 'Đang gửi...';
+          try {
+            if (typeof emailjs === 'undefined') throw new Error('EmailJS SDK chưa tải được');
+            await emailjs.send(EMAILJS_CFG.serviceId, EMAILJS_CFG.templateId, {
+              email: email,
+              passcode: result.pin,
+              time: new Date(Date.now() + 10 * 60 * 1000).toLocaleTimeString('vi-VN'),
+            });
+            if (statusMsg) statusMsg.innerHTML = `✅ Đã gửi mã xác nhận tới <b>${maskEmail(email)}</b>. Kiểm tra hộp thư (kể cả mục Spam).`;
+            if (nextStepBtn) nextStepBtn.style.display = '';
+          } catch(e) {
+            console.warn('[AUTH] emailjs send error:', e);
+            if (statusMsg) statusMsg.textContent = '❌ Gửi email thất bại. Kiểm tra kết nối mạng rồi thử lại.';
+          } finally {
+            genBtn.disabled = false;
+            genBtn.textContent = '📧 Gửi mã qua email';
+          }
         });
       }
       if (nextStepBtn) nextStepBtn.addEventListener('click', () => { resetStep = 2; render(); });
@@ -2337,6 +2431,7 @@ function pgAccounts() {
         const inpNewPw = mkInput('password', 'Mật khẩu mới (tối thiểu 6 ký tự)', '', () => {});
         const inpNewPw2 = mkInput('password', 'Xác nhận mật khẩu mới', '', () => {});
         const inpNewUser = mkInput('text', 'Tên đăng nhập mới (để trống = giữ nguyên)', '', () => {});
+        const inpRecoveryEmail = mkInput('text', 'vd: admin@gmail.com', AUTH.getRecoveryEmail(), () => {});
         return h('div', { style: { marginTop: 14, padding: 14, background: 'var(--bg3)', borderRadius: 'var(--r2)' } },
           h('div', { style: { fontWeight: 700, fontSize: 12, color: 'var(--text2)', marginBottom: 10, textTransform: 'uppercase', letterSpacing: 1 } }, 'Đổi thông tin đăng nhập admin'),
           h('div', { className: 'fg fg2', style: { gap: 10 } },
@@ -2344,6 +2439,9 @@ function pgAccounts() {
             fg('Mật khẩu hiện tại *', null, inpOldPw),
             fg('Mật khẩu mới', null, inpNewPw),
             fg('Xác nhận mật khẩu mới', null, inpNewPw2)
+          ),
+          h('div', { style: { marginTop: 10 } },
+            fg('Email nhận mã khôi phục mật khẩu (dùng cho "Quên mật khẩu")', null, inpRecoveryEmail)
           ),
           h('div', { style: { marginTop: 10, display: 'flex', gap: 8 } },
             h('button', { className: 'btn btn-primary btn-sm', onClick: () => {
@@ -2371,6 +2469,14 @@ function pgAccounts() {
                 const usedPw = newPw || oldPw;
                 const ok = AUTH.changeAdminUsername(newUser, usedPw);
                 if (!ok) { msg = '❌ Không thể đổi tên đăng nhập!'; rebuild(); return; }
+              }
+
+              const newRecoveryEmail = inpRecoveryEmail.value.trim();
+              if (newRecoveryEmail !== AUTH.getRecoveryEmail()) {
+                if (newRecoveryEmail && !newRecoveryEmail.includes('@')) { msg = '❌ Email khôi phục không hợp lệ!'; rebuild(); return; }
+                const usedPw = newPw || oldPw;
+                const ok = AUTH.setRecoveryEmail(newRecoveryEmail, usedPw);
+                if (!ok) { msg = '❌ Không thể lưu email khôi phục!'; rebuild(); return; }
               }
 
               msg = '✅ Đã cập nhật thông tin đăng nhập thành công!';
@@ -7302,12 +7408,13 @@ function openImport(existing, rebuild, prefillProduct) {
       : Math.round((e.shipUnitPrice || 0) * (e.shipQty || 1));
     const vatRate = e.shipVatRate || 0;
     const origWithVat = vatRate > 0 ? Math.round(origShipFeeTotal * (1 + vatRate/100)) : origShipFeeTotal;
+    const _nf = n => isNaN(n) ? 0 : Math.round(n);
     batchInfoEl.innerHTML =
       '📦 <strong>Phiếu này thuộc 1 chuyến hàng nhiều mặt hàng</strong><br>' +
-      '• Đơn giá VC gốc cả chuyến: <strong>' + numFmt(e.shipUnitPrice || 0) + 'đ/' + (e.shipUnit || 'chuyến') + '</strong>' +
-      (e.shipUnit !== 'chuyến' && e.shipQty ? ' × ' + e.shipQty + ' = <strong>' + numFmt(origShipFeeTotal) + 'đ</strong>' : '') +
-      (vatRate > 0 ? ' (+VAT ' + vatRate + '%→ <strong>' + numFmt(origWithVat) + 'đ</strong>)' : '') + '<br>' +
-      '• Phí VC đã chia cho phiếu này: <strong style="color:var(--accent)">' + numFmt(e.shipFee || 0) + 'đ</strong><br>' +
+      '• Đơn giá VC gốc cả chuyến: <strong>' + _nf(e.shipUnitPrice || 0) + 'đ/' + (e.shipUnit || 'chuyến') + '</strong>' +
+      (e.shipUnit !== 'chuyến' && e.shipQty ? ' × ' + e.shipQty + ' = <strong>' + _nf(origShipFeeTotal) + 'đ</strong>' : '') +
+      (vatRate > 0 ? ' (+VAT ' + vatRate + '%→ <strong>' + _nf(origWithVat) + 'đ</strong>)' : '') + '<br>' +
+      '• Phí VC đã chia cho phiếu này: <strong style="color:var(--accent)">' + _nf(e.shipFee || 0) + 'đ</strong><br>' +
       '<span style="color:var(--text2)">Bạn có thể điều chỉnh lại phí VC cho phiếu này ở ô trên.</span>';
     shipFeeWrap.appendChild(batchInfoEl);
   }
