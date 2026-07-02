@@ -4778,7 +4778,7 @@ function buildApp() {
 
   const sidebar = h('div', { className: 'sidebar' + (sidebarOpen ? ' open' : '') },
     h('div', { className: 'logo-area' },
-      h('div', { className: 'logo-gem' }, '💎'),
+      h('img', { className: 'logo-gem', src: LOGO_DATA_URL, alt: 'Linh Vũ Stone', style: { objectFit: 'cover' } }),
       h('div', { className: 'logo-name' }, settings.shopName || 'Đá Tự Nhiên'),
       h('div', { className: 'logo-sub' }, isAdmin ? '👑 Admin' : ('👷 ' + (currentUser?.displayName || 'Nhân viên')))
     ),
@@ -4807,7 +4807,7 @@ function buildApp() {
 
   const topbar = h('div', { className: 'topbar' },
     h('div', { className: 'topbar-logo' },
-      h('div', { className: 'topbar-gem' }, '💎'),
+      h('img', { className: 'topbar-gem', src: LOGO_DATA_URL, alt: 'Linh Vũ Stone', style: { objectFit: 'cover' } }),
       settings.shopName || 'Đá Tự Nhiên'
     ),
     h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
