@@ -10086,7 +10086,7 @@ function pgDebt() {
       const suppPaid  = suppOrders.reduce((a, i) => a + i.paid, 0);
       const suppDebtTotal = suppTotal - suppPaid;
 
-      const suppLeftPanel = h('div', { style: { width: '240px', flexShrink: 0 } },
+      const suppLeftPanel = h('div', { style: { flex: '0 0 240px', minWidth: '240px' } },
         inp('text', '🔍 Tìm nhà cung cấp...', suppSearch, v => { suppSearch = v; rebuild(); }, { style: { marginBottom: 10 } }),
         h('div', { style: { fontSize: 11, color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: 1, fontWeight: 700, marginBottom: 8, paddingLeft: 4 } },
           filteredSupps.length + ' nhà cung cấp'
@@ -10114,7 +10114,7 @@ function pgDebt() {
       );
 
       const suppRightPanel = selSupp
-        ? h('div', { style: { flex: 1, minWidth: 0 } },
+        ? h('div', { style: { flex: 1, minWidth: '280px' } },
             h('div', { className: 'card', style: { marginBottom: 14 } },
               h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 10 } },
                 h('div', {},
@@ -10180,7 +10180,7 @@ function pgDebt() {
       const custPaid  = orders.reduce((a, s) => a + s.paid, 0);
       const custDebt  = custTotal - custPaid;
 
-      const leftPanel = h('div', { style: { width: '240px', flexShrink: 0 } },
+      const leftPanel = h('div', { style: { flex: '0 0 240px', minWidth: '240px' } },
         inp('text', '🔍 Tìm khách hàng...', histSearch, v => { histSearch = v; rebuild(); }, { style: { marginBottom: 10 } }),
         h('div', { style: { fontSize: 11, color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: 1, fontWeight: 700, marginBottom: 8, paddingLeft: 4 } },
           `${filteredCusts.length} khách hàng`
@@ -10209,7 +10209,7 @@ function pgDebt() {
       );
 
       const rightPanel = cust
-        ? h('div', { style: { flex: 1, minWidth: 0 } },
+        ? h('div', { style: { flex: 1, minWidth: '280px' } },
             // Header khách hàng
             h('div', { className: 'card', style: { marginBottom: 14 } },
               h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 10 } },
