@@ -2619,30 +2619,13 @@ function openPdfMobile(htmlContent, filename) {
       const btnRow = document.createElement('div');
       btnRow.style.cssText = 'display:flex;gap:8px;align-items:center';
 
-      // Nút chia sẻ (Web Share API — hoạt động trên iOS/Android)
-      if (navigator.share || navigator.canShare) {
-        const btnShare = document.createElement('button');
-        btnShare.style.cssText = 'padding:7px 14px;border-radius:7px;border:none;background:#c9a84c;color:#0f1117;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit';
-        btnShare.textContent = '📤 Chia sẻ';
-        btnShare.onclick = async () => {
-          try {
-            // Tạo blob PDF nếu browser hỗ trợ, fallback sang share URL
-            const shareBlob = new Blob([htmlContent], { type: 'text/html' });
-            const shareFile = new File([shareBlob], (filename||'document')+'.html', { type: 'text/html' });
-            if (navigator.canShare && navigator.canShare({ files: [shareFile] })) {
-              await navigator.share({ files: [shareFile], title: filename || 'Tài liệu' });
-            } else {
-              await navigator.share({ title: filename || 'Tài liệu', url: url });
-            }
-          } catch(e) { if (e.name !== 'AbortError') alert('Không thể chia sẻ: ' + e.message); }
-        };
-        btnRow.appendChild(btnShare);
-      }
-
-      // Nút in (hoạt động tốt trên mobile Chrome/Safari)
+      // Nút in / Xuất PDF — dùng cơ chế in gốc của hệ điều hành (AirPrint trên iOS,
+      // hộp in của Android) để đảm bảo đúng font chữ và định dạng như trên máy tính.
+      // KHÔNG chia sẻ thẳng file HTML nữa (trước đây gây ra file .html thay vì PDF khi
+      // gửi cho khách) — sau khi bấm, hộp thoại in cho phép lưu/chia sẻ file PDF chuẩn.
       const btnPrint = document.createElement('button');
-      btnPrint.style.cssText = 'padding:7px 14px;border-radius:7px;border:1px solid #3a4560;background:#1e2535;color:#e8e6df;font-size:13px;cursor:pointer;font-family:inherit';
-      btnPrint.textContent = '🖨️ In';
+      btnPrint.style.cssText = 'padding:7px 14px;border-radius:7px;border:none;background:#c9a84c;color:#0f1117;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit';
+      btnPrint.textContent = '🖨️ In / Xuất PDF';
       btnPrint.onclick = () => {
         const iframe = overlay.querySelector('iframe');
         if (iframe) {
@@ -16910,45 +16893,16 @@ th.r{text-align:right}th.c{text-align:center}
   // ── Format số VND ────────────────────────────────────────────
   function fmtVND(n) { return new Intl.NumberFormat('vi-VN').format(Math.round(n)||0); }
 
-  // ── Tải file PDF thực về máy (Blob download) ────────────────
+  // ── Xuất báo giá thành PDF thật qua cơ chế in gốc của hệ điều hành ──
+  // (KHÔNG chia sẻ file .html thô nữa — trước đây gây ra file .html thay vì
+  // PDF khi gửi cho khách. buildQuotationPDF() đã tự embed window.print()
+  // nên overlay sẽ tự mở hộp thoại in ngay khi hiện lên.)
   function downloadQuotationPDF(q) {
     try {
-      const html = buildQuotationPDF(q);
-      const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
-      const url  = URL.createObjectURL(blob);
-      // Tên file: BaoGia_TenKhach_NgayThang.html
-      const _now = new Date();
-      const _pad = n => String(n).padStart(2,'0');
-      const dateTag = `${_now.getFullYear()}${_pad(_now.getMonth()+1)}${_pad(_now.getDate())}`;
-      const custTag = (q.customerName || 'KhachHang').replace(/\s+/g,'_').replace(/[^a-zA-Z0-9_àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđÀÁẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬÈÉẺẼẸÊẾỀỂỄỆÌÍỈĨỊÒÓỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÙÚỦŨỤƯỨỪỬỮỰỲÝỶỸỴĐ]/g,'');
-      const fname = `BaoGia_${custTag}_${dateTag}.html`;
-
-      // Thử Web Share API (share file thực, hoạt động iOS/Android)
-      const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-      if (isMobile && navigator.share && navigator.canShare) {
-        const file = new File([blob], fname, { type: 'text/html' });
-        if (navigator.canShare({ files: [file] })) {
-          navigator.share({ files: [file], title: 'Báo Giá - ' + (q.customerName || 'Quý Khách') })
-            .catch(e => { if (e.name !== 'AbortError') _fallbackDownload(url, fname); });
-          return;
-        }
-      }
-      _fallbackDownload(url, fname);
+      openPdfMobile(buildQuotationPDF(q), 'Báo giá - ' + (q.customerName || 'Quý Khách'));
     } catch(e) {
-      toast('❌ Không thể tải file: ' + (e.message||e), 'error');
+      toast('❌ Không thể mở báo giá: ' + (e.message||e), 'error');
     }
-  }
-
-  function _fallbackDownload(url, fname) {
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = fname;
-    a.style.display = 'none';
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 2000);
-    // Hướng dẫn rõ ràng: file .html mở bằng trình duyệt, sau đó in/lưu PDF
-    toast('📥 Đã tải file báo giá (.html) — Mở bằng trình duyệt, chọn In → Lưu PDF để có file PDF chuẩn!', 'info', 5000);
   }
 
   // ── Render quotation card trong bubble ───────────────────────
@@ -17001,14 +16955,13 @@ th.r{text-align:right}th.c{text-align:center}
       openPdfMobile(html, 'Báo giá - ' + (q.customerName || 'Quý Khách'));
     };
 
-    // Nút 2: Tải file PDF về máy / Chia sẻ trên mobile
-    const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    // Nút 2: Xuất PDF — mở hộp thoại in gốc để lưu/chia sẻ PDF đúng font
     const btnDL = document.createElement('button');
     btnDL.className = 'qc-btn pdf';
     btnDL.style.background = '#4caf7d';
     btnDL.style.color = '#fff';
-    btnDL.innerHTML = isMobile ? '📤 Chia sẻ file' : '📥 Tải file';
-    btnDL.title = isMobile ? 'Chia sẻ file báo giá qua Zalo, Gmail...' : 'Tải file báo giá về máy';
+    btnDL.innerHTML = '📄 Xuất PDF';
+    btnDL.title = 'Mở hộp thoại in để lưu/chia sẻ file PDF chuẩn qua Zalo, Gmail...';
     btnDL.onclick = () => downloadQuotationPDF(q);
 
     // Nút 3: Lưu vào trang Báo Giá
