@@ -2597,7 +2597,16 @@ function pgAccounts() {
 // ── Mobile-safe PDF opener ─────────────────────────────────────────
 // Trên mobile, window.open thường bị block. Dùng blob URL để mở PDF
 // và hiển thị nút "Chia sẻ" / "Tải về" thân thiện với điện thoại.
-function openPdfMobile(htmlContent, filename) {
+function openPdfMobile(htmlContent, filename, docTitle) {
+  // Một số trình duyệt di động (đặc biệt Safari/iOS khi in qua iframe) lấy
+  // tiêu đề trang GỐC (tab ngoài) làm tên file khi lưu PDF, chứ không phải
+  // <title> bên trong iframe. Tạm đổi tiêu đề tab gốc sang tên khách hàng
+  // (docTitle) trong lúc xem/in, rồi khôi phục lại khi đóng — để tên file
+  // PDF xuất ra chỉ chứa tên khách hàng, không lẫn tên app/cửa hàng.
+  const _prevOuterTitle = document.title;
+  if (docTitle) document.title = docTitle;
+  const _restoreOuterTitle = () => { document.title = _prevOuterTitle; };
+
   try {
     const blob = new Blob([htmlContent], { type: 'text/html;charset=utf-8' });
     const url  = URL.createObjectURL(blob);
@@ -2651,6 +2660,7 @@ function openPdfMobile(htmlContent, filename) {
         document.body.removeChild(overlay);
         _revokeUrl();
         document.body.style.overflow = ''; // khôi phục scroll
+        _restoreOuterTitle();
       };
 
       btnRow.appendChild(btnPrint);
@@ -2671,7 +2681,9 @@ function openPdfMobile(htmlContent, filename) {
       document.body.style.overflow = 'hidden'; // chặn scroll nền
 
     } else {
-      // Desktop: mở tab mới bình thường
+      // Desktop: mở tab mới bình thường (tab mới có <title> riêng từ htmlContent
+      // nên không cần đổi tiêu đề tab hiện tại — khôi phục lại ngay)
+      _restoreOuterTitle();
       const w = window.open(url, '_blank');
       if (!w) {
         // Fallback: popup bị chặn, thử write trực tiếp
@@ -2683,6 +2695,7 @@ function openPdfMobile(htmlContent, filename) {
   } catch(e) {
     // Ultimate fallback
     console.error('[PDF] openPdfMobile error:', e);
+    _restoreOuterTitle();
     const w = window.open('', '_blank', 'width=900,height=800');
     if (w) { w.document.write(htmlContent); w.document.close(); }
   }
@@ -9631,7 +9644,7 @@ tr.sub td { background:#f6f0e2; font-weight:700; }
 </div>
 <scr${''}ipt>window.onload=function(){window.print()};</scr${''}ipt>
 </body></html>`;
-  openPdfMobile(html, 'Công nợ KH' + (label ? ' - ' + label : ''));
+  openPdfMobile(html, 'Công nợ KH' + (label ? ' - ' + label : ''), label || undefined);
 }
 
 // Cụm 2 nút Xuất PDF / Excel cho công nợ
@@ -10575,7 +10588,7 @@ function pgInvoice() {
         </tr>`).join('');
         const shipRow = ship2 > 0 ? `<tr><td class="c"></td><td><i>🚚 Phí vận chuyển</i></td><td class="c">—</td><td class="c">—</td><td class="r">—</td><td class="r"><b>${fmt(ship2)}đ</b></td></tr>` : '';
         return `<!DOCTYPE html><html><head><meta charset="UTF-8">
-<title>Hoá Đơn - ${grp.customer}</title>
+<title>${grp.customer}</title>
 <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:ital,wght@0,400;0,600;0,700;1,400&display=swap" rel="stylesheet">
 <style>
 * { box-sizing:border-box; margin:0; padding:0; }
@@ -10640,7 +10653,7 @@ td.r { text-align:right; } td.c { text-align:center; }
   </div>
   <div class="footer">Cảm ơn quý khách đã tin tưởng sử dụng sản phẩm của chúng tôi!</div>
 </div>
-${autoprint ? '<scr'+'ipt>document.title=" ";var _t=document.title;window.addEventListener("beforeprint",function(){document.title="";});window.addEventListener("afterprint",function(){document.title=_t;});window.onload=function(){window.print();};<\/scr'+'ipt>' : '<scr'+'ipt>var _t=document.title;window.addEventListener("beforeprint",function(){document.title="";});window.addEventListener("afterprint",function(){document.title=_t;});<\/scr'+'ipt>'}
+${autoprint ? '<scr'+'ipt>window.onload=function(){window.print()};<\/scr'+'ipt>' : ''}
 </body></html>`;
       }
 
@@ -10648,10 +10661,10 @@ ${autoprint ? '<scr'+'ipt>document.title=" ";var _t=document.title;window.addEve
         invEl,
         h('div', { style:{ marginTop:12, display:'flex', gap:8, flexWrap:'wrap' } },
           h('button', { className:'btn btn-primary', onClick: () => {
-            openPdfMobile(buildGroupInvoiceHTML(grp, true), 'Hóa đơn - ' + (grp.customer||''));
+            openPdfMobile(buildGroupInvoiceHTML(grp, true), 'Hóa đơn - ' + (grp.customer||''), grp.customer);
           } }, '🖨️ In hoá đơn'),
           h('button', { className:'btn', onClick: () => {
-            openPdfMobile(buildGroupInvoiceHTML(grp, false), 'Hóa đơn PDF - ' + (grp.customer||''));
+            openPdfMobile(buildGroupInvoiceHTML(grp, false), 'Hóa đơn PDF - ' + (grp.customer||''), grp.customer);
           } }, '📄 Xuất PDF')
         )
       );
@@ -10769,7 +10782,7 @@ function pgXuatKho() {
       </tr>`;
     }).join('');
     return `<!DOCTYPE html><html><head><meta charset="UTF-8">
-<title>Phiếu Xuất Kho - ${esc(grp.customer)}</title>
+<title>${esc(grp.customer)}</title>
 <style>
 * { box-sizing:border-box; margin:0; padding:0; }
 body { font-family:'Times New Roman',Times,serif; font-size:13px; color:#000; background:#fff; }
@@ -10897,10 +10910,10 @@ ${autoprint ? '<scr' + 'ipt>window.onload=function(){window.print()};<\/scr' + '
         slipEl,
         h('div', { style: { marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' } },
           h('button', { className: 'btn btn-primary', onClick: () => {
-            openPdfMobile(buildXuatKhoHTML(grp, true), 'Phiếu xuất kho - ' + (grp.customer || ''));
+            openPdfMobile(buildXuatKhoHTML(grp, true), 'Phiếu xuất kho - ' + (grp.customer || ''), grp.customer);
           } }, '🖨️ In phiếu'),
           h('button', { className: 'btn', onClick: () => {
-            openPdfMobile(buildXuatKhoHTML(grp, false), 'Phiếu xuất kho PDF - ' + (grp.customer || ''));
+            openPdfMobile(buildXuatKhoHTML(grp, false), 'Phiếu xuất kho PDF - ' + (grp.customer || ''), grp.customer);
           } }, '📄 Xuất PDF')
         )
       );
@@ -11199,7 +11212,7 @@ function pgQuotation() {
             const noteLines = customerNote ? customerNote.split('\n').filter(l => l.trim()) : [];
             const noteStr = noteLines.length > 0 ? '<div style="margin-top:16px;font-size:12px;color:#555;border:1px solid #e8e0cc;border-radius:6px;padding:12px 16px;background:#fffdf7;"><div style="font-weight:700;color:#8b6914;margin-bottom:8px;font-size:12px;text-transform:uppercase;letter-spacing:.5px;">📝 Điều khoản &amp; Ghi chú</div>' + noteLines.map((line, i) => '<div style="display:flex;gap:8px;margin-bottom:5px;"><span style="color:#d4b84a;flex-shrink:0;font-weight:700;">' + (i+1) + '.</span><span>' + line + '</span></div>').join('') + '</div>' : '';
             return `<!DOCTYPE html><html><head><meta charset="UTF-8">
-<title>Báo Giá — ${S.settings.shopName || 'Đá Tự Nhiên'}</title>
+<title>${customerName || 'Bao Gia'}</title>
 <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:ital,wght@0,400;0,600;0,700;1,400&display=swap" rel="stylesheet">
 <style>
 * { box-sizing:border-box; margin:0; padding:0; }
@@ -11276,7 +11289,7 @@ tr:nth-child(even) td { background:#faf7f0; }
   </div>
   <div class="footer">Cảm ơn quý khách đã quan tâm đến sản phẩm đá tự nhiên của chúng tôi! Mọi thắc mắc vui lòng liên hệ: ${S.settings.phone || ''}</div>
 </div>
-${autoprint ? '<scr'+'ipt>document.title=" ";var _t=document.title;window.addEventListener("beforeprint",function(){document.title="";});window.addEventListener("afterprint",function(){document.title=_t;});window.onload=function(){window.print();};<\/scr'+'ipt>' : '<scr'+'ipt>var _t=document.title;window.addEventListener("beforeprint",function(){document.title="";});window.addEventListener("afterprint",function(){document.title=_t;});<\/scr'+'ipt>'}
+${autoprint ? '<scr'+'ipt>window.onload=function(){window.print()};<\/scr'+'ipt>' : ''}
 </body></html>`;
           }
 
@@ -11298,13 +11311,13 @@ ${autoprint ? '<scr'+'ipt>document.title=" ";var _t=document.title;window.addEve
               h('button', { className: 'btn', style: { background: 'var(--blue)', color: '#fff', border: 'none' }, onClick: () => {
                 S.modal = null; render();
                 setTimeout(() => {
-                  openPdfMobile(buildCustomerQuoteHTML(false), 'Báo giá PDF');
+                  openPdfMobile(buildCustomerQuoteHTML(false), 'Báo giá PDF', customerName);
                 }, 100);
               } }, '📄 Xuất PDF báo giá'),
               h('button', { className: 'btn btn-primary', onClick: () => {
                 S.modal = null; render();
                 setTimeout(() => {
-                  openPdfMobile(buildCustomerQuoteHTML(true), 'Báo giá in');
+                  openPdfMobile(buildCustomerQuoteHTML(true), 'Báo giá in', customerName);
                 }, 100);
               } }, '🖨️ In báo giá')
             ]
@@ -16541,7 +16554,7 @@ Sau thẻ QUOTATION, tiếp tục trả lời bình thường để giải thíc
     }).join('');
 
     return `<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8">
-<title>Báo Giá - ${shop}</title>
+<title>${q.customerName || 'Bao Gia'}</title>
 <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -16899,7 +16912,7 @@ th.r{text-align:right}th.c{text-align:center}
   // nên overlay sẽ tự mở hộp thoại in ngay khi hiện lên.)
   function downloadQuotationPDF(q) {
     try {
-      openPdfMobile(buildQuotationPDF(q), 'Báo giá - ' + (q.customerName || 'Quý Khách'));
+      openPdfMobile(buildQuotationPDF(q), 'Báo giá - ' + (q.customerName || 'Quý Khách'), q.customerName);
     } catch(e) {
       toast('❌ Không thể mở báo giá: ' + (e.message||e), 'error');
     }
@@ -16952,7 +16965,7 @@ th.r{text-align:right}th.c{text-align:center}
     btnView.title = 'Xem trước và in báo giá';
     btnView.onclick = () => {
       const html = buildQuotationPDF(q);
-      openPdfMobile(html, 'Báo giá - ' + (q.customerName || 'Quý Khách'));
+      openPdfMobile(html, 'Báo giá - ' + (q.customerName || 'Quý Khách'), q.customerName);
     };
 
     // Nút 2: Xuất PDF — mở hộp thoại in gốc để lưu/chia sẻ PDF đúng font
