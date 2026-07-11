@@ -10556,6 +10556,10 @@ function pgInvoice() {
           remaining > 0 && h('div', { style:{ color:'#c0392b', fontWeight:700 } }, 'Còn lại: ', fmt(remaining) + 'đ')
         ),
         grp.note && h('div', { style:{ marginTop:12, fontSize:11, color:'#888', fontStyle:'italic', borderTop:'1px solid #eee', paddingTop:8 } }, 'Ghi chú: ', grp.note),
+        h('div', { style:{ marginTop:14, fontSize:11.5, color:'#a33', background:'#fdf3f0', border:'1px solid #f0d8d0', borderRadius:6, padding:'8px 12px', lineHeight:1.7 } },
+          h('div', {}, '• Không nhận lại hàng hư hỏng vỏ thùng, tháo giây, dính vữa hồ dầu....'),
+          h('div', {}, '• Hàng mới 100%')
+        ),
         h('div', { style:{ marginTop:36, display:'flex', justifyContent:'space-between', textAlign:'center' } },
           h('div', { style:{ width:'44%' } },
             h('div', { style:{ fontSize:12, fontWeight:700, color:'#333', textTransform:'uppercase', letterSpacing:.8 } }, 'Đại diện bán hàng'),
@@ -10618,6 +10622,7 @@ td.r { text-align:right; } td.c { text-align:center; }
 .sig-name { border-top:1.5px solid #888; padding-top:6px; font-size:12px; color:#444; font-weight:600; }
 .footer { margin-top:24px; text-align:center; font-size:11px; color:#aaa; border-top:1px solid #e0d9c8; padding-top:12px; }
 .note-box { margin-top:12px; font-size:11px; color:#888; font-style:italic; border-top:1px solid #eee; padding-top:8px; }
+.policy-note { margin-top:14px; font-size:11.5px; color:#a33; background:#fdf3f0; border:1px solid #f0d8d0; border-radius:6px; padding:8px 12px; line-height:1.7; }
 @media print {
   @page { size:A4; margin:8mm 12mm 8mm 12mm; }
   body { print-color-adjust:exact; -webkit-print-color-adjust:exact; }
@@ -10647,6 +10652,7 @@ td.r { text-align:right; } td.c { text-align:center; }
     ${rem2 > 0 ? '<div class="debt-row">Còn lại: ' + fmt(rem2) + 'đ</div>' : ''}
   </div>
   ${grp.note ? '<div class="note-box">Ghi chú: ' + grp.note + '</div>' : ''}
+  <div class="policy-note">• Không nhận lại hàng hư hỏng vỏ thùng, tháo giây, dính vữa hồ dầu....<br>• Hàng mới 100%</div>
   <div class="signatures">
     <div class="sig-box"><div class="sig-title">Đại diện bán hàng</div><div class="sig-note">(Ký, ghi rõ họ tên)</div><div class="sig-name">${S.settings.shopName || 'Đá Tự Nhiên'}</div></div>
     <div class="sig-box"><div class="sig-title">Khách hàng xác nhận</div><div class="sig-note">(Ký, ghi rõ họ tên)</div><div class="sig-name">${grp.customer}</div></div>
@@ -10798,6 +10804,7 @@ th,td { border:1px solid #555; padding:6px 8px; vertical-align:middle; }
 thead th { background:#eee; font-weight:700; text-align:center; font-size:11.5px; }
 td.c { text-align:center; }
 .totrow { font-weight:700; background:#f0f0f0; }
+.policy-note { margin-top:12px; font-size:12px; color:#a33; background:#fdf3f0; border:1px solid #f0d8d0; border-radius:5px; padding:8px 12px; line-height:1.7; }
 .sigs { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:30px; text-align:center; }
 .sig-t { font-weight:700; font-size:12.5px; text-transform:uppercase; }
 .sig-n { font-size:11px; font-style:italic; color:#666; margin:3px 0 60px; }
@@ -10829,6 +10836,7 @@ td.c { text-align:center; }
       <tr class="totrow"><td class="c" colspan="4">Tổng số lượng</td><td class="c">${fmt(totalQty)}</td><td></td></tr>
     </tbody>
   </table>
+  <div class="policy-note">• Không nhận lại hàng hư hỏng vỏ thùng, tháo giây, dính vữa hồ dầu....<br>• Hàng mới 100%</div>
   <div class="sigs">
     <div><div class="sig-t">Người lập phiếu</div><div class="sig-n">(Ký, ghi rõ họ tên)</div></div>
     <div><div class="sig-t">Thủ kho</div><div class="sig-n">(Ký, ghi rõ họ tên)</div></div>
@@ -10901,6 +10909,10 @@ ${autoprint ? '<scr' + 'ipt>window.onload=function(){window.print()};<\/scr' + '
               h('td', { style: { padding: '8px', border: '1px solid #ddd' } }, '')
             )
           )
+        ),
+        h('div', { style: { marginTop: 14, fontSize: 11.5, color: '#a33', background: '#fdf3f0', border: '1px solid #f0d8d0', borderRadius: 6, padding: '8px 12px', lineHeight: 1.7 } },
+          h('div', {}, '• Không nhận lại hàng hư hỏng vỏ thùng, tháo giây, dính vữa hồ dầu....'),
+          h('div', {}, '• Hàng mới 100%')
         )
       );
 
