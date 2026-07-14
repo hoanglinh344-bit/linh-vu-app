@@ -10313,7 +10313,146 @@ function pgDebt() {
                   suppDebtTotal > 0
                     ? h('div', { className: 'badge badge-amber', style: { fontSize: 12, padding: '5px 12px' } }, '⚠️ Còn nợ: ' + fmt(suppDebtTotal) + 'đ')
                     : h('div', { className: 'badge badge-green', style: { fontSize: 12, padding: '5px 12px' } }, '✅ Đã thanh toán hết'),
-                  suppDebtTotal > 0 && suppDebtExportButtons(() => [selSupp], selSupp.name)
+                  suppDebtTotal > 0 && suppDebtExportButtons(() => [selSupp], selSupp.name),
+                  suppDebtTotal > 0 && h('button', {
+                    className: 'btn btn-primary btn-sm',
+                    style: { background: 'var(--amber)', borderColor: 'var(--amber)', color: '#fff', fontWeight: 700 },
+                    onClick: () => {
+                      // Trả nợ tổng — tự động khấu trừ vào các lần nhập còn nợ theo thứ tự cũ nhất trước
+                      const suppDebtOrders = [...suppOrders].filter(i => i.status === 'debt').sort((a, b) => a.date.localeCompare(b.date));
+                      const now3 = new Date();
+                      const timeStr3 = now3.getHours().toString().padStart(2,'0') + ':' + now3.getMinutes().toString().padStart(2,'0');
+                      const inpAmt3  = mkInput('number', 'Số tiền trả (VNĐ)', String(suppDebtTotal), () => {});
+                      inpAmt3.style.fontSize = '18px'; inpAmt3.style.fontWeight = '700';
+                      inpAmt3.setAttribute('inputmode','numeric');
+                      const inpDate3 = mkInput('date', '', today(), () => {});
+                      const inpTime3 = mkInput('time', '', timeStr3, () => {});
+                      const inpNote3 = mkInput('text', 'VD: chuyển khoản, tiền mặt...', '', () => {});
+
+                      // Preview phân bổ
+                      const previewEl3 = document.createElement('div');
+                      previewEl3.style.cssText = 'margin-top:12px';
+
+                      function renderPreview3() {
+                        const amtIn = parseFloat(inpAmt3.value) || 0;
+                        previewEl3.innerHTML = '';
+                        if (amtIn <= 0) return;
+                        const title = document.createElement('div');
+                        title.style.cssText = 'font-size:11px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px';
+                        title.textContent = '📋 Phân bổ tự động (cũ nhất trước)';
+                        previewEl3.appendChild(title);
+                        let remain = amtIn;
+                        suppDebtOrders.forEach(i => {
+                          if (remain <= 0) return;
+                          const owe = i.total - i.paid;
+                          const pay = Math.min(owe, remain);
+                          remain -= pay;
+                          const rowEl = document.createElement('div');
+                          rowEl.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--bg3);border-radius:6px;margin-bottom:4px;font-size:12px';
+                          rowEl.innerHTML = `<div><span style="color:var(--text2)">📅 ${fmtD(i.date)} · ${escHtml(i.productName)}</span><br><span style="color:var(--amber);font-size:11px">Nợ: ${fmt(owe)}đ</span></div><div style="font-weight:700;color:var(--green)">Trả: ${fmt(pay)}đ${pay >= owe ? ' ✅' : ''}</div>`;
+                          previewEl3.appendChild(rowEl);
+                        });
+                        if (remain > 0) {
+                          const warn = document.createElement('div');
+                          warn.style.cssText = 'font-size:11px;color:var(--amber);margin-top:4px';
+                          warn.textContent = `⚠️ Dư ${fmt(remain)}đ (vượt quá tổng nợ ${fmt(suppDebtTotal)}đ)`;
+                          previewEl3.appendChild(warn);
+                        }
+                      }
+                      inpAmt3.addEventListener('input', renderPreview3);
+                      renderPreview3();
+
+                      S.modal = {
+                        title: `🏭 Trả nợ tổng — ${selSupp.name}`,
+                        large: true,
+                        content: h('div', {},
+                          h('div', { style: { marginBottom: 14, padding: '12px 14px', background: 'var(--bg3)', borderRadius: 'var(--r2)', fontSize: 13 } },
+                            h('div', { style: { fontWeight: 700, fontSize: 15, color: 'var(--text)' } }, selSupp.name),
+                            h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10, marginTop: 10 } },
+                              h('div', { style: { textAlign: 'center' } },
+                                h('div', { style: { fontSize: 10, color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 3 } }, 'Tổng nhập'),
+                                h('div', { style: { fontWeight: 700, color: 'var(--accent)' } }, fmt(suppTotal) + 'đ')
+                              ),
+                              h('div', { style: { textAlign: 'center' } },
+                                h('div', { style: { fontSize: 10, color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 3 } }, 'Đã trả'),
+                                h('div', { style: { fontWeight: 700, color: 'var(--green)' } }, fmt(suppPaid) + 'đ')
+                              ),
+                              h('div', { style: { textAlign: 'center' } },
+                                h('div', { style: { fontSize: 10, color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 3 } }, 'Còn nợ'),
+                                h('div', { style: { fontWeight: 700, color: 'var(--amber)', fontSize: 15 } }, fmt(suppDebtTotal) + 'đ')
+                              )
+                            ),
+                            h('div', { style: { fontSize: 11, color: 'var(--text3)', marginTop: 8 } },
+                              `${suppDebtOrders.length} lần nhập chưa thanh toán · Phân bổ tự động theo thứ tự ngày cũ nhất`
+                            )
+                          ),
+                          h('div', { className: 'fg fg2', style: { gap: 10 } },
+                            fg('Ngày trả', null, inpDate3),
+                            fg('Giờ trả', null, inpTime3),
+                            fg('Số tiền trả (VNĐ) *', true, inpAmt3),
+                            fg('Ghi chú / Hình thức TT', true, inpNote3)
+                          ),
+                          h('div', { style: { display: 'flex', gap: 8, marginTop: 8 } },
+                            h('button', { className: 'btn btn-xs', style: { background: 'var(--amber)', color: '#fff', border: 'none' },
+                              onClick: () => { inpAmt3.value = suppDebtTotal; renderPreview3(); }
+                            }, '✓ Trả hết ' + fmt(suppDebtTotal) + 'đ'),
+                            h('button', { className: 'btn btn-xs btn-ghost',
+                              onClick: () => { inpAmt3.value = Math.round(suppDebtTotal / 2); renderPreview3(); }
+                            }, '½ Trả nửa')
+                          ),
+                          previewEl3
+                        ),
+                        footer: [
+                          h('button', { className: 'btn', onClick: () => { S.modal = null; render(); } }, 'Huỷ'),
+                          h('button', { className: 'btn btn-primary', style: { background: 'var(--amber)', borderColor: 'var(--amber)' }, onClick: () => {
+                            const amtIn = parseFloat(inpAmt3.value) || 0;
+                            if (amtIn <= 0) { toast('Vui lòng nhập số tiền trả!', 'error'); return; }
+                            if (amtIn > suppDebtTotal + 0.01) { toast('Số tiền vượt quá tổng nợ ' + fmt(suppDebtTotal) + 'đ!', 'error'); return; }
+                            const dateIn = inpDate3.value;
+                            const timeIn = inpTime3.value;
+                            const noteIn = inpNote3.value.trim();
+
+                            // Phân bổ vào các lần nhập (cũ nhất trước)
+                            let remaining3 = amtIn;
+                            const newLogs = [];
+                            const updatedImports = S.imports.map(imp => {
+                              if (remaining3 <= 0) return imp;
+                              const matchDebt = suppDebtOrders.find(d => d.id === imp.id);
+                              if (!matchDebt) return imp;
+                              const owe = imp.total - imp.paid;
+                              if (owe <= 0) return imp;
+                              const pay = Math.min(owe, remaining3);
+                              remaining3 -= pay;
+                              const newPaid = imp.paid + pay;
+                              const done = newPaid >= imp.total;
+                              newLogs.push({
+                                id: 'pl' + uid(),
+                                type: 'supplier',
+                                refId: imp.id,
+                                supplier: selSupp.name,
+                                date: dateIn,
+                                time: timeIn,
+                                amount: pay,
+                                note: noteIn || 'Trả nợ tổng',
+                                createdAt: new Date().toISOString(),
+                                _updated: new Date().toISOString()
+                              });
+                              return { ...imp, paid: newPaid, status: done ? 'paid' : 'debt', _updated: new Date().toISOString() };
+                            });
+
+                            S.imports = updatedImports;
+                            S.paymentlogs = [...newLogs, ...(S.paymentlogs || [])];
+                            save('imports'); save('paymentlogs');
+                            S.modal = null;
+                            toast(`✅ Đã trả ${fmt(amtIn)}đ · Cập nhật ${newLogs.length} lần nhập`, 'success');
+                            rebuild();
+                            render();
+                          } }, '💸 Xác nhận trả nợ tổng')
+                        ]
+                      };
+                      render();
+                    }
+                  }, '💸 Trả nợ tổng')
                 )
               ),
               h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10, marginTop: 16 } },
