@@ -9474,6 +9474,30 @@ function _allOrdersOf(cust) {
   return (cust.orders || []).slice().sort((a, b) => (a.date || '').localeCompare(b.date || ''));
 }
 
+// Các đợt thanh toán của 1 dòng hàng (đơn bán / phiếu nhập), sắp theo ngày.
+// paymentlogs chỉ ghi các lần thu/trả QUA nút "Thu nợ"/"Trả NCC" — khoản trả
+// ngay lúc tạo đơn (paid ban đầu) không có log riêng, nên bù phần chênh lệch
+// thành 1 "đợt" ảo lấy theo ngày tạo đơn để không bị thiếu số liệu.
+function _paymentEventsOf(item, type) {
+  const logs = (S.paymentlogs || [])
+    .filter(l => l.refId === item.id && l.type === type && !l._deleted)
+    .slice()
+    .sort((a, b) => (a.date || '').localeCompare(b.date || '') || (a.time || '').localeCompare(b.time || '') || (a.createdAt || '').localeCompare(b.createdAt || ''));
+  const loggedSum = logs.reduce((a, l) => a + (l.amount || 0), 0);
+  const initial = (item.paid || 0) - loggedSum;
+  const events = [];
+  if (initial > 0.5) events.push({ date: item.date, time: '', note: '', amount: initial, isInitial: true });
+  logs.forEach(l => events.push({ date: l.date, time: l.time || '', note: l.note || '', amount: l.amount || 0, isInitial: false }));
+  return events;
+}
+function _paymentEventLabel(ev, verb) {
+  if (ev.isInitial) return 'Thanh toán lúc tạo đơn';
+  let s = verb;
+  if (ev.time) s += ' · ' + ev.time;
+  if (ev.note) s += ' (' + ev.note + ')';
+  return s;
+}
+
 // Chuẩn bị dữ liệu xuất: chỉ giữ khách còn công nợ, nhưng liệt kê TOÀN BỘ đơn hàng của khách đó
 // (kể cả đơn đã thanh toán đủ) để Tổng mua / Đã thanh toán khớp với thực tế
 function _buildDebtExportData(custList) {
@@ -9494,6 +9518,15 @@ function exportCustDebtExcel(custList, label) {
   const hStyle = { font:{bold:true,color:{rgb:'FFFFFF'},name:'Arial',sz:10}, fill:{fgColor:{rgb:RED},patternType:'solid'}, alignment:{horizontal:'center',vertical:'center',wrapText:true}, border:{top:{style:'thin',color:{rgb:'CCC'}},bottom:{style:'thin',color:{rgb:'CCC'}},left:{style:'thin',color:{rgb:'CCC'}},right:{style:'thin',color:{rgb:'CCC'}}} };
   const dStyle = align => ({ font:{name:'Arial',sz:10}, alignment:{horizontal:align||'left',vertical:'center'}, border:{top:{style:'hair',color:{rgb:'EEE'}},bottom:{style:'hair',color:{rgb:'EEE'}},left:{style:'hair',color:{rgb:'EEE'}},right:{style:'hair',color:{rgb:'EEE'}}} });
   const subStyle = align => ({ font:{bold:true,name:'Arial',sz:10}, fill:{fgColor:{rgb:'F3E9D2'},patternType:'solid'}, alignment:{horizontal:align||'left',vertical:'center'} });
+  // Dòng chi tiết 1 đợt thanh toán — nền vàng nhạt, mô tả in nghiêng, số tiền xanh đậm
+  const payStyle = ci => {
+    const right = ci >= 5 && ci <= 8;
+    const s = { fill:{fgColor:{rgb:'FBF3DF'},patternType:'solid'}, alignment:{horizontal:right?'right':'left',vertical:'center'}, border:{top:{style:'hair',color:{rgb:'EEE'}},bottom:{style:'hair',color:{rgb:'EEE'}},left:{style:'hair',color:{rgb:'EEE'}},right:{style:'hair',color:{rgb:'EEE'}}} };
+    s.font = ci === 3 ? { name:'Arial', sz:10, italic:true, color:{rgb:'8A6D23'} }
+      : ci === 7 ? { name:'Arial', sz:10, bold:true, color:{rgb:'1A7D3C'} }
+      : { name:'Arial', sz:10 };
+    return s;
+  };
 
   const headers = ['Khách hàng','SĐT','Ngày mua','Tên sản phẩm','Số lượng','Đơn giá (đ)','Thành tiền (đ)','Đã thanh toán (đ)','Còn nợ (đ)','Địa chỉ công trình'];
   const aoa = [
@@ -9502,7 +9535,7 @@ function exportCustDebtExcel(custList, label) {
     [],
     headers
   ];
-  // Theo dõi style từng dòng: 'data' | 'sub'
+  // Theo dõi style từng dòng: 'data' | 'pay' | 'sub'
   const rowKinds = [];
   let grandTotal = 0, grandPaid = 0, grandRemain = 0;
 
@@ -9522,6 +9555,10 @@ function exportCustDebtExcel(custList, label) {
         s.address || ''
       ]);
       rowKinds.push('data');
+      _paymentEventsOf(s, 'customer').forEach(ev => {
+        aoa.push(['', '', fmtD(ev.date), '↳ ' + _paymentEventLabel(ev, 'Thanh toán'), '', '', '', numFmt(ev.amount), '', '']);
+        rowKinds.push('pay');
+      });
     });
     aoa.push(['', '', '', 'Cộng — ' + c.name, '', '', numFmt(cTotal), numFmt(cPaid), numFmt(cRemain), '']);
     rowKinds.push('sub');
@@ -9537,14 +9574,14 @@ function exportCustDebtExcel(custList, label) {
   ws['A2'] = { v: aoa[1][0], t: 's', s: { font: { italic: true, sz: 10, name: 'Arial', color: { rgb: '888888' } } } };
   // Header (dòng index 3)
   headers.forEach((_, ci) => { const a = XLSX.utils.encode_cell({ r: 3, c: ci }); if (ws[a]) ws[a].s = hStyle; });
-  // Dòng dữ liệu / subtotal
+  // Dòng dữ liệu / đợt thanh toán / subtotal
   rowKinds.forEach((kind, i) => {
     const r = 4 + i;
     headers.forEach((_, ci) => {
       const a = XLSX.utils.encode_cell({ r, c: ci });
       if (!ws[a]) return;
       const right = ci >= 5 && ci <= 8;
-      ws[a].s = kind === 'sub' ? subStyle(right ? 'right' : 'left') : dStyle(right ? 'right' : 'left');
+      ws[a].s = kind === 'sub' ? subStyle(right ? 'right' : 'left') : kind === 'pay' ? payStyle(ci) : dStyle(right ? 'right' : 'left');
     });
   });
   // Dòng tổng cộng
@@ -9575,6 +9612,10 @@ function exportCustDebtPDF(custList, label) {
     const rows = c.items.map((s, idx) => {
       const remain = (s.total || 0) - (s.paid || 0);
       cTotal += (s.total || 0); cPaid += (s.paid || 0); cRemain += remain;
+      const payRows = _paymentEventsOf(s, 'customer').map(ev => `<tr class="pay-sub">
+        <td></td><td class="c">${fmtD(ev.date)}</td><td colspan="4">↳ ${escHtml(_paymentEventLabel(ev, 'Thanh toán'))}</td>
+        <td class="pay-amt">${fmt(ev.amount)}</td><td colspan="2"></td>
+      </tr>`).join('');
       return `<tr>
         <td class="c">${idx + 1}</td>
         <td class="c">${fmtD(s.date)}</td>
@@ -9585,7 +9626,7 @@ function exportCustDebtPDF(custList, label) {
         <td class="r">${fmt(s.paid || 0)}</td>
         <td class="r" style="${remain > 0.5 ? 'color:#c0392b;font-weight:700' : ''}">${fmt(remain)}</td>
         <td>${escHtml(s.address || '')}</td>
-      </tr>`;
+      </tr>` + payRows;
     }).join('');
     grandTotal += cTotal; grandPaid += cPaid; grandRemain += cRemain;
     return `<div class="cust-sec">
@@ -9623,6 +9664,8 @@ th,td { border:1px solid #888; padding:4px 7px; vertical-align:middle; }
 thead th { background:#eee; font-weight:700; text-align:center; font-size:11px; }
 td.c { text-align:center; } td.r { text-align:right; }
 tr.sub td { background:#f6f0e2; font-weight:700; }
+tr.pay-sub td { background:#fbf6ea; border-top:none; font-size:11px; color:#8a6d23; font-style:italic; }
+tr.pay-sub td.pay-amt { color:#1a7d3c; font-weight:700; font-style:normal; text-align:right; }
 @media print { @page{size:A4 landscape;margin:8mm;} body{print-color-adjust:exact;-webkit-print-color-adjust:exact;} }
 </style></head><body><div class="page">
   <div class="head">
@@ -9685,6 +9728,15 @@ function exportSuppDebtExcel(suppList, label) {
   const hStyle = { font:{bold:true,color:{rgb:'FFFFFF'},name:'Arial',sz:10}, fill:{fgColor:{rgb:AMBER},patternType:'solid'}, alignment:{horizontal:'center',vertical:'center',wrapText:true}, border:{top:{style:'thin',color:{rgb:'CCC'}},bottom:{style:'thin',color:{rgb:'CCC'}},left:{style:'thin',color:{rgb:'CCC'}},right:{style:'thin',color:{rgb:'CCC'}}} };
   const dStyle = align => ({ font:{name:'Arial',sz:10}, alignment:{horizontal:align||'left',vertical:'center'}, border:{top:{style:'hair',color:{rgb:'EEE'}},bottom:{style:'hair',color:{rgb:'EEE'}},left:{style:'hair',color:{rgb:'EEE'}},right:{style:'hair',color:{rgb:'EEE'}}} });
   const subStyle = align => ({ font:{bold:true,name:'Arial',sz:10}, fill:{fgColor:{rgb:'F3E9D2'},patternType:'solid'}, alignment:{horizontal:align||'left',vertical:'center'} });
+  // Dòng chi tiết 1 đợt trả NCC — nền vàng nhạt, mô tả in nghiêng, số tiền xanh đậm
+  const payStyle = ci => {
+    const right = ci >= 4 && ci <= 7;
+    const s = { fill:{fgColor:{rgb:'FBF3DF'},patternType:'solid'}, alignment:{horizontal:right?'right':'left',vertical:'center'}, border:{top:{style:'hair',color:{rgb:'EEE'}},bottom:{style:'hair',color:{rgb:'EEE'}},left:{style:'hair',color:{rgb:'EEE'}},right:{style:'hair',color:{rgb:'EEE'}}} };
+    s.font = ci === 2 ? { name:'Arial', sz:10, italic:true, color:{rgb:'8A6D23'} }
+      : ci === 6 ? { name:'Arial', sz:10, bold:true, color:{rgb:'1A7D3C'} }
+      : { name:'Arial', sz:10 };
+    return s;
+  };
 
   const headers = ['Nhà cung cấp','Ngày nhập','Tên sản phẩm','Số lượng','Đơn giá (đ)','Thành tiền (đ)','Đã trả (đ)','Còn nợ (đ)','Ghi chú'];
   const aoa = [
@@ -9712,6 +9764,10 @@ function exportSuppDebtExcel(suppList, label) {
         i.note || ''
       ]);
       rowKinds.push('data');
+      _paymentEventsOf(i, 'supplier').forEach(ev => {
+        aoa.push(['', fmtD(ev.date), '↳ ' + _paymentEventLabel(ev, 'Trả NCC'), '', '', '', numFmt(ev.amount), '', '']);
+        rowKinds.push('pay');
+      });
     });
     aoa.push(['', '', 'Cộng — ' + s.name, '', '', numFmt(sTotal), numFmt(sPaid), numFmt(sRemain), '']);
     rowKinds.push('sub');
@@ -9732,7 +9788,7 @@ function exportSuppDebtExcel(suppList, label) {
       const a = XLSX.utils.encode_cell({ r, c: ci });
       if (!ws[a]) return;
       const right = ci >= 4 && ci <= 7;
-      ws[a].s = kind === 'sub' ? subStyle(right ? 'right' : 'left') : dStyle(right ? 'right' : 'left');
+      ws[a].s = kind === 'sub' ? subStyle(right ? 'right' : 'left') : kind === 'pay' ? payStyle(ci) : dStyle(right ? 'right' : 'left');
     });
   });
   headers.forEach((_, ci) => {
@@ -9762,6 +9818,10 @@ function exportSuppDebtPDF(suppList, label) {
     const rows = s.items.map((i, idx) => {
       const remain = (i.total || 0) - (i.paid || 0);
       sTotal += (i.total || 0); sPaid += (i.paid || 0); sRemain += remain;
+      const payRows = _paymentEventsOf(i, 'supplier').map(ev => `<tr class="pay-sub">
+        <td></td><td class="c">${fmtD(ev.date)}</td><td colspan="4">↳ ${escHtml(_paymentEventLabel(ev, 'Trả NCC'))}</td>
+        <td class="pay-amt">${fmt(ev.amount)}</td><td colspan="2"></td>
+      </tr>`).join('');
       return `<tr>
         <td class="c">${idx + 1}</td>
         <td class="c">${fmtD(i.date)}</td>
@@ -9772,7 +9832,7 @@ function exportSuppDebtPDF(suppList, label) {
         <td class="r">${fmt(i.paid || 0)}</td>
         <td class="r" style="${remain > 0.5 ? 'color:#c0392b;font-weight:700' : ''}">${fmt(remain)}</td>
         <td>${escHtml(i.note || '')}</td>
-      </tr>`;
+      </tr>` + payRows;
     }).join('');
     grandTotal += sTotal; grandPaid += sPaid; grandRemain += sRemain;
     return `<div class="cust-sec">
@@ -9810,6 +9870,8 @@ th,td { border:1px solid #888; padding:4px 7px; vertical-align:middle; }
 thead th { background:#eee; font-weight:700; text-align:center; font-size:11px; }
 td.c { text-align:center; } td.r { text-align:right; }
 tr.sub td { background:#f6f0e2; font-weight:700; }
+tr.pay-sub td { background:#fbf6ea; border-top:none; font-size:11px; color:#8a6d23; font-style:italic; }
+tr.pay-sub td.pay-amt { color:#1a7d3c; font-weight:700; font-style:normal; text-align:right; }
 @media print { @page{size:A4 landscape;margin:8mm;} body{print-color-adjust:exact;-webkit-print-color-adjust:exact;} }
 </style></head><body><div class="page">
   <div class="head">
